@@ -1,0 +1,26 @@
+[project]
+name = "worker-harness"
+version = "0.1.0"
+description = "Orchestrate GPU/ML worker nodes over ZeroTier VPN"
+requires-python = ">=3.11"
+dependencies = [
+    "typer[all]>=0.15",
+    "pydantic>=2.10",
+    "aiosqlite>=0.20",
+    "rich>=13.9",
+    "httpx>=0.28",
+    "textual>=0.93",
+    "psutil>=6.1",
+    "uvicorn>=0.34",
+    "fastapi>=0.115",
+]
+
+[project.scripts]
+worker-harness = "worker_harness.cli.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.rye.scripts]
+worker-harness = "worker_harness.cli.app:main"
