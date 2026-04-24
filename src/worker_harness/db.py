@@ -336,3 +336,27 @@ class Database:
             timestamp=r["timestamp"],
             summary=r["summary"],
         ) for r in rows]
+
+    # ── Admin ─────────────────────────────────────────────────────────
+
+    async def delete_worker(self, worker_id: str) -> bool:
+        """Delete a worker and all its associated records."""
+        cursor = await self._db.execute(
+            "DELETE FROM jobs WHERE worker_id = ?", (worker_id,)
+        )
+        cursor = await self._db.execute(
+            "DELETE FROM port_forwards WHERE worker_id = ?", (worker_id,)
+        )
+        cursor = await self._db.execute(
+            "DELETE FROM workers WHERE id = ?", (worker_id,)
+        )
+        await self._db.commit()
+        return cursor.rowcount > 0
+
+    async def prune_workers(self, older_than_ts: int) -> int:
+        """Delete all workers not seen since older_than_ts."""
+        cursor = await self._db.execute(
+            "DELETE FROM workers WHERE last_heartbeat_ts < ?", (older_than_ts,)
+        )
+        await self._db.commit()
+        return cursor.rowcount
