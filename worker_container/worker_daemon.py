@@ -49,11 +49,21 @@ def _run(cmd: list[str], timeout: int = 5) -> str:
 def get_gpu_info() -> dict[str, Any]:
     """Collect GPU info via nvidia-smi. Falls back to empty if unavailable."""
     try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used",
-             "--format=csv,noheader,nounits"],
-            stderr=subprocess.DEVNULL,
-        ).decode()
+        # nvidia-smi may not be on PATH; try common locations
+        for cmd in ["nvidia-smi", "/usr/bin/nvidia-smi", "/usr/local/nvidia/bin/nvidia-smi"]:
+            try:
+                out = subprocess.check_output(
+                    [cmd, "--query-gpu=index,name,memory.total,memory.used",
+                     "--format=csv,noheader,nounits"],
+                    stderr=subprocess.DEVNULL, timeout=5,
+                ).decode()
+                break
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                continue
+        else:
+            log.debug("nvidia-smi not found in any known location")
+            return {"count": 0, "gpus": []}
+
         gpus = []
         for line in out.strip().splitlines():
             if not line:
@@ -65,22 +75,23 @@ def get_gpu_info() -> dict[str, Any]:
                 "vram_total_gb": round(int(total_mb.strip()) / 1024, 1),
                 "vram_used_gb": round(int(used_mb.strip()) / 1024, 1),
             })
-        return {"count": len(gpus), "gpus": gpus}
+        return {"gpu_count": len(gpus), "gpus": gpus}
     except Exception as e:
         log.debug(f"nvidia-smi not available: {e}")
         return {"count": 0, "gpus": []}
 
 
 def get_zerotier_ip() -> str:
-    """Get the ZeroTier IP for the primary ZT interface."""
+    """Get the ZeroTier IPv4 address (prefer) or IPv6 from zerotier-cli -j."""
     try:
         out = subprocess.check_output(
-            ["zerotier-cli", "-j", "listnetworks"], stderr=subprocess.DEVNULL
+            ["zerotier-cli", "-j", "listnetworks"], stderr=subprocess.DEVNULL, timeout=5
         ).decode()
         networks = json.loads(out)
         for net in networks:
             for addr in net.get("assignedAddresses", []):
-                if ":" in addr:  # IPv6 ZT address
+                # Prefer IPv4 (no colon), fall back to IPv6
+                if ":" not in addr:
                     return addr.split("/")[0]
         return ""
     except Exception:
@@ -163,15 +174,22 @@ def get_worker_id() -> str:
 # ── Heartbeat ────────────────────────────────────────────────────────
 
 def build_payload(worker_id: str, zerotier_ip: str, ssh_port: int) -> dict[str, Any]:
+    gpu_info = get_gpu_info()
+    sys_info = get_system_info()
     return {
         "worker_id": worker_id,
         "name": WORKER_NAME,
         "zerotier_ip": zerotier_ip,
         "ssh_port": ssh_port,
-        **get_gpu_info(),
-        **get_system_info(),
+        "gpu_count": gpu_info.get("gpu_count", 0),
+        "gpus": gpu_info.get("gpus", []),
+        "cpu_cores": sys_info.get("cpu_cores", 0),
+        "total_ram_gb": sys_info.get("total_ram_gb", 0.0),
+        "used_ram_gb": sys_info.get("used_ram_gb", 0.0),
+        "total_disk_gb": sys_info.get("total_disk_gb", 0.0),
+        "used_disk_gb": sys_info.get("used_disk_gb", 0.0),
         "active_jobs": get_active_jobs(),
-        "active_ports": [],  # TODO: wire up active SSH tunnels
+        "active_ports": [],
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
