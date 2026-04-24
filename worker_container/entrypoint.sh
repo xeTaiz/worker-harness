@@ -21,7 +21,7 @@ if [ -n "${ZEROTIER_NETWORK_ID:-}" ]; then
 
     # Join the network (auto-authorized if the network has certificate policy,
     # otherwise authorize via ZeroTier Central)
-    zerotier-one join "$ZEROTIER_NETWORK_ID"
+    zerotier-cli join "$ZEROTIER_NETWORK_ID"
 
     # Wait for an IP to be assigned
     echo "[entrypoint] Waiting for ZeroTier IP..."
