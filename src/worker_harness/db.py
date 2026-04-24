@@ -112,9 +112,10 @@ class Database:
             return worker
 
     async def get_worker(self, worker_id: str) -> Worker | None:
-        row = await self._db.execute_row(
+        cursor = await self._db.execute(
             "SELECT * FROM workers WHERE id = ?", (worker_id,)
         )
+        row = await cursor.fetchone()
         if not row:
             return None
         return self._row_to_worker(row)
@@ -220,7 +221,8 @@ class Database:
         await self._db.commit()
 
     async def get_job(self, job_id: str) -> Job | None:
-        row = await self._db.execute_row("SELECT * FROM jobs WHERE id = ?", (job_id,))
+        cursor = await self._db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+        row = await cursor.fetchone()
         if not row:
             return None
         return self._row_to_job(row)
