@@ -143,8 +143,21 @@ def _progress_bar(used: float, total: float, width: int = 20) -> str:
     return f"[blue]{'█' * filled}[/][░{'░' * empty}]"
 
 
+def _workers_prune_impl(minutes: int = 5):
+    """Remove workers not seen in the last N minutes (default: 5)."""
+    async def run():
+        import time as _time
+        db = _get_db()
+        async with _db_lifespan(db):
+            cutoff = int(_time.time()) - (minutes * 60)
+            count = await db.prune_workers(cutoff)
+            console.print(f"[green]Removed {count} stale worker(s).[/]")
+    asyncio.run(run())
+
+
 # Build the typer app
 app = typer.Typer(name="workers", help="Manage worker nodes.")
 app.command(name="list")(_workers_list_impl)
 app.command(name="show")(_workers_show_impl)
 app.command(name="status")(_workers_status_impl)
+app.command(name="prune")(_workers_prune_impl)
