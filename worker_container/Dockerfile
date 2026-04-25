@@ -24,9 +24,12 @@ RUN ssh-keygen -A \
     && echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config \
     && echo "AuthorizedKeysFile /ssh/authorized_keys" >> /etc/ssh/sshd_config \
     && echo "PasswordAuthentication no" >> /etc/ssh/sshd_config \
-    && echo "PermitRootLogin no" >> /etc/ssh/sshd_config
+    && echo "PermitRootLogin prohibit-password" >> /etc/ssh/sshd_config
 
-# Copy ZeroTier install script
+# Harness directory for job scripts and logs
+RUN mkdir -p /harness && chmod 1777 /harness
+
+# ZeroTier
 RUN curl -s https://install.zerotier.com | bash
 
 # Copy SSH public key for authorized access
@@ -38,10 +41,8 @@ COPY worker_daemon.py /worker_daemon.py
 COPY requirements.txt /requirements.txt
 RUN pip3 install --break-system-packages -r /requirements.txt
 
-# Working directory
 WORKDIR /workspace
 
-# Entrypoint handles ZeroTier bootstrap, SSH, and daemon start
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

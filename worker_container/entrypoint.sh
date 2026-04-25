@@ -56,6 +56,11 @@ mkdir -p /run/sshd
 /usr/sbin/sshd
 echo "[entrypoint] SSH server running on port ${WORKER_SSH_PORT:-22}"
 
+# ── 2b. Harness directory ───────────────────────────────────────────
+mkdir -p /harness
+chmod 1777 /harness
+echo "[entrypoint] Harness directory ready at /harness"
+
 # ── 3. Worker daemon ────────────────────────────────────────────────
 echo "[entrypoint] Starting worker daemon..."
 exec python3 /worker_daemon.py

@@ -37,11 +37,11 @@ class JobManager:
         job = Job(
             command=command,
             worker_id=worker.id,
-            tmux_session=f"wh_{name or job.id}",
             status=JobStatus.RUNNING,
             pty_enabled=pty_enabled,
             started_at=int(datetime.now(timezone.utc).timestamp()),
         )
+        job.tmux_session = f"wh_{name or job.id}"
         await self.db.insert_job(job)
 
         # Create the tmux session on the worker
@@ -60,11 +60,13 @@ class JobManager:
     async def stop_job(self, worker: Worker, job_id: str) -> bool:
         """Kill a running job's tmux session. Returns True if successful."""
         result = await ssh_tmux_kill(worker, job_id)
-        if result.returncode == 0:
+        # pkill returns exit 1 when no processes match (expected).
+        # "echo done" always succeeds. Treat any successful SSH + "done" output as success.
+        if result.returncode == 0 and result.stdout.strip() in ("", "done"):
             log.info(f"Stopped job {job_id} on {worker.name}")
-            # Mark job as failed with exit code -1
+            # Refresh status — mark as stopped if still running
             job = await self.db.get_job(job_id)
-            if job:
+            if job and job.status == JobStatus.RUNNING:
                 job.status = JobStatus.FAILED
                 job.exit_code = -1
                 job.finished_at = int(datetime.now(timezone.utc).timestamp())
@@ -85,7 +87,11 @@ class JobManager:
         is_running = await ssh_tmux_running(worker, job.id)
         if not is_running:
             exit_code = await ssh_get_exit_code(worker, job.id)
-            job.status = JobStatus.FAILED if (exit_code or 0) != 0 else JobStatus.DONE
+            # None means retrieval failed; treat as unknown but don't falsely mark as DONE
+            if exit_code is None:
+                job.status = JobStatus.FAILED
+            else:
+                job.status = JobStatus.FAILED if exit_code != 0 else JobStatus.DONE
             job.exit_code = exit_code
             job.finished_at = int(datetime.now(timezone.utc).timestamp())
             await self.db.update_job(job)

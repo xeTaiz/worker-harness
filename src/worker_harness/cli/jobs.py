@@ -85,8 +85,8 @@ def _job_start_impl(
 
 
 def _job_list_impl(
-    worker_id: str | None = None,
-    status_filter: str | None = None,
+    worker_id: str | None = typer.Option(None, "--worker", help="Filter by worker ID or name"),
+    status_val: str | None = typer.Option(None, "--status", help="Filter by status: pending, running, done, failed"),
 ):
     async def run():
         db = await _db_connect()
@@ -95,16 +95,28 @@ def _job_list_impl(
             from worker_harness.models import JobStatus
             output_mode = _state.get("output", "text")
 
-            status = None
-            if status_filter:
+            job_status = None
+            if status_val is not None:
                 try:
-                    status = JobStatus(status_filter)
+                    job_status = JobStatus(status_val)
                 except ValueError:
-                    console.print(f"[red]Invalid status: {status_filter}[/]")
+                    console.print(f"[red]Invalid status: {status_val}[/]")
                     raise typer.Exit(1)
 
-            jobs_list = await db.list_jobs(worker_id=worker_id, status=status)
+            jobs_list = await db.list_jobs(worker_id=worker_id, status=job_status)
             all_workers = {w.id: w for w in await db.list_workers()}
+
+            # Refresh status for jobs that appear to be running
+            from worker_harness.job import JobManager
+            jm = JobManager(db)
+            updated = []
+            for j in jobs_list:
+                if j.status in (JobStatus.RUNNING, JobStatus.PENDING):
+                    w = all_workers.get(j.worker_id)
+                    if w:
+                        j = await jm.refresh_job_status(w, j)
+                updated.append(j)
+            jobs_list = updated
 
             if output_mode == "json":
                 import json
@@ -169,7 +181,18 @@ def _job_logs_impl(
             jm.db = db
 
             if follow:
-                _stream_logs(jm, worker, job_id)
+                # Poll logs every second until Ctrl+C
+                last_len = 0
+                try:
+                    while True:
+                        logs = await jm.get_logs(worker, job_id, tail=50)
+                        lines = logs.splitlines()
+                        for line in lines[last_len:]:
+                            console.print(line)
+                        last_len = len(lines)
+                        await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    pass
             else:
                 t = tail if tail is not None else (None if head is not None else 10)
                 h = head
@@ -210,27 +233,6 @@ def _job_stop_impl(job_id: str):
                 console.print(f"[red]Failed to stop job: {job_id}[/]")
                 raise typer.Exit(1)
     asyncio.run(run())
-
-
-async def _stream_logs_async(jm, worker, job_id: str) -> None:
-    last_len = 0
-    try:
-        while True:
-            logs = await jm.get_logs(worker, job_id, tail=100)
-            lines = logs.splitlines()
-            for line in lines[last_len:]:
-                console.print(line)
-            last_len = len(lines)
-            await asyncio.sleep(1)
-    except asyncio.CancelledError:
-        pass
-
-
-def _stream_logs(jm, worker, job_id: str) -> None:
-    try:
-        asyncio.run(_stream_logs_async(jm, worker, job_id))
-    except KeyboardInterrupt:
-        pass
 
 
 def _format_timestamp(ts: int) -> str:

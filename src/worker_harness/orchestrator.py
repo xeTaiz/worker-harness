@@ -46,10 +46,11 @@ async def serve(config: Config) -> None:
 
     try:
         # Periodically mark stale workers as offline
+        import time as _time
         async def offline_sweeper():
             while not stop_event.is_set():
-                await asyncio.sleep(config.heartbeat.offline_cutoff_seconds)
-                cutoff = int(asyncio.get_event_loop().time()) - config.heartbeat.offline_cutoff_seconds
+                await asyncio.sleep(30)  # check every 30s regardless of cutoff
+                cutoff = int(_time.time()) - config.heartbeat.offline_cutoff_seconds
                 count = await db.mark_workers_offline(cutoff)
                 if count > 0:
                     console.print(f"[dim]Marked {count} worker(s) offline[/]")
