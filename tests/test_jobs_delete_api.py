@@ -22,7 +22,7 @@ class JobsDeleteApiTests(unittest.TestCase):
         reg = WorkerRegistration(
             worker_id="w-test",
             name="worker-test",
-            zerotier_ip="10.0.0.9",
+            worker_ip="10.0.0.9",
             ssh_port=22,
             gpu_count=1,
             gpus=[GPUInfo(index=0, name="GPU0", vram_total_gb=24, vram_used_gb=0)],
