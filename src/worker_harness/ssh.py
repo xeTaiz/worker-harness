@@ -41,7 +41,7 @@ def _ssh_base_args(worker: Worker) -> list[str]:
         "-o", "ServerAliveInterval=30",
         "-p", str(worker.ssh_port),
         "-i", SSH_KEY_PATH,
-        f"{SSH_USER}@{worker.zerotier_ip}",
+        f"{SSH_USER}@{worker.worker_ip}",
     ]
 
 
@@ -184,7 +184,7 @@ async def ssh_copy_file(worker: Worker, local_path: str | Path, remote_path: str
         "-P", str(worker.ssh_port),
         "-i", SSH_KEY_PATH,
         str(local_path),
-        f"{SSH_USER}@{worker.zerotier_ip}:{remote_path}",
+        f"{SSH_USER}@{worker.worker_ip}:{remote_path}",
     ]
     result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     return SSHResult(stdout=result.stdout, stderr=result.stderr, returncode=result.returncode)
@@ -200,7 +200,7 @@ async def ssh_port_forward(worker: Worker, local_port: int, remote_port: int) ->
         "-L", f"{local_port}:localhost:{remote_port}",
         "-p", str(worker.ssh_port),
         "-i", SSH_KEY_PATH,
-        f"{SSH_USER}@{worker.zerotier_ip}",
+        f"{SSH_USER}@{worker.worker_ip}",
     ]
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return proc

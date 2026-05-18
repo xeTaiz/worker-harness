@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 # ── Enums ────────────────────────────────────────────────────────────
@@ -51,7 +51,7 @@ class WorkerRegistration(BaseModel):
 
     worker_id: str
     name: str
-    zerotier_ip: str
+    worker_ip: str = Field(validation_alias=AliasChoices("worker_ip", "zerotier_ip"))
     ssh_port: int = 22
     gpu_count: int = 0
     gpus: list[GPUInfo] = Field(default_factory=list)
@@ -70,7 +70,7 @@ class Worker(BaseModel):
 
     id: str
     name: str
-    zerotier_ip: str
+    worker_ip: str
     ssh_port: int = 22
     gpu_count: int = 0
     gpu_names: list[str] = Field(default_factory=list)
@@ -91,7 +91,7 @@ class Worker(BaseModel):
         return cls(
             id=reg.worker_id,
             name=reg.name,
-            zerotier_ip=reg.zerotier_ip,
+            worker_ip=reg.worker_ip,
             ssh_port=reg.ssh_port,
             gpu_count=reg.gpu_count,
             gpu_names=[g.name for g in reg.gpus],
@@ -109,7 +109,7 @@ class Worker(BaseModel):
 
     def update_from_registration(self, reg: WorkerRegistration) -> None:
         self.name = reg.name
-        self.zerotier_ip = reg.zerotier_ip
+        self.worker_ip = reg.worker_ip
         self.ssh_port = reg.ssh_port
         self.gpu_count = reg.gpu_count
         self.gpu_names = [g.name for g in reg.gpus]
@@ -168,7 +168,7 @@ class WorkerSummary(BaseModel):
 
     id: str
     name: str
-    zerotier_ip: str
+    worker_ip: str
     ssh_port: int
     gpu_count: int
     gpu_names: list[str]

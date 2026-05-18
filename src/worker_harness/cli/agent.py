@@ -41,7 +41,7 @@ def _agent_workers_impl():
                 summaries.append(WorkerSummary(
                     id=w.id,
                     name=w.name,
-                    zerotier_ip=w.zerotier_ip,
+                    worker_ip=w.worker_ip,
                     ssh_port=w.ssh_port,
                     gpu_count=w.gpu_count,
                     gpu_names=w.gpu_names,

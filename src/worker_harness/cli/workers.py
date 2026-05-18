@@ -51,7 +51,7 @@ def _workers_list_impl():
                 table = Table(title="Workers")
                 table.add_column("Status", style="bold")
                 table.add_column("Name")
-                table.add_column("ZeroTier IP")
+                table.add_column("Worker IP")
                 table.add_column("SSH Port")
                 table.add_column("GPUs")
                 table.add_column("CPU Cores")
@@ -68,7 +68,7 @@ def _workers_list_impl():
                     )
                     table.add_row(
                         f"[{status_color}]{status_icon}[/]",
-                        w.name, w.zerotier_ip, str(w.ssh_port),
+                        w.name, w.worker_ip, str(w.ssh_port),
                         str(w.gpu_count) if w.gpu_count > 0 else "-",
                         str(w.cpu_cores),
                         f"{w.used_ram_gb:.0f}/{w.total_ram_gb:.0f} GB",
@@ -124,7 +124,7 @@ def _print_worker_detail(w) -> None:
     content = Text()
     content += f"[bold]ID:[/bold]          {w.id}\n"
     content += f"[bold]Status:[/bold]     {w.status.value}\n"
-    content += f"[bold]ZeroTier IP:[/bold] {w.zerotier_ip}:{w.ssh_port}\n"
+    content += f"[bold]Worker IP:[/bold] {w.worker_ip}:{w.ssh_port}\n"
     content += f"[bold]CPUs:[/bold]        {w.cpu_cores}\n"
     content += f"[bold]RAM:[/bold]         {ram_bar} {w.used_ram_gb:.1f}/{w.total_ram_gb:.1f} GB\n"
     content += f"[bold]Disk:[/bold]        {disk_bar} {w.used_disk_gb:.1f}/{w.total_disk_gb:.1f} GB\n"
