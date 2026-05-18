@@ -29,10 +29,10 @@ RUN ssh-keygen -A \
 # Harness directory for job scripts and logs
 RUN mkdir -p /harness && chmod 1777 /harness
 
-# ZeroTier
-RUN curl -s https://install.zerotier.com | bash
+# Tailscale
+RUN curl -fsSL https://tailscale.com/install.sh | sh
 
-# Copy SSH public key for authorized access
+# Bake orchestrator public key into worker image (overridable via volume mount).
 COPY authorized_keys /ssh/authorized_keys
 RUN chmod 600 /ssh/authorized_keys
 

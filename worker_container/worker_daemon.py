@@ -9,7 +9,6 @@ Responsibilities:
 """
 
 import asyncio
-import json
 import logging
 import os
 import socket
@@ -81,21 +80,21 @@ def get_gpu_info() -> dict[str, Any]:
         return {"count": 0, "gpus": []}
 
 
-def get_zerotier_ip() -> str:
-    """Get the ZeroTier IPv4 address (prefer) or IPv6 from zerotier-cli -j."""
-    try:
-        out = subprocess.check_output(
-            ["zerotier-cli", "-j", "listnetworks"], stderr=subprocess.DEVNULL, timeout=5
-        ).decode()
-        networks = json.loads(out)
-        for net in networks:
-            for addr in net.get("assignedAddresses", []):
-                # Prefer IPv4 (no colon), fall back to IPv6
-                if ":" not in addr:
-                    return addr.split("/")[0]
-        return ""
-    except Exception:
-        return ""
+def get_tailscale_ip() -> str:
+    """Get the Tailscale IPv4 address."""
+    commands = [
+        ["tailscale", "--socket=/var/run/tailscale/tailscaled.sock", "ip", "-4"],
+        ["tailscale", "ip", "-4"],
+    ]
+
+    for cmd in commands:
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=5).decode().strip()
+            if out:
+                return out.splitlines()[0].strip()
+        except Exception:
+            continue
+    return ""
 
 
 def get_system_info() -> dict[str, Any]:
@@ -173,13 +172,14 @@ def get_worker_id() -> str:
 
 # ── Heartbeat ────────────────────────────────────────────────────────
 
-def build_payload(worker_id: str, zerotier_ip: str, ssh_port: int) -> dict[str, Any]:
+def build_payload(worker_id: str, tailscale_ip: str, ssh_port: int) -> dict[str, Any]:
     gpu_info = get_gpu_info()
     sys_info = get_system_info()
     return {
         "worker_id": worker_id,
         "name": WORKER_NAME,
-        "zerotier_ip": zerotier_ip,
+        # Backward-compat field name; now carries Tailscale IP.
+        "zerotier_ip": tailscale_ip,
         "ssh_port": ssh_port,
         "gpu_count": gpu_info.get("gpu_count", 0),
         "gpus": gpu_info.get("gpus", []),
@@ -194,8 +194,8 @@ def build_payload(worker_id: str, zerotier_ip: str, ssh_port: int) -> dict[str, 
     }
 
 
-async def send_heartbeat(worker_id: str, zerotier_ip: str, ssh_port: int, client: httpx.AsyncClient) -> bool:
-    payload = build_payload(worker_id, zerotier_ip, ssh_port)
+async def send_heartbeat(worker_id: str, tailscale_ip: str, ssh_port: int, client: httpx.AsyncClient) -> bool:
+    payload = build_payload(worker_id, tailscale_ip, ssh_port)
     url = f"http://{ORCHESTRATOR_HOST}:{ORCHESTRATOR_PORT}/register"
     try:
         resp = await client.post(url, json=payload, timeout=10.0)
@@ -225,15 +225,15 @@ async def main() -> None:
 
     async with httpx.AsyncClient() as client:
         # Initial registration
-        zerotier_ip = get_zerotier_ip()
-        log.info(f"ZeroTier IP: {zerotier_ip}")
-        await send_heartbeat(worker_id, zerotier_ip, WORKER_SSH_PORT, client)
+        tailscale_ip = get_tailscale_ip()
+        log.info(f"Tailscale IP: {tailscale_ip}")
+        await send_heartbeat(worker_id, tailscale_ip, WORKER_SSH_PORT, client)
 
         # Periodic heartbeats
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
-            zerotier_ip = get_zerotier_ip()
-            await send_heartbeat(worker_id, zerotier_ip, WORKER_SSH_PORT, client)
+            tailscale_ip = get_tailscale_ip()
+            await send_heartbeat(worker_id, tailscale_ip, WORKER_SSH_PORT, client)
 
 
 if __name__ == "__main__":
