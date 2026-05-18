@@ -90,14 +90,12 @@ Payload:
   "name": "gpu-rig-1",           // from env WORKER_NAME or hostname
   "zerotier_ip": "10.147.17.x",
   "ssh_port": 22,                // container SSH port (passed at start)
-  "gpu_info": {
-    "count": 2,
-    "names": ["NVIDIA RTX 4090", "NVIDIA RTX 4090"],
-    "vram_gb": [24, 24]
-  },
-  "resources": {
-    "cpu_cores": 32,
-    "total_ram_gb": 128,
+  "gpu_count": 2,
+  "gpus": [
+    {"name": "NVIDIA RTX 4090", "vram_total_gb": 24, "vram_used_gb": 8},
+    {"name": "NVIDIA RTX 4090", "vram_total_gb": 24, "vram_used_gb": 0}
+  ],
+  "cpu_cores": 32,
     "used_ram_gb": 64,
     "total_disk_gb": 2000,
     "used_disk_gb": 340
@@ -133,6 +131,8 @@ RUN dnf install -y openssh-server tmux git curl wget vim jq && \
     ssh-keygen -A && \
     mkdir -p /run/sshd
 
+# Harness directory for job scripts and logs (mount from host for persistence)
+RUN mkdir -p /harness && chmod 1777 /harness
 # Podman socket (container-in-container support)
 # Note: socket is mounted from host at runtime
 
@@ -155,11 +155,14 @@ zerotier-one join "$ZEROTIER_NETWORK_ID"
 # Wait for IP
 while ! ip addr show zt* | grep -q "inet "; do sleep 1; done
 
-# 2. SSH server (port from env ORCHESTRATOR_SSH_PORT, default 22)
+# 2. SSH server (port from env WORKER_SSH_PORT, default 22)
 sed -i "s/#Port 22/Port ${WORKER_SSH_PORT:-22}/" /etc/ssh/sshd_config
 /usr/sbin/sshd
 
-# 3. Start the worker daemon (Python)
+# 3. Harness directory for job scripts and logs
+mkdir -p /harness && chmod 1777 /harness
+
+# 4. Start the worker daemon (Python)
 exec python -m worker.daemon
 ```
 
@@ -224,10 +227,13 @@ CREATE TABLE workers (
     ssh_port INTEGER NOT NULL DEFAULT 22,
     gpu_count INTEGER DEFAULT 0,
     gpu_names TEXT,            -- JSON list
-    gpu_vram_gb TEXT,          -- JSON list
+    gpu_vram_gb TEXT,          -- JSON list (total per GPU)
+    gpu_used_vram_gb TEXT,     -- JSON list (current usage per GPU)
     cpu_cores INTEGER,
     total_ram_gb REAL,
+    used_ram_gb REAL,
     total_disk_gb REAL,
+    used_disk_gb REAL,
     status TEXT DEFAULT 'online',  -- online, offline, draining
     last_heartbeat_ts INTEGER,
     created_at INTEGER
@@ -286,14 +292,15 @@ def read_tmux_log(worker_ip: str, ssh_port: int, session: str) -> str  # reads .
 ```
 
 **PTY handling:** Jobs that use tqdm or other TUI libraries need a PTY. The `pty_enabled`
-flag on jobs controls this. PTY is allocated with `ssh -tt` and output is captured to a
-tmux log file (`tmux capture-pane -t <session> -p > /tmp/wh_<job_id>.log`) which is then
-read back by the orchestrator.
 
-### Log Retrieval
+Job logs are written to `/harness/<job_id>/output.log` on the worker (persistent,
+mount a host volume at `/harness` for durability). Each job also stores its script
+at `/harness/<job_id>/script.sh` for full command history auditability.
 
-Job logs are written to `/tmp/wh_<job_id>.log` on the worker and retrieved via SSH.
-To keep output manageable for agents:
+Job execution: the orchestrator base64-encodes a bash script and passes it via a
+single SSH call — the script writes to `/harness/<job_id>/script.sh`, then runs it
+under `tmux` for interactive inspection. The tmux session stays open for 60s after
+the job completes, allowing `tmux attach` to inspect the finished session.
 
 | Argument | Behavior |
 |----------|----------|
