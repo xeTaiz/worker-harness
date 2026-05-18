@@ -178,8 +178,7 @@ def build_payload(worker_id: str, tailscale_ip: str, ssh_port: int) -> dict[str,
     return {
         "worker_id": worker_id,
         "name": WORKER_NAME,
-        # Backward-compat field name; now carries Tailscale IP.
-        "zerotier_ip": tailscale_ip,
+        "worker_ip": tailscale_ip,
         "ssh_port": ssh_port,
         "gpu_count": gpu_info.get("gpu_count", 0),
         "gpus": gpu_info.get("gpus", []),
