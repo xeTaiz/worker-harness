@@ -75,6 +75,7 @@ class Worker(BaseModel):
     gpu_count: int = 0
     gpu_names: list[str] = Field(default_factory=list)
     gpu_vram_gb: list[float] = Field(default_factory=list)
+    gpu_used_vram_gb: list[float] = Field(default_factory=list)
     cpu_cores: int = 0
     total_ram_gb: float = 0.0
     used_ram_gb: float = 0.0
@@ -95,6 +96,7 @@ class Worker(BaseModel):
             gpu_count=reg.gpu_count,
             gpu_names=[g.name for g in reg.gpus],
             gpu_vram_gb=[g.vram_total_gb for g in reg.gpus],
+            gpu_used_vram_gb=[g.vram_used_gb for g in reg.gpus],
             cpu_cores=reg.cpu_cores,
             total_ram_gb=reg.total_ram_gb,
             used_ram_gb=reg.used_ram_gb,
@@ -112,6 +114,7 @@ class Worker(BaseModel):
         self.gpu_count = reg.gpu_count
         self.gpu_names = [g.name for g in reg.gpus]
         self.gpu_vram_gb = [g.vram_total_gb for g in reg.gpus]
+        self.gpu_used_vram_gb = [g.vram_used_gb for g in reg.gpus]
         self.cpu_cores = reg.cpu_cores
         self.total_ram_gb = reg.total_ram_gb
         self.used_ram_gb = reg.used_ram_gb

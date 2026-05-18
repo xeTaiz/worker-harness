@@ -82,4 +82,19 @@ def main_entry():
     app.add_typer(jobs.app, name="job")
     app.add_typer(tunnels.app, name="tunnel")
     app.add_typer(agent_mod.app, name="agent")
+
+    @app.command(name="tui", hidden=True)
+    def tui_cmd():
+        """Launch the Textual TUI."""
+        from worker_harness.db import Database
+        from worker_harness.job import JobManager
+        from worker_harness.tui.app import run_tui
+        from worker_harness.config import Config
+        config = Config.load()
+        db = Database(config.db_path)
+        import asyncio
+        asyncio.run(db.connect())
+        jm = JobManager(db)
+        run_tui(db, jm)
+
     app()

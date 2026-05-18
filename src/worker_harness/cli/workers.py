@@ -129,8 +129,14 @@ def _print_worker_detail(w) -> None:
     content += f"[bold]RAM:[/bold]         {ram_bar} {w.used_ram_gb:.1f}/{w.total_ram_gb:.1f} GB\n"
     content += f"[bold]Disk:[/bold]        {disk_bar} {w.used_disk_gb:.1f}/{w.total_disk_gb:.1f} GB\n"
     if w.gpu_count > 0:
-        content += f"[bold]GPUs:[/bold]        {w.gpu_count}x {', '.join(w.gpu_names)}\n"
-        content += f"[bold]GPU VRAM:[/bold]    {', '.join(str(v) + 'GB' for v in w.gpu_vram_gb)}\n"
+        gpu_lines = []
+        for i in range(w.gpu_count):
+            name = w.gpu_names[i] if i < len(w.gpu_names) else f"GPU {i}"
+            total = w.gpu_vram_gb[i] if i < len(w.gpu_vram_gb) else 0
+            used = w.gpu_used_vram_gb[i] if i < len(w.gpu_used_vram_gb) else 0
+            bar = _progress_bar(used, total, width=16)
+            gpu_lines.append(f"  [[bold]{name}[/bold]] {bar} {used:.1f}/{total:.1f} GB")
+        content += f"[bold]GPUs:[/bold]\n" + '\n'.join(gpu_lines) + "\n"
     panel = Panel(content, title=f"Worker: {w.name}", expand=False)
     console.print(panel)
 

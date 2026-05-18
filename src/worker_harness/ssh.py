@@ -114,9 +114,8 @@ async def ssh_tmux_new(worker: Worker, job_id: str, command: str, pty_enabled: b
 async def ssh_tmux_kill(worker: Worker, job_id: str) -> SSHResult:
     session = f"wh_{job_id}"
     cmd = (
-        f"tmux kill-session -t '{session}' 2>/dev/null; "
-        f"pkill -f '/harness/{job_id}/script.sh' 2>/dev/null; "
-        f"echo done"
+        f"tmux kill-session -t '{session}' 2>/dev/null || true; "
+        f"tmux has-session -t '{session}' 2>/dev/null && echo still_running || echo stopped"
     )
     return await async_ssh_run(worker, cmd, timeout=10)
 

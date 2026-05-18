@@ -60,21 +60,25 @@ class JobManager:
     async def stop_job(self, worker: Worker, job_id: str) -> bool:
         """Kill a running job's tmux session. Returns True if successful."""
         result = await ssh_tmux_kill(worker, job_id)
-        # pkill returns exit 1 when no processes match (expected).
-        # "echo done" always succeeds. Treat any successful SSH + "done" output as success.
-        if result.returncode == 0 and result.stdout.strip() in ("", "done"):
+        output = (result.stdout or "").strip()
+
+        # Treat idempotent/already-gone session as success.
+        if result.returncode == 0 and output in ("", "stopped"):
             log.info(f"Stopped job {job_id} on {worker.name}")
             # Refresh status — mark as stopped if still running
             job = await self.db.get_job(job_id)
-            if job and job.status == JobStatus.RUNNING:
+            if job and job.status in (JobStatus.RUNNING, JobStatus.PENDING):
                 job.status = JobStatus.FAILED
                 job.exit_code = -1
                 job.finished_at = int(datetime.now(timezone.utc).timestamp())
                 await self.db.update_job(job)
             return True
-        else:
-            log.warning(f"Failed to stop job {job_id}: {result.stderr}")
-            return False
+
+        log.warning(
+            f"Failed to stop job {job_id} on {worker.name}: "
+            f"rc={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}"
+        )
+        return False
 
     async def refresh_job_status(self, worker: Worker, job: Job) -> Job:
         """
