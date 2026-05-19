@@ -1,0 +1,36 @@
+{
+  "groups": {
+    "group:admin": ["dome@"]
+  },
+  "tagOwners": {
+    "tag:wh-orchestrator": ["worker-harness@","group:admin"],
+    "tag:wh-worker": ["worker-harness@","group:admin"]
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["tag:wh-worker"],
+      "dst": ["tag:wh-orchestrator:12888"]
+    },
+    {
+      "action": "accept",
+      "src": ["tag:wh-orchestrator"],
+      "dst": ["tag:wh-worker:*"]
+    },
+    {
+      "action": "accept",
+      "src": ["autogroup:member"],
+      "dst": ["tag:wh-orchestrator:*"]
+    },
+    {
+      "action": "accept",
+      "src": ["autogroup:member"],
+      "dst": ["tag:wh-worker:*"]
+    },
+    {
+      "action": "accept",
+      "src": ["autogroup:member"],
+      "dst": ["autogroup:member:*"]
+    }
+  ]
+}
