@@ -13,3 +13,4 @@ scikit-image
 tqdm
 jupyter
 notebook
+opencv-python-headless
