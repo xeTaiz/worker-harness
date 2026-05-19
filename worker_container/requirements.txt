@@ -11,4 +11,5 @@ matplotlib
 scikit-learn
 scikit-image
 tqdm
-
+jupyter
+notebook

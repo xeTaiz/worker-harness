@@ -5,7 +5,7 @@ echo "[entrypoint] Starting worker bootstrap..."
 
 # ── 1. Tailscale bootstrap ─────────────────────────────────────────
 TS_AUTHKEY="${TS_AUTHKEY:-}"
-TS_TAGS="${TS_TAGS:-tag:worker}"
+TS_HOST="${TS_HOST:-https://controlplane.tailscale.com}"
 TS_HOSTNAME="${TS_HOSTNAME:-}"
 TS_ACCEPT_ROUTES="${TS_ACCEPT_ROUTES:-false}"
 TS_EXTRA_ARGS="${TS_EXTRA_ARGS:-}"
@@ -24,11 +24,10 @@ tailscaled \
 
 sleep 2
 
-echo "[entrypoint] Joining tailnet with tags: $TS_TAGS"
+echo "[entrypoint] Joining tailnet..."
 UP_ARGS=(
-  --socket=/var/run/tailscale/tailscaled.sock
+  --login-server="$TS_HOST"
   --authkey="$TS_AUTHKEY"
-  --advertise-tags="$TS_TAGS"
   --accept-routes="$TS_ACCEPT_ROUTES"
 )
 
@@ -42,7 +41,7 @@ if [ -n "$TS_EXTRA_ARGS" ]; then
   UP_ARGS+=("${EXTRA_ARGS[@]}")
 fi
 
-tailscale up "${UP_ARGS[@]}"
+tailscale --socket=/var/run/tailscale/tailscaled.sock up "${UP_ARGS[@]}"
 
 echo "[entrypoint] Waiting for Tailnet IP..."
 for i in $(seq 1 30); do

@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+RUN id -u worker-harness >/dev/null 2>&1 || useradd -m worker-harness
+
 # Tailscale userspace + daemon
 RUN curl -fsSL https://tailscale.com/install.sh | sh
 
