@@ -5,7 +5,7 @@
 A tool for managing a fleet of worker machines that run coding/machine-learning jobs.
 Two components:
 
-1. **Worker** — a container image that self-registers into a ZeroTier VPN and exposes
+1. **Worker** — a container image that self-registers into a Tailscale/Headscale tailnet and exposes
    a Podman socket, SSH, and a minimal heartbeat daemon.
 2. **Orchestrator** — a native process on a head node that discovers workers via their
    heartbeats, stores state in SQLite, and exposes both a TUI and a CLI for full
@@ -17,7 +17,7 @@ Two components:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        ZeroTier Mesh VPN                         │
+│                     Tailscale/Headscale Tailnet                  │
 │                                                                  │
 │  ┌──────────────────────────┐   ┌──────────────────────────┐   │
 │  │   Orchestrator (native)  │   │     Worker N (container)  │   │
@@ -31,7 +31,7 @@ Two components:
 │  │  │ (job exec, shell,  │  │   │  Podman socket (host)   │   │  │
 │  │  │  port forward)     │  │   │  SSH server (container) │   │  │
 │  │  └────────────────────┘  │   │  tmux (job sessions)    │   │  │
-│  │  ┌────────────────────┐  │   │  ZeroTier daemon        │   │  │
+│  │  ┌────────────────────┐  │   │  Tailscale daemon        │   │  │
 │  │  │ SQLite DB          │  │   └─────────────────────────│───┘   │
 │  │  └────────────────────┘  │                                   │
 │  │  ┌────────────────────┐  │   ┌──────────────────────────┐   │
@@ -43,11 +43,11 @@ Two components:
 
 **Key design decisions:**
 
-- Workers **push** heartbeats to the orchestrator's HTTP API. The orchestrator has a
-  well-known ZeroTier IP that is baked into the worker image config.
+- Workers **push** heartbeats to the orchestrator's HTTP API. The orchestrator is
+  discovered by Tailnet DNS name (`ORCHESTRATOR_HOST`) in worker config.
 - The orchestrator **pulls** job results by SSHing into workers, creating/managing tmux
   sessions, and reading tmux capture files.
-- ZeroTier lives **inside** the container, bootstrapped from env vars at start time.
+- Tailscale lives **inside** the container, bootstrapped from env vars at start time.
 - The worker container runs a **minimal Python daemon** (single async process) for
   heartbeats and nothing else. All "real work" runs in tmux managed by the orchestrator.
 - Podman socket is exposed via host bind-mount, enabling nested containers inside jobs.
@@ -56,31 +56,31 @@ Two components:
 
 ## 2. Network & Registration
 
-### ZeroTier Setup
+### Tailscale/Headscale Setup
 
 - Worker container starts with env vars:
-  - `ZEROTIER_NETWORK_ID` — the ZeroTier network to join
-  - `ZEROTIER_SECRET` — the ZeroTier identity secret (base64), optional. If omitted, the
-    daemon generates a fresh identity on first start.
+  - `TS_AUTHKEY` — auth/preauth key used for node login
+  - `TS_TAGS` — tags to advertise (default `tag:wh-worker`)
+  - `TS_HOSTNAME` — optional stable hostname
+  - `TS_ACCEPT_ROUTES` — default `false`
 - A startup script in the container:
-  1. Writes the secret to `/var/lib/zerotier-one/identity.secret` (if provided)
-  2. Starts `zerotier-one`
-  3. Joins `ZEROTIER_NETWORK_ID`
-  4. Waits until the node has an IP on the network
-  5. Starts the worker daemon
+  1. Starts `tailscaled`
+  2. Runs `tailscale up` with auth key + tags
+  3. Waits until Tailnet IP is assigned
+  4. Starts the worker daemon
 
-- Orchestrator also runs ZeroTier (native install or container) and gets a **fixed,
-  pre-allocated IP** on the ZeroTier network (via ZeroTier's IP assignment).
+- Orchestrator also runs Tailscale (native install or container) with tag `tag:wh-orchestrator`.
 
-- Worker containers can be pre-built with a static ZeroTier IP pool or use DHCP on the
-  ZeroTier network. For predictability, workers should be pre-authorized in the ZeroTier
-  central console so they always get the same IP based on their identity.
+- Access is controlled in Headscale ACLs/tags:
+  - `tag:wh-worker` -> `tag:wh-orchestrator:<heartbeat-port>`
+  - `tag:wh-orchestrator` -> `tag:wh-worker:22`
+  - No worker-to-worker access rule.
 
 ### Worker Registration (Heartbeat)
 
 Every **60 seconds** (configurable), the worker daemon POSTs to:
 ```
-http://<ORCHESTRATOR_ZEROTIER_IP>:<ORCHESTRATOR_PORT>/register
+http://<ORCHESTRATOR_HOST>:<ORCHESTRATOR_PORT>/register
 ```
 
 Payload:
@@ -88,7 +88,7 @@ Payload:
 {
   "worker_id": "uuid-v4",
   "name": "gpu-rig-1",           // from env WORKER_NAME or hostname
-  "zerotier_ip": "10.147.17.x",
+  "zerotier_ip": "100.64.x.y",       // transitional field name; carries overlay IP
   "ssh_port": 22,                // container SSH port (passed at start)
   "gpu_count": 2,
   "gpus": [
@@ -110,7 +110,7 @@ Payload:
 ```
 
 If the orchestrator restarts, workers will re-register on their next heartbeat and the
-orchestrator picks them back up (existing worker_id + zerotier_ip is the identity key).
+orchestrator picks them back up (existing worker_id + zerotier_ip/overlay IP is the identity key).
 
 ---
 
@@ -121,10 +121,8 @@ orchestrator picks them back up (existing worker_id + zerotier_ip is the identit
 ```
 FROM fedora:41  # or ubuntu, choose based on GPU driver compatibility
 
-# ZeroTier
-RUN curl -s 'https://pkg.zerotier.com/zt.gpg' | rpm --import - && \
-    curl -s https://www.zerotier.com/download/packages/zt_6_4.deb -o /tmp/zt.deb && \
-    apt install /tmp/zt.deb || ( # or yum/dnf equivalent )
+# Tailscale
+RUN curl -fsSL https://tailscale.com/install.sh | sh
 
 # SSH server
 RUN dnf install -y openssh-server tmux git curl wget vim jq && \
@@ -143,17 +141,17 @@ WORKDIR /workspace
 
 ```bash
 #!/bin/bash
-# 1. ZeroTier bootstrap
-if [ -n "$ZEROTIER_SECRET" ]; then
-    mkdir -p /var/lib/zerotier-one
-    echo "$ZEROTIER_SECRET" > /var/lib/zerotier-one/identity.secret
-fi
-zerotier-one &
-sleep 5
-zerotier-one join "$ZEROTIER_NETWORK_ID"
+# 1. Tailscale bootstrap
+tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
+sleep 2
+tailscale --socket=/var/run/tailscale/tailscaled.sock up \
+  --authkey "$TS_AUTHKEY" \
+  --advertise-tags "${TS_TAGS:-tag:wh-worker}" \
+  --accept-routes "${TS_ACCEPT_ROUTES:-false}" \
+  ${TS_HOSTNAME:+--hostname "$TS_HOSTNAME"}
 
 # Wait for IP
-while ! ip addr show zt* | grep -q "inet "; do sleep 1; done
+while [ -z "$(tailscale --socket=/var/run/tailscale/tailscaled.sock ip -4 2>/dev/null | head -n1)" ]; do sleep 1; done
 
 # 2. SSH server (port from env WORKER_SSH_PORT, default 22)
 sed -i "s/#Port 22/Port ${WORKER_SSH_PORT:-22}/" /etc/ssh/sshd_config
@@ -172,7 +170,7 @@ A single-file (or minimal module) async Python process. Responsibilities:
 - Send heartbeat POST every 60s to orchestrator
 - On startup, do a full registration POST immediately
 - Optionally: receive commands via a Unix socket (`/run/worker-daemon.sock`) for
-  things that need in-container execution (e.g. `podman ps`, `zerotier-cli status`)
+  things that need in-container execution (e.g. `podman ps`, `tailscale status`)
 
 That's it. No job management, no scheduling. Keep it tiny.
 
@@ -182,7 +180,7 @@ On each worker **host machine** (not inside the container):
 - Podman rootless socket must be running: `systemctl --user enable --now podman.socket`
 - The socket is passed into the container: `-v /run/podman/podman.sock:/run/podman/podman.sock`
 - NVIDIA Container Toolkit / runtime installed
-- ZeroTier client (if orchestrator runs natively)
+- Tailscale client (if orchestrator runs natively)
 
 ---
 
@@ -422,10 +420,10 @@ These are intentionally **not** in scope for v1 but noted for later:
    certificate-based auth on the heartbeat endpoint.
 2. **Job queues** — No queueing system. Jobs are fire-and-forget. A simple queue (SQLite-backed)
    with workers picking up work could be added later.
-3. **Multi-orchestrator** — One orchestrator per ZeroTier network. For HA: use a proper DB
+3. **Multi-orchestrator** — One orchestrator per tailnet. For HA: use a proper DB
    (PostgreSQL) instead of SQLite and run multiple orchestrators with leader election.
 4. **File transfer** — No `scp`/`rsync` built in yet. Workers have SSH so `rsync` over the
-   ZeroTier network works manually. A `worker-harness sync` command could wrap this.
+   tailnet works manually. A `worker-harness sync` command could wrap this.
 5. **NFS server** — The spec mentions potentially running an NFS server in workers for shared
    data. The tool will provide the *capability* but not automate the setup (agent responsibility).
 6. **GPU scheduling hints** — v1 just exposes GPU info. A future version could have a simple
@@ -436,7 +434,7 @@ These are intentionally **not** in scope for v1 but noted for later:
 ## 8. Implementation Order
 
 ### Phase 1 — Foundation
-1. Worker container Dockerfile + ZeroTier bootstrap script
+1. Worker container Dockerfile + Tailscale bootstrap script
 2. Worker daemon (heartbeat only, minimal)
 3. Orchestrator HTTP server (register + heartbeat endpoints)
 4. SQLite schema + repository layer
