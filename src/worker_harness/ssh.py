@@ -194,10 +194,11 @@ async def ssh_port_forward(worker: Worker, local_port: int, remote_port: int) ->
     args = [
         "ssh",
         "-N",
+        "-g",
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ServerAliveInterval=30",
-        "-L", f"{local_port}:localhost:{remote_port}",
+        "-L", f"0.0.0.0:{local_port}:localhost:{remote_port}",
         "-p", str(worker.ssh_port),
         "-i", SSH_KEY_PATH,
         f"{SSH_USER}@{worker.worker_ip}",

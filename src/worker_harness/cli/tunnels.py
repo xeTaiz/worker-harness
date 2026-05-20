@@ -86,7 +86,7 @@ def _tunnel_add_impl(
                     "pid": proc.pid,
                 }))
             else:
-                direction = f"localhost:{local_port} → {worker.name}:{remote_port}"
+                direction = f"orchestrator:{local_port} → {worker.name}:{remote_port}"
                 console.print(f"[green]Tunnel started[/]: {direction}")
                 console.print(f"  Service:  {pf.service_name}")
                 console.print(f"  PID:      {proc.pid}")
@@ -121,7 +121,7 @@ def _tunnel_list_impl():
                 for pf in forwards:
                     worker = workers.get(pf.worker_id)
                     wname = worker.name if worker else pf.worker_id[:12]
-                    direction = f"localhost:{pf.local_port} → {wname}:{pf.remote_port}"
+                    direction = f"orchestrator:{pf.local_port} → {wname}:{pf.remote_port}"
                     table.add_row(pf.id[:12], pf.service_name, direction, str(pf.pid))
                 console.print(table)
     asyncio.run(run())
