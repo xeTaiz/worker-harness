@@ -1,4 +1,4 @@
-httpx>=0.28
+httpx[socks]>=0.28
 psutil>=6.1
 torch
 torchvision

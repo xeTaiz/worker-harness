@@ -39,12 +39,12 @@ RUN curl -fsSL https://tailscale.com/install.sh | sh
 COPY authorized_keys /ssh/authorized_keys
 RUN chmod 600 /ssh/authorized_keys
 
-# Copy worker daemon
-COPY worker_daemon.py /worker_daemon.py
 COPY requirements.txt /requirements.txt
 RUN pip3 install --break-system-packages -r /requirements.txt
 
 WORKDIR /workspace
+# Copy worker daemon
+COPY worker_daemon.py /worker_daemon.py
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

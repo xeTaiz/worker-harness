@@ -18,6 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -28,6 +29,7 @@ HEARTBEAT_INTERVAL: int = int(os.environ.get("HEARTBEAT_INTERVAL", "60"))
 WORKER_NAME: str = os.environ.get("WORKER_NAME", socket.gethostname())
 WORKER_SSH_PORT: int = int(os.environ.get("WORKER_SSH_PORT", "22"))
 WORKER_ID_FILE: Path = Path("/run/worker-daemon/id")
+WH_PROXY: str = os.environ.get("WH_PROXY", "").strip()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -172,6 +174,24 @@ def get_worker_id() -> str:
 
 # ── Heartbeat ────────────────────────────────────────────────────────
 
+def _validate_proxy(proxy: str) -> str:
+    parsed = urlparse(proxy)
+    if parsed.scheme not in {"socks5", "socks5h", "http", "https"}:
+        raise ValueError("WH_PROXY must use socks5/socks5h/http/https scheme")
+    if not parsed.hostname:
+        raise ValueError("WH_PROXY must include a host")
+    if parsed.port is None:
+        raise ValueError("WH_PROXY must include a port")
+    return proxy
+
+
+def build_http_client() -> httpx.AsyncClient:
+    kwargs: dict[str, Any] = {"trust_env": False}
+    if WH_PROXY:
+        kwargs["proxy"] = _validate_proxy(WH_PROXY)
+    return httpx.AsyncClient(**kwargs)
+
+
 def build_payload(worker_id: str, tailscale_ip: str, ssh_port: int) -> dict[str, Any]:
     gpu_info = get_gpu_info()
     sys_info = get_system_info()
@@ -220,9 +240,23 @@ async def main() -> None:
         sys.exit(1)
 
     worker_id = get_worker_id()
-    log.info(f"Worker daemon starting. ID={worker_id}, name={WORKER_NAME}")
+    proxy_mode = "enabled" if WH_PROXY else "disabled"
+    log.info(
+        "Worker daemon starting. ID=%s, name=%s, proxy=%s, orchestrator=%s:%s",
+        worker_id,
+        WORKER_NAME,
+        proxy_mode,
+        ORCHESTRATOR_HOST,
+        ORCHESTRATOR_PORT,
+    )
 
-    async with httpx.AsyncClient() as client:
+    try:
+        client = build_http_client()
+    except ValueError as e:
+        log.error(f"Invalid WH_PROXY: {e}")
+        sys.exit(1)
+
+    async with client:
         # Initial registration
         tailscale_ip = get_tailscale_ip()
         log.info(f"Tailscale IP: {tailscale_ip}")

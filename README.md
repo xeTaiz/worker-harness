@@ -60,10 +60,10 @@ Run worker (required envs: `TS_AUTHKEY`, `ORCHESTRATOR_HOST`):
 podman run -d \
   --name worker-harness-worker-1 \
   --restart unless-stopped \
-  --cap-add NET_ADMIN \
-  --device /dev/net/tun:/dev/net/tun \
   --device nvidia.com/gpu=all \
   -e TS_AUTHKEY='<WORKER_TS_AUTHKEY>' \
+  -e TS_USERSPACE='true' \
+  -e WH_PROXY='socks5://127.0.0.1:1055' \
   -e ORCHESTRATOR_HOST='<orchestrator-tailnet-dns-or-ip>' \
   worker-harness/worker:latest
 ```
@@ -89,6 +89,10 @@ Defaults (if unset):
 - `TS_OPERATOR=worker-harness`
 - `TS_HOSTNAME` unset
 - `TS_ACCEPT_ROUTES=false`
+- `TS_USERSPACE=true`
+- `TS_SOCKS5_ADDR=127.0.0.1:1055`
+- `TS_SERVE_SSH_PORT=<WORKER_SSH_PORT>`
+- `WH_PROXY` unset (auto-defaults to `socks5://$TS_SOCKS5_ADDR` when `TS_USERSPACE=true`)
 - `ORCHESTRATOR_PORT=12888`
 - `WORKER_SSH_PORT=22`
 - `HEARTBEAT_INTERVAL=60`
@@ -118,11 +122,13 @@ Defaults (if unset):
 Worker registration now uses `worker_ip`.
 `zerotier_ip` is still accepted as a backward-compatible input alias.
 
-## Runtime requirements for both containers
+## Runtime requirements
 
-- `/dev/net/tun` device
-- `NET_ADMIN` capability
-- Optional persistent `/var/lib/tailscale` volume if stable identity is desired
+- **Orchestrator container:** requires `/dev/net/tun` + `NET_ADMIN` (kernel/TUN mode).
+- **Worker container:**
+  - `TS_USERSPACE=true`: no `/dev/net/tun` and no `NET_ADMIN` required.
+  - `TS_USERSPACE=false`: requires `/dev/net/tun` + `NET_ADMIN`.
+- Optional persistent `/var/lib/tailscale` volume if stable identity is desired.
 
 See also:
 - `specs/TAILSCALE.md`
