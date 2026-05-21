@@ -34,7 +34,7 @@ Use `just` to build both images with a paired SSH key setup:
 
 This gives independent worker/orchestrator images with no runtime shared-volume key distribution required.
 
-## Start containers with Podman (ephemeral runtime)
+## Start containers with Docker or Podman (ephemeral runtime)
 
 Build images first:
 
@@ -43,6 +43,20 @@ just build
 ```
 
 Run orchestrator (only required env is `TS_AUTHKEY`):
+
+### Docker
+
+```bash
+docker run -d \
+  --name worker-harness-orchestrator \
+  --restart unless-stopped \
+  --cap-add NET_ADMIN \
+  --device /dev/net/tun:/dev/net/tun \
+  -e TS_AUTHKEY='<ORCH_TS_AUTHKEY>' \
+  worker-harness/orchestrator:latest
+```
+
+### Podman
 
 ```bash
 podman run -d \
@@ -55,6 +69,22 @@ podman run -d \
 ```
 
 Run worker (required envs: `TS_AUTHKEY`, `ORCHESTRATOR_HOST`):
+
+### Docker
+
+```bash
+docker run -d \
+  --name worker-harness-worker-1 \
+  --restart unless-stopped \
+  --gpus all \
+  -e TS_AUTHKEY='<WORKER_TS_AUTHKEY>' \
+  -e TS_USERSPACE='true' \
+  -e WH_PROXY='socks5://127.0.0.1:1055' \
+  -e ORCHESTRATOR_HOST='<orchestrator-tailnet-dns-or-ip>' \
+  worker-harness/worker:latest
+```
+
+### Podman
 
 ```bash
 podman run -d \
@@ -74,6 +104,32 @@ Notes:
 - Do not publish orchestrator API ports to the host; reach it via Tailnet IP/DNS only.
 - No Tailscale state volume is needed for ephemeral containers.
 - If you want persistent Tailnet identity across restarts, mount `/var/lib/tailscale`.
+
+## Run worker with Singularity/Apptainer
+
+Build the image first (`just build`), then create a `.sif` from the local Docker image:
+
+```bash
+apptainer pull worker-harness-worker.sif docker-daemon://worker-harness/worker:latest
+```
+
+Run the worker with GPU passthrough and required env vars:
+
+```bash
+apptainer run --nv \
+  --env TS_AUTHKEY='<WORKER_TS_AUTHKEY>' \
+  --env ORCHESTRATOR_HOST='<orchestrator-tailnet-dns-or-ip>' \
+  --env TS_USERSPACE='true' \
+  --env WH_PROXY='socks5://127.0.0.1:1055' \
+  --env WORKER_SSH_PORT='2222' \
+  --env TS_SERVE_SSH_PORT='2222' \
+  worker-harness-worker.sif
+```
+
+Notes:
+
+- `singularity` and `apptainer` CLIs are equivalent for these commands on most systems.
+- `WORKER_SSH_PORT` and `TS_SERVE_SSH_PORT` should match so the orchestrator connects to the registered reachable port.
 
 ## Worker container env vars
 
