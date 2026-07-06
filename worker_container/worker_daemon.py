@@ -9,6 +9,8 @@ Responsibilities:
 """
 
 import asyncio
+import getpass
+import json
 import logging
 import os
 import socket
@@ -27,9 +29,37 @@ ORCHESTRATOR_HOST: str = os.environ.get("ORCHESTRATOR_HOST", "")
 ORCHESTRATOR_PORT: int = int(os.environ.get("ORCHESTRATOR_PORT", "12888"))
 HEARTBEAT_INTERVAL: int = int(os.environ.get("HEARTBEAT_INTERVAL", "60"))
 WORKER_NAME: str = os.environ.get("WORKER_NAME", socket.gethostname())
-WORKER_SSH_PORT: int = int(os.environ.get("WORKER_SSH_PORT", "22"))
-WORKER_ID_FILE: Path = Path("/run/worker-daemon/id")
+WH_DIR: Path = Path(os.environ.get("WH_DIR", os.path.join(Path.home(), ".local", "worker-harness"))).expanduser()
+TS_SOCKET: str = str(WH_DIR / "tailscale" / "run" / "tailscaled.sock")
+HARNESS_DIR: Path = WH_DIR / "harness"
+WORKER_ID_FILE: Path = WH_DIR / "worker-daemon" / "id"
 WH_PROXY: str = os.environ.get("WH_PROXY", "").strip()
+def _detect_ssh_user() -> str:
+    for key in (
+        "SSH_USER",
+        "SINGULARITY_USER",
+        "APPTAINER_USER",
+        "SUDO_USER",
+        "LOGNAME",
+        "USER",
+    ):
+        value = os.environ.get(key, "").strip()
+        if value and value != "root":
+            return value
+
+    home = os.environ.get("HOME", "").strip()
+    if home.startswith("/home/"):
+        candidate = home.split("/", 2)[-1].strip()
+        if candidate and candidate != "root":
+            return candidate
+
+    try:
+        return getpass.getuser() or "root"
+    except Exception:
+        return "root"
+
+
+SSH_USER: str = _detect_ssh_user()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,21 +112,28 @@ def get_gpu_info() -> dict[str, Any]:
         return {"count": 0, "gpus": []}
 
 
-def get_tailscale_ip() -> str:
-    """Get the Tailscale IPv4 address."""
+def get_tailscale_identity() -> tuple[str, str]:
+    """Get the Tailscale IPv4 address and MagicDNS hostname."""
     commands = [
-        ["tailscale", "--socket=/var/run/tailscale/tailscaled.sock", "ip", "-4"],
-        ["tailscale", "ip", "-4"],
+        ["tailscale", f"--socket={TS_SOCKET}", "status", "--json"],
+        ["tailscale", "status", "--json"],
     ]
 
     for cmd in commands:
         try:
             out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=5).decode().strip()
-            if out:
-                return out.splitlines()[0].strip()
+            if not out:
+                continue
+            data = json.loads(out)
+            self_info = data.get("Self") or data.get("self") or {}
+            ips = self_info.get("TailscaleIPs") or []
+            ip = next((ip.strip() for ip in ips if "." in str(ip)), (ips[0].strip() if ips else ""))
+            dns_name = (self_info.get("DNSName") or self_info.get("HostName") or "").rstrip(".").strip()
+            if ip or dns_name:
+                return ip, dns_name
         except Exception:
             continue
-    return ""
+    return "", ""
 
 
 def get_system_info() -> dict[str, Any]:
@@ -192,14 +229,16 @@ def build_http_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(**kwargs)
 
 
-def build_payload(worker_id: str, tailscale_ip: str, ssh_port: int) -> dict[str, Any]:
+def build_payload(worker_id: str, tailscale_ip: str, dns_name: str) -> dict[str, Any]:
     gpu_info = get_gpu_info()
     sys_info = get_system_info()
     return {
         "worker_id": worker_id,
         "name": WORKER_NAME,
         "worker_ip": tailscale_ip,
-        "ssh_port": ssh_port,
+        "dns_name": dns_name,
+        "ssh_user": SSH_USER,
+        "harness_dir": str(HARNESS_DIR),
         "gpu_count": gpu_info.get("gpu_count", 0),
         "gpus": gpu_info.get("gpus", []),
         "cpu_cores": sys_info.get("cpu_cores", 0),
@@ -213,8 +252,8 @@ def build_payload(worker_id: str, tailscale_ip: str, ssh_port: int) -> dict[str,
     }
 
 
-async def send_heartbeat(worker_id: str, tailscale_ip: str, ssh_port: int, client: httpx.AsyncClient) -> bool:
-    payload = build_payload(worker_id, tailscale_ip, ssh_port)
+async def send_heartbeat(worker_id: str, tailscale_ip: str, dns_name: str, client: httpx.AsyncClient) -> bool:
+    payload = build_payload(worker_id, tailscale_ip, dns_name)
     url = f"http://{ORCHESTRATOR_HOST}:{ORCHESTRATOR_PORT}/register"
     try:
         resp = await client.post(url, json=payload, timeout=10.0)
@@ -242,9 +281,11 @@ async def main() -> None:
     worker_id = get_worker_id()
     proxy_mode = "enabled" if WH_PROXY else "disabled"
     log.info(
-        "Worker daemon starting. ID=%s, name=%s, proxy=%s, orchestrator=%s:%s",
+        "Worker daemon starting. ID=%s, name=%s, ssh_user=%s, wh_dir=%s, proxy=%s, orchestrator=%s:%s",
         worker_id,
         WORKER_NAME,
+        SSH_USER,
+        WH_DIR,
         proxy_mode,
         ORCHESTRATOR_HOST,
         ORCHESTRATOR_PORT,
@@ -258,15 +299,15 @@ async def main() -> None:
 
     async with client:
         # Initial registration
-        tailscale_ip = get_tailscale_ip()
-        log.info(f"Tailscale IP: {tailscale_ip}")
-        await send_heartbeat(worker_id, tailscale_ip, WORKER_SSH_PORT, client)
+        tailscale_ip, dns_name = get_tailscale_identity()
+        log.info(f"Tailscale IP: {tailscale_ip} DNS: {dns_name or '(none)'}")
+        await send_heartbeat(worker_id, tailscale_ip, dns_name, client)
 
         # Periodic heartbeats
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
-            tailscale_ip = get_tailscale_ip()
-            await send_heartbeat(worker_id, tailscale_ip, WORKER_SSH_PORT, client)
+            tailscale_ip, dns_name = get_tailscale_identity()
+            await send_heartbeat(worker_id, tailscale_ip, dns_name, client)
 
 
 if __name__ == "__main__":
