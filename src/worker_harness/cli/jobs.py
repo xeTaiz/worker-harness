@@ -77,7 +77,7 @@ def _job_start_impl(
                     console.print(f"[red]Failed to start job on {worker.name}[/]")
                     raise typer.Exit(1)
                 console.print(f"[green]Job started[/]: {job.id}")
-                console.print(f"  Worker:  {worker.name} ({worker.worker_ip})")
+                console.print(f"  Worker:  {worker.name} ({worker.ssh_host})")
                 console.print(f"  Session: {job.tmux_session}")
                 short_cmd = command[:80] + ("..." if len(command) > 80 else "")
                 console.print(f"  Command: {short_cmd}")

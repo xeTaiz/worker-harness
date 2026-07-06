@@ -68,7 +68,7 @@ def create_app(db: Database) -> FastAPI:
             worker = await db.upsert_worker(reg)
             log.info(
                 f"Worker registered/updated: {worker.name} "
-                f"(id={worker.id}, ip={worker.worker_ip}, gpus={worker.gpu_count})"
+                f"(id={worker.id}, ip={worker.worker_ip}, dns={getattr(worker, 'dns_name', '')}, gpus={worker.gpu_count})"
             )
             return {"status": "ok", "worker_id": worker.id}
         except ValidationError as e:

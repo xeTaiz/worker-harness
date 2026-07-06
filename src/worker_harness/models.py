@@ -52,7 +52,9 @@ class WorkerRegistration(BaseModel):
     worker_id: str
     name: str
     worker_ip: str = Field(validation_alias=AliasChoices("worker_ip", "zerotier_ip"))
-    ssh_port: int = 22
+    dns_name: str = ""
+    ssh_user: str = "root"
+    harness_dir: str = "/harness"
     gpu_count: int = 0
     gpus: list[GPUInfo] = Field(default_factory=list)
     cpu_cores: int = 0
@@ -71,7 +73,9 @@ class Worker(BaseModel):
     id: str
     name: str
     worker_ip: str
-    ssh_port: int = 22
+    dns_name: str = ""
+    ssh_user: str = "root"
+    harness_dir: str = "/harness"
     gpu_count: int = 0
     gpu_names: list[str] = Field(default_factory=list)
     gpu_vram_gb: list[float] = Field(default_factory=list)
@@ -85,6 +89,10 @@ class Worker(BaseModel):
     last_heartbeat_ts: int = 0
     created_at: int = 0
 
+    @property
+    def ssh_host(self) -> str:
+        return self.dns_name or self.worker_ip
+
     @classmethod
     def from_registration(cls, reg: WorkerRegistration) -> Worker:
         now = int(datetime.now(timezone.utc).timestamp())
@@ -92,7 +100,9 @@ class Worker(BaseModel):
             id=reg.worker_id,
             name=reg.name,
             worker_ip=reg.worker_ip,
-            ssh_port=reg.ssh_port,
+            dns_name=reg.dns_name,
+            ssh_user=reg.ssh_user,
+            harness_dir=reg.harness_dir,
             gpu_count=reg.gpu_count,
             gpu_names=[g.name for g in reg.gpus],
             gpu_vram_gb=[g.vram_total_gb for g in reg.gpus],
@@ -110,7 +120,9 @@ class Worker(BaseModel):
     def update_from_registration(self, reg: WorkerRegistration) -> None:
         self.name = reg.name
         self.worker_ip = reg.worker_ip
-        self.ssh_port = reg.ssh_port
+        self.dns_name = reg.dns_name
+        self.ssh_user = reg.ssh_user
+        self.harness_dir = reg.harness_dir
         self.gpu_count = reg.gpu_count
         self.gpu_names = [g.name for g in reg.gpus]
         self.gpu_vram_gb = [g.vram_total_gb for g in reg.gpus]
@@ -169,7 +181,9 @@ class WorkerSummary(BaseModel):
     id: str
     name: str
     worker_ip: str
-    ssh_port: int
+    dns_name: str = ""
+    ssh_user: str
+    harness_dir: str
     gpu_count: int
     gpu_names: list[str]
     cpu_cores: int
@@ -180,6 +194,10 @@ class WorkerSummary(BaseModel):
     status: WorkerStatus
     last_heartbeat_ts: int
     running_job_count: int = 0
+
+    @property
+    def ssh_host(self) -> str:
+        return self.dns_name or self.worker_ip
 
 
 class AgentWorkersResponse(BaseModel):

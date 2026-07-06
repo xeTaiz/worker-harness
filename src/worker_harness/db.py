@@ -48,7 +48,9 @@ class Database:
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 worker_ip TEXT NOT NULL,
-                ssh_port INTEGER NOT NULL DEFAULT 22,
+                dns_name TEXT NOT NULL DEFAULT '',
+                ssh_user TEXT NOT NULL DEFAULT 'root',
+                harness_dir TEXT NOT NULL DEFAULT '/harness',
                 gpu_count INTEGER DEFAULT 0,
                 gpu_names TEXT DEFAULT '[]',
                 gpu_vram_gb TEXT DEFAULT '[]',
@@ -82,6 +84,13 @@ class Database:
                 )
             else:
                 await self._db.execute("ALTER TABLE workers ADD COLUMN worker_ip TEXT NOT NULL DEFAULT ''")
+
+        if "dns_name" not in colnames:
+            await self._db.execute("ALTER TABLE workers ADD COLUMN dns_name TEXT NOT NULL DEFAULT ''")
+        if "ssh_user" not in colnames:
+            await self._db.execute("ALTER TABLE workers ADD COLUMN ssh_user TEXT NOT NULL DEFAULT 'root'")
+        if "harness_dir" not in colnames:
+            await self._db.execute("ALTER TABLE workers ADD COLUMN harness_dir TEXT NOT NULL DEFAULT '/harness'")
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
@@ -162,12 +171,12 @@ class Database:
     async def _insert_worker(self, w: Worker) -> None:
         await self._db.execute(
             """INSERT INTO workers
-               (id, name, worker_ip, ssh_port, gpu_count, gpu_names, gpu_vram_gb,
+               (id, name, worker_ip, dns_name, ssh_user, harness_dir, gpu_count, gpu_names, gpu_vram_gb,
                 gpu_used_vram_gb, cpu_cores, total_ram_gb, used_ram_gb, total_disk_gb, used_disk_gb,
                 status, last_heartbeat_ts, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                w.id, w.name, w.worker_ip, w.ssh_port, w.gpu_count,
+                w.id, w.name, w.worker_ip, w.dns_name, w.ssh_user, w.harness_dir, w.gpu_count,
                 json.dumps(w.gpu_names), json.dumps(w.gpu_vram_gb),
                 json.dumps(w.gpu_used_vram_gb),
                 w.cpu_cores, w.total_ram_gb, w.used_ram_gb,
@@ -180,12 +189,12 @@ class Database:
     async def _update_worker(self, w: Worker) -> None:
         await self._db.execute(
             """UPDATE workers SET
-               name=?, worker_ip=?, ssh_port=?, gpu_count=?, gpu_names=?,
+               name=?, worker_ip=?, dns_name=?, ssh_user=?, harness_dir=?, gpu_count=?, gpu_names=?,
                gpu_vram_gb=?, gpu_used_vram_gb=?, cpu_cores=?, total_ram_gb=?, used_ram_gb=?,
                total_disk_gb=?, used_disk_gb=?, status=?, last_heartbeat_ts=?
                WHERE id=?""",
             (
-                w.name, w.worker_ip, w.ssh_port, w.gpu_count,
+                w.name, w.worker_ip, w.dns_name, w.ssh_user, w.harness_dir, w.gpu_count,
                 json.dumps(w.gpu_names), json.dumps(w.gpu_vram_gb),
                 json.dumps(w.gpu_used_vram_gb),
                 w.cpu_cores, w.total_ram_gb, w.used_ram_gb,
@@ -200,7 +209,9 @@ class Database:
             id=row["id"],
             name=row["name"],
             worker_ip=row["worker_ip"],
-            ssh_port=row["ssh_port"],
+            dns_name=row["dns_name"],
+            ssh_user=row["ssh_user"],
+            harness_dir=row["harness_dir"],
             gpu_count=row["gpu_count"],
             gpu_names=json.loads(row["gpu_names"]),
             gpu_vram_gb=json.loads(row["gpu_vram_gb"]),

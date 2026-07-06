@@ -243,7 +243,7 @@ class MainScreen(Screen[None]):
             self._detail_mode = "worker"
             self.query_one("#detail-text", Static).update(
                 f"[bold]{item.name}[/bold]  {item.status.value}\n"
-                f"IP: {item.worker_ip}:{item.ssh_port}  |  "
+                f"SSH: {item.ssh_user}@{item.ssh_host}  |  "
                 f"CPUs: {item.cpu_cores}  |  "
                 f"RAM: {_pct(item.used_ram_gb, item.total_ram_gb)}  |  "
                 f"GPUs: {_gpu_summary(item)}"
@@ -279,7 +279,7 @@ class MainScreen(Screen[None]):
 
         self.query_one("#detail-text", Static).update(
             f"[bold]{w.name}[/bold]  {w.status.value}\n"
-            f"IP: {w.worker_ip}:{w.ssh_port}  |  "
+            f"SSH: {w.ssh_user}@{w.ssh_host}  |  "
             f"CPUs: {w.cpu_cores}  |  "
             f"RAM: {_pct(w.used_ram_gb, w.total_ram_gb)}  |  "
             f"GPUs: {_gpu_summary(w)}"
@@ -346,7 +346,7 @@ class MainScreen(Screen[None]):
                 for i, w in enumerate(workers):
                     icon = "●" if w.status.value == "online" else "○"
                     table.add_row(
-                        icon, w.name[:13], w.worker_ip,
+                        icon, w.name[:13], w.ssh_host,
                         str(w.gpu_count) if w.gpu_count else "-",
                         _pct(w.used_ram_gb, w.total_ram_gb),
                         key=i,
