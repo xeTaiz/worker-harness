@@ -1,10 +1,11 @@
-FROM nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
+FROM nvcr.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install system packages
-RUN apt-get update && apt-get install -y \
-    openssh-server \
+RUN rm -f /etc/apt/sources.list.d/*nvidia* /etc/apt/sources.list.d/cuda* 2>/dev/null || true \
+    && find /etc/apt/sources.list.d -type f -name '*.list' -exec sed -i '/developer\.download\.nvidia\.com/d' {} + 2>/dev/null || true \
+    && apt-get update -o Acquire::Retries=5 && apt-get install -y \
     openssh-client \
     tmux \
     git \
@@ -21,23 +22,8 @@ RUN apt-get update && apt-get install -y \
 
 RUN id -u worker-harness >/dev/null 2>&1 || useradd -m worker-harness
 
-# SSH server setup
-RUN ssh-keygen -A \
-    && mkdir -p /run/sshd \
-    && echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config \
-    && echo "AuthorizedKeysFile /ssh/authorized_keys" >> /etc/ssh/sshd_config \
-    && echo "PasswordAuthentication no" >> /etc/ssh/sshd_config \
-    && echo "PermitRootLogin prohibit-password" >> /etc/ssh/sshd_config
-
-# Harness directory for job scripts and logs
-RUN mkdir -p /harness && chmod 1777 /harness
-
 # Tailscale
 RUN curl -fsSL https://tailscale.com/install.sh | sh
-
-# Bake orchestrator public key into worker image (overridable via volume mount).
-COPY authorized_keys /ssh/authorized_keys
-RUN chmod 600 /ssh/authorized_keys
 
 COPY requirements.txt /requirements.txt
 RUN pip3 install --break-system-packages -r /requirements.txt

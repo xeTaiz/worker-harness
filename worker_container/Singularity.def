@@ -1,0 +1,55 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+
+%labels
+    Maintainer worker-harness
+    Description "Worker Harness worker image (Tailscale SSH-only)"
+
+%environment
+    export DEBIAN_FRONTEND=noninteractive
+
+%files
+    worker_container/requirements.txt /requirements.txt
+    worker_container/worker_daemon.py /worker_daemon.py
+    worker_container/entrypoint.sh /entrypoint.sh
+
+%post
+    set -eux
+
+    rm -f /etc/apt/sources.list.d/*nvidia* /etc/apt/sources.list.d/cuda* 2>/dev/null || true
+    find /etc/apt/sources.list.d -type f -name '*.list' -exec sed -i '/developer\.download\.nvidia\.com/d' {} + 2>/dev/null || true
+
+    apt-get update -o Acquire::Retries=5
+    apt-get install -y \
+        openssh-client \
+        tmux \
+        git \
+        curl \
+        wget \
+        vim \
+        jq \
+        python3 \
+        python3-pip \
+        iproute2
+
+    ln -sf /usr/bin/python3 /usr/bin/python
+
+    if ! id -u worker-harness >/dev/null 2>&1; then
+        useradd -m worker-harness
+    fi
+
+    curl -fsSL https://tailscale.com/install.sh | sh
+
+    pip3 install --break-system-packages -r /requirements.txt
+
+    chmod +x /entrypoint.sh
+
+%runscript
+    exec /entrypoint.sh "$@"
+
+%startscript
+    exec /entrypoint.sh "$@"
+
+%help
+    Worker Harness worker container for Singularity/Apptainer.
+    Uses Tailscale userspace networking and Tailscale SSH for orchestrator control.
