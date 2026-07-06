@@ -13,36 +13,20 @@ This repository targets **Tailscale + Headscale**.
 Required ACL directions:
 
 1. `tag:wh-worker` -> `tag:wh-orchestrator:12888` (heartbeat/register API)
-2. `tag:wh-orchestrator` -> `tag:wh-worker:22` (SSH job/tunnel control)
+2. `tag:wh-orchestrator` -> `tag:wh-worker:*` (worker control traffic)
 3. `tag:client` -> `tag:wh-orchestrator:12888` (optional external access)
 
-Everything else remains denied by default.
+Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 
-See `headscale-policy.example.json` for an example policy.
-
-## Build-time SSH key exchange (separate images)
-
-Use `just` to build both images with a paired SSH key setup:
-
-- `just build`
-  - generates `orchestrator_container/ssh/orchestrator_ed25519` only if missing
-  - copies the public key to `worker_container/authorized_keys`
-  - builds orchestrator and worker images separately
-- `just clearkeys`
-  - deletes generated orchestrator keypair and `worker_container/authorized_keys`
-  - next `just build` creates a fresh keypair
-
-This gives independent worker/orchestrator images with no runtime shared-volume key distribution required.
-
-## Start containers with Docker or Podman (ephemeral runtime)
-
-Build images first:
+## Build images
 
 ```bash
 just build
 ```
 
-Run orchestrator (only required env is `TS_AUTHKEY`):
+## Start containers with Docker or Podman (ephemeral runtime)
+
+Run orchestrator (required env: `TS_AUTHKEY`):
 
 ### Docker
 
@@ -78,9 +62,9 @@ docker run -d \
   --restart unless-stopped \
   --gpus all \
   -e TS_AUTHKEY='<WORKER_TS_AUTHKEY>' \
-  -e TS_USERSPACE='true' \
-  -e WH_PROXY='socks5://127.0.0.1:1055' \
   -e ORCHESTRATOR_HOST='<orchestrator-tailnet-dns-or-ip>' \
+  -e SSH_USER="$(id -un)" \
+  -e WH_PROXY='socks5://127.0.0.1:1055' \
   worker-harness/worker:latest
 ```
 
@@ -92,44 +76,63 @@ podman run -d \
   --restart unless-stopped \
   --device nvidia.com/gpu=all \
   -e TS_AUTHKEY='<WORKER_TS_AUTHKEY>' \
-  -e TS_USERSPACE='true' \
-  -e WH_PROXY='socks5://127.0.0.1:1055' \
   -e ORCHESTRATOR_HOST='<orchestrator-tailnet-dns-or-ip>' \
+  -e SSH_USER="$(id -un)" \
+  -e WH_PROXY='socks5://127.0.0.1:1055' \
   worker-harness/worker:latest
 ```
 
 Notes:
 
-- No keyshare volume is needed with the current build-time key flow (`just build`).
-- Do not publish orchestrator API ports to the host; reach it via Tailnet IP/DNS only.
-- No Tailscale state volume is needed for ephemeral containers.
-- If you want persistent Tailnet identity across restarts, mount `/var/lib/tailscale`.
+- Worker control is **Tailscale SSH only** (`tailscale up --ssh` on workers).
+- For Docker/Podman, pass `SSH_USER="$(id -un)"` so the worker advertises a non-root SSH user.
+- No build-time SSH key exchange is required.
+- Do not publish orchestrator API ports to the public host network; use Tailnet reachability.
 
 ## Run worker with Singularity/Apptainer
 
-Build the image first (`just build`), then create a `.sif` from the local Docker image:
+Build and convert from local Docker image:
 
 ```bash
 apptainer pull worker-harness-worker.sif docker-daemon://worker-harness/worker:latest
 ```
 
-Run the worker with GPU passthrough and required env vars:
+Use the helper wrapper to generate `/etc/passwd` and `/etc/group` from the image and bind them into the container:
 
 ```bash
-apptainer run --nv \
-  --env TS_AUTHKEY='<WORKER_TS_AUTHKEY>' \
-  --env ORCHESTRATOR_HOST='<orchestrator-tailnet-dns-or-ip>' \
-  --env TS_USERSPACE='true' \
-  --env WH_PROXY='socks5://127.0.0.1:1055' \
-  --env WORKER_SSH_PORT='2222' \
-  --env TS_SERVE_SSH_PORT='2222' \
-  worker-harness-worker.sif
+export TS_AUTHKEY='<WORKER_TS_AUTHKEY>'
+export ORCHESTRATOR_HOST='<orchestrator-tailnet-dns-or-ip>'
+./start-wh.sh worker-harness-worker.sif
 ```
 
 Notes:
 
-- `singularity` and `apptainer` CLIs are equivalent for these commands on most systems.
-- `WORKER_SSH_PORT` and `TS_SERVE_SSH_PORT` should match so the orchestrator connects to the registered reachable port.
+- `singularity` and `apptainer` CLIs are equivalent on most systems.
+- `start-wh.sh` binds a generated `/etc/passwd` and `/etc/group` plus a writable `WH_DIR` at `/var/lib/worker-harness`.
+- Worker runtime user is auto-detected and registered as `ssh_user` (fallback `root`).
+- `start-wh.sh` uses `--fakeroot` only when subordinate UID/GID ranges exist; override with `WH_FAKEROOT=1` or `0`.
+- Tailscale SSH always uses Tailnet port `22`; this does not require publishing host port `22`.
+
+### Auto-start on reboot (systemd user service)
+
+If you want the worker to restart automatically after a crash, install the user service and env file:
+
+```bash
+./install-service.sh
+```
+
+The service assumes `~/start-wh.sh` and `~/worker-harness-worker.sif`.
+
+If you prefer manual install:
+
+```bash
+mkdir -p ~/.config/systemd/user ~/.config/worker-harness
+cp systemd/worker-harness.service ~/.config/systemd/user/
+cp systemd/worker-harness.env ~/.config/worker-harness/
+systemctl --user daemon-reload
+systemctl --user enable --now worker-harness
+loginctl enable-linger "$USER"   # optional, but needed to start after reboot without login
+```
 
 ## Worker container env vars
 
@@ -140,17 +143,19 @@ Required:
 
 Defaults (if unset):
 
-- `TS_TAGS=tag:wh-worker`
 - `TS_HOST=https://controlplane.tailscale.com` (override for self-hosted Headscale)
-- `TS_OPERATOR=worker-harness`
 - `TS_HOSTNAME` unset
 - `TS_ACCEPT_ROUTES=false`
-- `TS_USERSPACE=true`
+- `TS_EXTRA_ARGS` unset
 - `TS_SOCKS5_ADDR=127.0.0.1:1055`
-- `TS_SERVE_SSH_PORT=<WORKER_SSH_PORT>`
-- `WH_PROXY` unset (auto-defaults to `socks5://$TS_SOCKS5_ADDR` when `TS_USERSPACE=true`)
+- `WH_PROXY` defaults to `socks5://$TS_SOCKS5_ADDR`
+- `SSH_USER` auto-detected from runtime env/home (set explicitly for Docker/Podman)
+- `WH_DIR=$HOME/.local/worker-harness`
+  - Tailscale state: `$WH_DIR/tailscale/state`
+  - Tailscale socket: `$WH_DIR/tailscale/run/tailscaled.sock`
+  - Worker daemon ID: `$WH_DIR/worker-daemon/id`
+  - Job/log harness: `$WH_DIR/harness`
 - `ORCHESTRATOR_PORT=12888`
-- `WORKER_SSH_PORT=22`
 - `HEARTBEAT_INTERVAL=60`
 - `WORKER_NAME=<container hostname>`
 
@@ -162,30 +167,26 @@ Required:
 
 Defaults (if unset):
 
-- `TS_TAGS=tag:wh-orchestrator`
 - `TS_HOST=https://controlplane.tailscale.com` (override for self-hosted Headscale)
-- `TS_OPERATOR=worker-harness`
-- `TS_HOSTNAME=orchestrator
+- `TS_HOSTNAME=orchestrator`
 - `TS_ACCEPT_ROUTES=false`
+- `TS_EXTRA_ARGS` unset
 - `WH_HB_HOST=0.0.0.0`
 - `WH_HB_PORT=12888`
 - `WH_DB_PATH=~/.config/worker-harness/db.sqlite`
 - `WH_COMMAND=serve`
-- `SSH_KEY_PATH=/opt/worker-harness/ssh/orchestrator_ed25519`
 
-## Worker registration field
+## Worker registration fields
 
-Worker registration now uses `worker_ip`.
-`zerotier_ip` is still accepted as a backward-compatible input alias.
+Worker registration uses `worker_ip`, `ssh_user`, and `harness_dir`.
+`zerotier_ip` is still accepted as a backward-compatible input alias for `worker_ip`.
 
 ## Runtime requirements
 
-- **Orchestrator container:** requires `/dev/net/tun` + `NET_ADMIN` (kernel/TUN mode).
-- **Worker container:**
-  - `TS_USERSPACE=true`: no `/dev/net/tun` and no `NET_ADMIN` required.
-  - `TS_USERSPACE=false`: requires `/dev/net/tun` + `NET_ADMIN`.
-- Optional persistent `/var/lib/tailscale` volume if stable identity is desired.
+- **Orchestrator container:** requires `/dev/net/tun` + `NET_ADMIN`.
+- **Worker container:** uses Tailscale userspace networking.
 
 See also:
 - `specs/TAILSCALE.md`
-- `specs/docker-compose.tailscale.example.yml`
+- `docker-compose.tailscale.example.yml`
+- `headscale-policy.example.json`
