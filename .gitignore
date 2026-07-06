@@ -1,4 +1,6 @@
 **/__pycache__
-worker_container/authorized_keys
-orchestrator_container/ssh/
 .env
+.apptainer-cache/
+.apptainer-tmp/
+.pip-cache/
+systemd/*.env
