@@ -9,7 +9,6 @@ TS_HOSTNAME="${TS_HOSTNAME:-orchestrator}"
 TS_ACCEPT_ROUTES="${TS_ACCEPT_ROUTES:-false}"
 TS_EXTRA_ARGS="${TS_EXTRA_ARGS:-}"
 WH_COMMAND="${WH_COMMAND:-serve}"
-SSH_KEY_PATH="${SSH_KEY_PATH:-/opt/worker-harness/ssh/orchestrator_ed25519}"
 
 if [ -z "$TS_AUTHKEY" ]; then
   echo "[entrypoint] ERROR: TS_AUTHKEY is required"
@@ -17,14 +16,6 @@ if [ -z "$TS_AUTHKEY" ]; then
 fi
 
 mkdir -p /var/lib/tailscale /var/run/tailscale /root/.config/worker-harness
-
-if [ ! -f "$SSH_KEY_PATH" ]; then
-  echo "[entrypoint] ERROR: SSH private key not found at $SSH_KEY_PATH"
-  echo "[entrypoint] Build orchestrator image via 'just build' so key is baked in"
-  exit 1
-fi
-chmod 600 "$SSH_KEY_PATH"
-export SSH_KEY_PATH
 
 echo "[entrypoint] Starting tailscaled..."
 tailscaled \
