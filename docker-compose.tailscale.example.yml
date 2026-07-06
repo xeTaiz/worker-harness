@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: orchestrator_container/Dockerfile
+    container_name: worker-harness-orchestrator
+    environment:
+      TS_AUTHKEY: ${ORCH_TS_AUTHKEY}
+      TS_HOST: ${TS_HOST:-https://controlplane.tailscale.com}
+      TS_HOSTNAME: orchestrator
+      TS_ACCEPT_ROUTES: "false"
+      WH_COMMAND: serve
+      WH_HB_HOST: 0.0.0.0
+      WH_HB_PORT: 12888
+      WH_DB_PATH: /data/db.sqlite
+    volumes:
+      - orchestrator-db:/data
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./worker_container
+      dockerfile: Dockerfile
+    container_name: worker-harness-worker-1
+    environment:
+      TS_AUTHKEY: ${WORKER_TS_AUTHKEY}
+      TS_HOST: ${TS_HOST:-https://controlplane.tailscale.com}
+      TS_HOSTNAME: worker-1
+      TS_ACCEPT_ROUTES: "false"
+      TS_SOCKS5_ADDR: "127.0.0.1:1055"
+      WH_PROXY: "socks5://127.0.0.1:1055"
+      WH_DIR: /var/lib/worker-harness
+      ORCHESTRATOR_HOST: orchestrator.tailnet.example
+      ORCHESTRATOR_PORT: "12888"
+      HEARTBEAT_INTERVAL: "60"
+      WORKER_NAME: worker-1
+    restart: unless-stopped
+
+volumes:
+  orchestrator-db:

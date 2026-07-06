@@ -97,41 +97,50 @@ Build and convert from local Docker image:
 apptainer pull worker-harness-worker.sif docker-daemon://worker-harness/worker:latest
 ```
 
-Use the helper wrapper to generate `/etc/passwd` and `/etc/group` from the image and bind them into the container:
+Recommended deploy flow:
 
 ```bash
-export TS_AUTHKEY='<WORKER_TS_AUTHKEY>'
-export ORCHESTRATOR_HOST='<orchestrator-tailnet-dns-or-ip>'
+just dist
+rsync -a dist/ target:/path/to/worker-harness/
+```
+
+Then on the target host:
+
+```bash
+cd /path/to/worker-harness
+./install-service.sh
+```
+
+If you want to run it manually instead of systemd, put env vars in `.env` (or set `WH_ENV_FILE`) and run:
+
+```bash
 ./start-wh.sh worker-harness-worker.sif
 ```
 
 Notes:
 
 - `singularity` and `apptainer` CLIs are equivalent on most systems.
+- `start-wh.sh` auto-loads env from `WH_ENV_FILE`, `./.env`, `./worker-harness.env`, or `~/.config/worker-harness/worker-harness.env` if present.
 - `start-wh.sh` binds a generated `/etc/passwd` and `/etc/group` plus a writable `WH_DIR` at `/var/lib/worker-harness`.
 - Worker runtime user is auto-detected and registered as `ssh_user` (fallback `root`).
 - `start-wh.sh` uses `--fakeroot` only when subordinate UID/GID ranges exist; override with `WH_FAKEROOT=1` or `0`.
 - Tailscale SSH always uses Tailnet port `22`; this does not require publishing host port `22`.
+- `just dist` stages a rsync-friendly bundle from the repo `.env` (generated `dist/.env` is gitignored).
 
 ### Auto-start on reboot (systemd user service)
 
-If you want the worker to restart automatically after a crash, install the user service and env file:
+If you want the worker to restart automatically after a crash:
 
 ```bash
 ./install-service.sh
 ```
 
-The service assumes `~/start-wh.sh` and `~/worker-harness-worker.sif`.
+`install-service.sh` copies `start-wh.sh` and `worker-harness-worker.sif` into `$HOME`, stores the runtime env in `~/.config/worker-harness/worker-harness.env`, and prompts for any missing mandatory values if no bundle `.env` is present.
 
-If you prefer manual install:
+For boot without login, enable user lingering:
 
 ```bash
-mkdir -p ~/.config/systemd/user ~/.config/worker-harness
-cp systemd/worker-harness.service ~/.config/systemd/user/
-cp systemd/worker-harness.env ~/.config/worker-harness/
-systemctl --user daemon-reload
-systemctl --user enable --now worker-harness
-loginctl enable-linger "$USER"   # optional, but needed to start after reboot without login
+loginctl enable-linger "$USER"
 ```
 
 ## Worker container env vars

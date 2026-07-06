@@ -22,3 +22,6 @@ build-singularity-from-docker output="worker-harness-worker.sif":
     @echo "[just build-singularity-from-docker] Pulling Singularity image from docker-daemon://{{worker_image}} -> {{output}}"
     @mkdir -p .apptainer-tmp .apptainer-cache
     @TMPDIR="$PWD/.apptainer-tmp" APPTAINER_TMPDIR="$PWD/.apptainer-tmp" APPTAINER_CACHEDIR="$PWD/.apptainer-cache" apptainer pull --force {{output}} docker-daemon://{{worker_image}}
+
+dist:
+    @./scripts/make-dist.sh

@@ -4,3 +4,7 @@
 .apptainer-tmp/
 .pip-cache/
 systemd/*.env
+dist/*
+dist/.env
+!dist/.gitignore
+!dist/README.md

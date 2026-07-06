@@ -13,6 +13,24 @@ if [ -z "$runtime" ]; then
   fi
 fi
 
+load_env_file() {
+  local env_file="$1"
+  if [ -n "$env_file" ] && [ -f "$env_file" ]; then
+    # shellcheck disable=SC1090
+    set -a
+    . "$env_file"
+    set +a
+    return 0
+  fi
+  return 1
+}
+
+if ! load_env_file "${WH_ENV_FILE:-}"; then
+  load_env_file "$PWD/.env" || true
+  load_env_file "$PWD/worker-harness.env" || true
+  load_env_file "$HOME/.config/worker-harness/worker-harness.env" || true
+fi
+
 image="${WH_IMAGE:-${1:-worker-harness-worker.sif}}"
 wh_dir_host="${WH_DIR:-$HOME/.local/worker-harness}"
 wh_dir_container="${WH_CONTAINER_DIR:-/var/lib/worker-harness}"
@@ -36,6 +54,8 @@ if [ -n "${WH_FAKEROOT:-}" ]; then
 elif grep -q "^${ssh_user}:" /etc/subuid 2>/dev/null && grep -q "^${ssh_user}:" /etc/subgid 2>/dev/null; then
   fakeroot_flag="--fakeroot"
 fi
+
+TS_AUTHKEY="${TS_AUTHKEY:-${WORKER_TS_KEY:-}}"
 
 if [ -z "${TS_AUTHKEY:-}" ]; then
   echo "[start-wh] ERROR: TS_AUTHKEY is required" >&2
