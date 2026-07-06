@@ -32,5 +32,13 @@
       "src": ["autogroup:member"],
       "dst": ["autogroup:member:*"]
     }
+  ],
+  "ssh": [
+    {
+      "action": "accept",
+      "src": ["tag:wh-orchestrator"],
+      "dst": ["tag:wh-worker"],
+      "users": ["root", "autogroup:nonroot"]
+    }
   ]
 }
