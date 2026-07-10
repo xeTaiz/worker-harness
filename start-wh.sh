@@ -68,6 +68,19 @@ fi
 
 mkdir -p "$wh_dir_host" "$compat_dir" "${wh_dir_host}/home/${ssh_user}"
 
+# ── Writable overlay (persistent apt installs across restarts) ───────
+overlay_file="${WH_OVERLAY:-$wh_dir_host/overlay.ext3}"
+overlay_size="${WH_OVERLAY_SIZE:-8192}"   # MiB (8 GB default)
+if [ ! -f "$overlay_file" ]; then
+  if "$runtime" overlay create --size "$overlay_size" "$overlay_file" 2>/dev/null; then
+    echo "[start-wh] Created ${overlay_size}MiB writable overlay at $overlay_file"
+  else
+    echo "[start-wh] WARNING: could not create overlay ($overlay_file). Continuing without it." >&2
+    echo "[start-wh]   (Needs fakeroot/root + mkfs.ext3. Set WH_OVERLAY to a pre-created file to skip this.)" >&2
+    overlay_file=""
+  fi
+fi
+
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
@@ -147,6 +160,11 @@ mount_args=($fakeroot_flag --nv \
   --bind "$passwd_file:/etc/passwd" \
   --bind "$group_file:/etc/group" \
   --workdir "$ssh_home_container")
+
+# Add writable overlay if available (allows persistent apt installs)
+if [ -n "$overlay_file" ] && [ -f "$overlay_file" ]; then
+  mount_args+=(--overlay "$overlay_file")
+fi
 
 exec_env_args=(
   --env TS_AUTHKEY="$TS_AUTHKEY"

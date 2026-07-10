@@ -167,6 +167,8 @@ Defaults (if unset):
 - `ORCHESTRATOR_PORT=12888`
 - `HEARTBEAT_INTERVAL=60`
 - `WORKER_NAME=<container hostname>`
+- `WH_OVERLAY` - path to a writable ext3 overlay file (default: `$WH_DIR/overlay.ext3`). Created automatically on first start if the runtime supports it. Lets `apt install` persist across container restarts.
+- `WH_OVERLAY_SIZE` - overlay size in MiB (default: `8192` = 8 GB)
 
 ## Orchestrator container env vars
 
@@ -199,3 +201,4 @@ See also:
 - `specs/TAILSCALE.md`
 - `docker-compose.tailscale.example.yml`
 - `headscale-policy.example.json`
+- `worker_container/CUDA_ENV_GUIDE.md` — how to install CUDA toolkits (nvcc) and Python ML environments on demand inside a worker
