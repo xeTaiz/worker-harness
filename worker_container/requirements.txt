@@ -1,16 +1,4 @@
+# Only the worker daemon's own dependencies belong here.
+# ML/CUDA stacks (torch, transformers, etc.) are installed per-job via uv.
 httpx[socks]>=0.28
 psutil>=6.1
-torch
-torchvision
-timm
-transformers
-huggingface_hub
-numpy
-tensorboard
-matplotlib
-scikit-learn
-scikit-image
-tqdm
-jupyter
-notebook
-opencv-python-headless

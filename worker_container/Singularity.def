@@ -12,6 +12,8 @@ From: nvcr.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
     worker_container/requirements.txt /requirements.txt
     worker_container/worker_daemon.py /worker_daemon.py
     worker_container/entrypoint.sh /entrypoint.sh
+    worker_container/wh-cuda-env /wh-cuda-env
+    worker_container/CUDA_ENV_GUIDE.md /opt/wh/CUDA_ENV_GUIDE.md
 
 %post
     set -eux
@@ -30,7 +32,13 @@ From: nvcr.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
         jq \
         python3 \
         python3-pip \
-        iproute2
+        iproute2 \
+        build-essential \
+        cmake \
+        ninja-build \
+        pkg-config \
+        file \
+        ccache
 
     ln -sf /usr/bin/python3 /usr/bin/python
 
@@ -40,9 +48,12 @@ From: nvcr.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 
     curl -fsSL https://tailscale.com/install.sh | sh
 
+    pip3 install --break-system-packages uv
     pip3 install --break-system-packages -r /requirements.txt
 
     chmod +x /entrypoint.sh
+    chmod +x /wh-cuda-env
+    ln -sf /wh-cuda-env /usr/local/bin/wh-cuda-env
 
 %runscript
     exec /entrypoint.sh "$@"

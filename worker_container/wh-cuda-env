@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# wh-cuda-env — install and activate a CUDA toolkit (nvcc) from pip wheels.
+#
+# Usage:
+#   wh-cuda-env install [pip-install-args...]   # one-time per worker
+#   eval "$(wh-cuda-env env)"                    # activate in any shell
+#   wh-cuda-env status                           # show current state
+#
+# The toolkit lives in $WH_DIR/harness/ and is cached across jobs.
+# No root required.  Needs `uv` (shipped in the image) and a host compiler
+# (build-essential, shipped in the image).
+set -euo pipefail
+
+WH_DIR="${WH_DIR:-/var/lib/worker-harness}"
+CUDA_VENV="${WH_DIR}/harness/cuda-venv"
+CUDA_ROOT="${WH_DIR}/harness/cuda-root"
+DEFAULT_PKGS=(nvidia-cuda-nvcc-cu12 nvidia-cuda-runtime-cu12 nvidia-cuda-cccl-cu12)
+
+_err() { echo "[wh-cuda-env] ERROR: $*" >&2; exit 1; }
+
+_nvidia_root() {
+  find "$CUDA_VENV" -type d -name nvidia -path "*/site-packages/*" 2>/dev/null | head -1
+}
+
+# Build a symlink tree that looks like a conventional $CUDA_HOME so that
+# arbitrary build systems (cmake FindCUDA, setup.py, Makefile, …) work
+# without extra flags.
+_build_shim() {
+  local nr="$1"
+  rm -rf "$CUDA_ROOT"
+  mkdir -p "$CUDA_ROOT/bin" "$CUDA_ROOT/include" "$CUDA_ROOT/lib64"
+
+  # nvcc + its internal binaries (cicc, ptxas, fatbinary, cudafe, …)
+  ln -sf "$nr/cuda_nvcc/bin/"*      "$CUDA_ROOT/bin/"
+  # nvcc needs nvvm/ discoverable relative to its own location
+  ln -sf "$nr/cuda_nvcc/nvvm"       "$CUDA_ROOT/nvvm"  2>/dev/null || true
+  ln -sf "$nr/cuda_nvcc/include/"*  "$CUDA_ROOT/include/"
+  # cuda_runtime.h, cuda.h, driver_types.h, …
+  ln -sf "$nr/cuda_runtime/include/"* "$CUDA_ROOT/include/" 2>/dev/null || true
+  # thrust / cub / libcudxx headers
+  ln -sf "$nr/cuda_cccl/include/"*  "$CUDA_ROOT/include/" 2>/dev/null || true
+  # libcudart.so, libcudart_static.a, libnvrtc.so, …
+  ln -sf "$nr/cuda_runtime/lib/"*   "$CUDA_ROOT/lib64/" 2>/dev/null || true
+  ln -sf "$nr/cuda_nvcc/lib/"*      "$CUDA_ROOT/lib64/" 2>/dev/null || true
+}
+
+_print_env() {
+  cat <<SCRIPT
+export CUDA_HOME="$CUDA_ROOT"
+export PATH="$CUDA_ROOT/bin\${PATH:+:\$PATH}"
+export LD_LIBRARY_PATH="$CUDA_ROOT/lib64\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+export CPATH="$CUDA_ROOT/include\${CPATH:+:\$CPATH}"
+export LIBRARY_PATH="$CUDA_ROOT/lib64\${LIBRARY_PATH:+:\$LIBRARY_PATH}"
+SCRIPT
+}
+
+cmd_install() {
+  command -v uv  >/dev/null 2>&1 || _err "uv not found on PATH"
+  command -v g++ >/dev/null 2>&1 || _err "g++ not found — build-essential missing from image"
+
+  local pkgs=("$@")
+  if [ "${#pkgs[@]}" -eq 0 ]; then
+    pkgs=("${DEFAULT_PKGS[@]}")
+  fi
+
+  mkdir -p "${WH_DIR}/harness"
+
+  if [ ! -d "$CUDA_VENV" ]; then
+    echo "[wh-cuda-env] Creating venv at $CUDA_VENV ..."
+    uv venv "$CUDA_VENV" >/dev/null
+  fi
+
+  echo "[wh-cuda-env] Installing: ${pkgs[*]}"
+  uv pip install --python "$CUDA_VENV/bin/python" "${pkgs[@]}"
+
+  local nr
+  nr="$(_nvidia_root)"
+  [ -n "$nr" ] || _err "could not locate nvidia/ under $CUDA_VENV"
+
+  echo "[wh-cuda-env] Building CUDA_HOME shim at $CUDA_ROOT ..."
+  _build_shim "$nr"
+
+  echo "[wh-cuda-env] Done. Activate with:  eval \"\$(wh-cuda-env env)\""
+  _print_env
+}
+
+cmd_env() {
+  [ -d "$CUDA_ROOT" ] || _err "no toolkit at $CUDA_ROOT — run 'wh-cuda-env install' first"
+  _print_env
+}
+
+cmd_status() {
+  echo "WH_DIR:     $WH_DIR"
+  echo "venv:       $CUDA_VENV  ($([ -d "$CUDA_VENV" ] && echo present || echo missing))"
+  echo "cuda-root:  $CUDA_ROOT  ($([ -d "$CUDA_ROOT" ] && echo present || echo missing))"
+  if [ -x "$CUDA_ROOT/bin/nvcc" ]; then
+    echo "nvcc:       $("$CUDA_ROOT/bin/nvcc" --version 2>/dev/null | grep release || echo 'version query failed')"
+  fi
+}
+
+case "${1:-}" in
+  install) shift; cmd_install "$@" ;;
+  env)     cmd_env ;;
+  status)  cmd_status ;;
+  ""|help|-h|--help)
+    sed -n '2,11p' "$0"
+    ;;
+  *) _err "unknown subcommand: $1  (try: wh-cuda-env help)" ;;
+esac
