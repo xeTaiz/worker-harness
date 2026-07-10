@@ -176,6 +176,7 @@ async def ssh_get_exit_code(worker: Worker, job_id: str) -> int | None:
 
 
 async def ssh_copy_file(worker: Worker, local_path: str | Path, remote_path: str, timeout: int = 60) -> SSHResult:
+    """Upload a local file to a worker by piping bytes over SSH stdin."""
     import shlex
 
     local_path = Path(local_path)
@@ -193,6 +194,49 @@ async def ssh_copy_file(worker: Worker, local_path: str | Path, remote_path: str
         stdout=(result.stdout or b"").decode(errors="replace"),
         stderr=(result.stderr or b"").decode(errors="replace"),
         returncode=result.returncode,
+    )
+
+
+async def ssh_upload_bytes(worker: Worker, content: bytes, remote_path: str, timeout: int = 60) -> SSHResult:
+    """Upload raw bytes (not a local file) to a worker path."""
+    import shlex
+
+    remote_parent = shlex.quote(str(Path(remote_path).parent))
+    remote_file = shlex.quote(remote_path)
+    cmd = f"mkdir -p {remote_parent} && cat > {remote_file}"
+    args = _ssh_base_args(worker) + ["sh", "-lc", cmd]
+    result = subprocess.run(
+        args,
+        input=content,
+        capture_output=True,
+        timeout=timeout,
+    )
+    return SSHResult(
+        stdout=(result.stdout or b"").decode(errors="replace"),
+        stderr=(result.stderr or b"").decode(errors="replace"),
+        returncode=result.returncode,
+    )
+
+
+async def ssh_download_bytes(worker: Worker, remote_path: str, max_bytes: int = 10 * 1024 * 1024, timeout: int = 30) -> tuple[bytes, SSHResult]:
+    """Download a file from a worker. Returns (content, ssh_result)."""
+    import shlex
+
+    remote_file = shlex.quote(remote_path)
+    cmd = f"cat {remote_file}"
+    args = _ssh_base_args(worker) + ["sh", "-lc", cmd]
+    result = subprocess.run(
+        args,
+        capture_output=True,
+        timeout=timeout,
+    )
+    return (
+        result.stdout or b"",
+        SSHResult(
+            stdout="",
+            stderr=(result.stderr or b"").decode(errors="replace"),
+            returncode=result.returncode,
+        ),
     )
 
 

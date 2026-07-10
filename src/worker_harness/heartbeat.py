@@ -16,7 +16,7 @@ from pydantic import BaseModel, ValidationError
 from .db import Database
 from .job import JobManager
 from .models import JobStatus, PortForward, WorkerRegistration
-from .ssh import ssh_port_forward
+from .ssh import ssh_port_forward, ssh_upload_bytes, ssh_download_bytes
 
 log = logging.getLogger("heartbeat-server")
 
@@ -36,6 +36,20 @@ class TunnelCreateRequest(BaseModel):
     local_port: int
     remote_port: int
     name: str = ""
+
+
+# 10 MB — larger transfers should use direct rsync over tailnet SSH
+MAX_FILE_TRANSFER_BYTES = 10 * 1024 * 1024
+
+
+class FileUploadRequest(BaseModel):
+    path: str
+    content_b64: str  # base64-encoded file content
+
+
+class FileDownloadRequest(BaseModel):
+    path: str
+    max_bytes: int = MAX_FILE_TRANSFER_BYTES
 
 
 @asynccontextmanager
@@ -318,6 +332,79 @@ def create_app(db: Database) -> FastAPI:
 
         await db.delete_port_forward(pf.id)
         return {"tunnel_id": pf.id, "removed": True}
+
+    @app.post("/api/v1/workers/{worker_id}/files")
+    async def worker_file_upload(worker_id: str, payload: FileUploadRequest):
+        import base64
+
+        worker = await resolve_worker(worker_id)
+        if not worker:
+            raise HTTPException(status_code=404, detail=f"Worker not found: {worker_id}")
+
+        try:
+            content = base64.b64decode(payload.content_b64, validate=True)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid base64 content")
+
+        if len(content) > MAX_FILE_TRANSFER_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"File too large: {len(content)} bytes > {MAX_FILE_TRANSFER_BYTES} limit. "
+                    "Use rsync over tailnet SSH for large files: "
+                    "rsync -e 'tailscale ssh' <local> {worker.ssh_user}@{host}:{path}".format(
+                        worker=worker, host=worker.ssh_host, path=payload.path
+                    )
+                ),
+            )
+
+        result = await ssh_upload_bytes(worker, content, payload.path)
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=502,
+                detail=f"SSH upload failed: {result.stderr or 'unknown error'}",
+            )
+
+        return {
+            "worker_id": worker.id,
+            "path": payload.path,
+            "size": len(content),
+        }
+
+    @app.get("/api/v1/workers/{worker_id}/files")
+    async def worker_file_download(
+        worker_id: str,
+        path: str = Query(..., description="Remote file path to download"),
+        max_bytes: int = Query(MAX_FILE_TRANSFER_BYTES, ge=1, le=MAX_FILE_TRANSFER_BYTES),
+    ):
+        import base64
+
+        worker = await resolve_worker(worker_id)
+        if not worker:
+            raise HTTPException(status_code=404, detail=f"Worker not found: {worker_id}")
+
+        content, result = await ssh_download_bytes(worker, path, max_bytes=max_bytes)
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=502,
+                detail=f"SSH download failed: {result.stderr or 'unknown error'}",
+            )
+
+        if len(content) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"File too large: {len(content)} bytes > {max_bytes} limit. "
+                    "Use rsync over tailnet SSH for large files."
+                ),
+            )
+
+        return {
+            "worker_id": worker.id,
+            "path": path,
+            "size": len(content),
+            "content_b64": base64.b64encode(content).decode(),
+        }
 
     @app.get("/api/v1/events")
     async def events_list(limit: int = Query(50, ge=1, le=1000)):
