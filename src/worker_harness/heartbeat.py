@@ -16,7 +16,7 @@ from pydantic import BaseModel, ValidationError
 from .db import Database
 from .job import JobManager
 from .models import JobStatus, PortForward, WorkerRegistration
-from .ssh import ssh_port_forward, ssh_upload_bytes, ssh_download_bytes
+from .ssh import async_ssh_run, ssh_port_forward, ssh_upload_bytes, ssh_download_bytes
 
 log = logging.getLogger("heartbeat-server")
 
@@ -29,6 +29,8 @@ class JobCreateRequest(BaseModel):
     command: str
     name: str | None = None
     no_pty: bool = False
+    sync: bool = False       # block until command finishes, return stdout
+    sync_timeout: int = 120  # seconds to wait in sync mode
 
 
 class TunnelCreateRequest(BaseModel):
@@ -150,7 +152,32 @@ def create_app(db: Database) -> FastAPI:
             name=payload.name,
             pty_enabled=not payload.no_pty,
         )
-        return job.model_dump(mode="json")
+
+        if not payload.sync:
+            return job.model_dump(mode="json")
+
+        # Sync mode: poll until the job finishes or sync_timeout expires.
+        import time as _time
+
+        deadline = _time.monotonic() + payload.sync_timeout
+        while _time.monotonic() < deadline:
+            job = await jm.refresh_job_status(worker, job)
+            if job.status not in (JobStatus.RUNNING, JobStatus.PENDING):
+                break
+            await asyncio.sleep(0.5)
+
+        # Read the full log (stdout+stderr merged by the tmux script)
+        log_path = f"{worker.harness_dir.rstrip('/')}/{job.id}/output.log"
+        log_result = await async_ssh_run(worker, f"cat '{log_path}' 2>/dev/null", timeout=10)
+        # Strip the EXIT marker line
+        output_lines = [
+            line for line in log_result.stdout.splitlines() if not line.startswith("EXIT:")
+        ]
+        output = "\n".join(output_lines)
+
+        result = job.model_dump(mode="json")
+        result["stdout"] = output
+        return result
 
     @app.get("/api/v1/jobs")
     async def jobs_list(
