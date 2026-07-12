@@ -43,7 +43,7 @@ compat_dir="${wh_dir_host}/compat"
 passwd_file="${compat_dir}/passwd"
 group_file="${compat_dir}/group"
 launch_mode="${WH_LAUNCH_MODE:-instance}"
-instance_name="${WH_INSTANCE_NAME:-wh-${ssh_user}-$$}"
+instance_name="${WH_INSTANCE_NAME:-wh-${ssh_user}}"
 fakeroot_flag=""
 if [ -n "${WH_FAKEROOT:-}" ]; then
   case "${WH_FAKEROOT}" in
@@ -197,6 +197,8 @@ exec_env_args=(
 )
 
 if [ "$launch_mode" = "instance" ]; then
+  # Stop any leftover instance from a previous run (crash, restart, etc.)
+  "$runtime" instance stop "$instance_name" 2>/dev/null || true
   echo "[start-wh] Starting instance $instance_name using $runtime..."
   "$runtime" instance start --cleanenv "${mount_args[@]}" "$image" "$instance_name"
   exec "$runtime" exec --cleanenv "${exec_env_args[@]}" instance://"$instance_name" /entrypoint.sh
