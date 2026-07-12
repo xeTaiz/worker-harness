@@ -166,6 +166,15 @@ if [ -n "$overlay_file" ] && [ -f "$overlay_file" ]; then
   mount_args+=(--overlay "$overlay_file")
 fi
 
+# Extra bind mounts (colon-separated host:container pairs)
+# e.g. WH_EXTRA_BINDS="$HOME/Dev:/code:/data:/data"
+if [ -n "${WH_EXTRA_BINDS:-}" ]; then
+  IFS=':' read -ra _extra_pairs <<< "$WH_EXTRA_BINDS"
+  for _pair in "${_extra_pairs[@]}"; do
+    mount_args+=(--bind "$_pair")
+  done
+fi
+
 exec_env_args=(
   --env TS_AUTHKEY="$TS_AUTHKEY"
   --env TS_HOST="${TS_HOST:-https://headscale.d0me.xyz}"
