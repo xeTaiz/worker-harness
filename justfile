@@ -9,6 +9,10 @@ build:
     @echo "[just build] Building worker image: {{worker_image}}"
     @docker build -t {{worker_image}} -f worker_container/Dockerfile worker_container
 
+# Build everything (docker containers + singularity .sif) then produce dist bundle.
+all: build build-singularity dist
+    @echo "[just all] Done. dist bundle ready in ./dist"
+
 build-orch:
     @echo "[just build-orch] Building orchestrator image: {{orchestrator_image}}"
     @docker build -t {{orchestrator_image}} -f orchestrator_container/Dockerfile .

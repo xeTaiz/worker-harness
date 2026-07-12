@@ -17,3 +17,5 @@ Usage:
 3. If needed: `loginctl enable-linger "$USER"`
 
 The generated `.env` is derived from the repo `.env` and contains the runtime worker env.
+You can add extra vars (e.g. `WH_EXTRA_BINDS`, `WH_MOUNT_HOME_FOLDERS`) to this file before running install-service.sh — they will be preserved in the installed config.
+All `WH_*` variables are automatically carried through.
