@@ -169,7 +169,7 @@ Defaults (if unset):
 - `WORKER_NAME=<container hostname>`
 - `WH_OVERLAY` - path to a writable ext3 overlay file (default: `$WH_DIR/overlay.ext3`). Created automatically on first start if the runtime supports it. Lets `apt install` persist across container restarts.
 - `WH_OVERLAY_SIZE` - overlay size in MiB (default: `8192` = 8 GB)
-- `WH_EXTRA_BINDS` - colon-separated `host:container` bind mount pairs (default: empty). e.g. `WH_EXTRA_BINDS="$HOME/Dev:/code:/data/datasets:/data"`
+- `WH_EXTRA_BINDS` - semicolon-separated `host:container` bind mount pairs (default: empty). e.g. `WH_EXTRA_BINDS="$HOME/Dev:/code;/data/datasets:/data"`
 - `WH_MOUNT_HOME_FOLDERS` - set to `0` to disable auto-mounting non-hidden directories from `$HOME` into the container (default: `1`, enabled). Hidden dirs (`.ssh`, `.gnupg`, `.config`, `.aws`, etc.) are excluded automatically by the glob.
 
 ## Orchestrator container env vars

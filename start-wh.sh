@@ -166,10 +166,10 @@ if [ -n "$overlay_file" ] && [ -f "$overlay_file" ]; then
   mount_args+=(--overlay "$overlay_file")
 fi
 
-# Extra bind mounts (colon-separated host:container pairs)
-# e.g. WH_EXTRA_BINDS="$HOME/Dev:/code:/data:/data"
+# Extra bind mounts (semicolon-separated host:container pairs)
+# e.g. WH_EXTRA_BINDS="$HOME/Dev:/code;/data/datasets:/data"
 if [ -n "${WH_EXTRA_BINDS:-}" ]; then
-  IFS=':' read -ra _extra_pairs <<< "$WH_EXTRA_BINDS"
+  IFS=';' read -ra _extra_pairs <<< "$WH_EXTRA_BINDS"
   for _pair in "${_extra_pairs[@]}"; do
     mount_args+=(--bind "$_pair")
   done
