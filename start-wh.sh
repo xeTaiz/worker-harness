@@ -44,6 +44,10 @@ passwd_file="${compat_dir}/passwd"
 group_file="${compat_dir}/group"
 launch_mode="${WH_LAUNCH_MODE:-instance}"
 instance_name="${WH_INSTANCE_NAME:-wh-${ssh_user}}"
+# Fakeroot is disabled by default — it creates a user namespace that breaks
+# Tailscale SSH (setuid to an unmapped host uid fails with EINVAL).
+# Only enable if you explicitly need root inside the container and can't
+# use --overlay for apt installs instead.
 fakeroot_flag=""
 if [ -n "${WH_FAKEROOT:-}" ]; then
   case "${WH_FAKEROOT}" in
@@ -51,8 +55,6 @@ if [ -n "${WH_FAKEROOT:-}" ]; then
     0|false|no|off) fakeroot_flag="" ;;
     *) echo "[start-wh] ERROR: WH_FAKEROOT must be 0/1 or false/true" >&2; exit 1 ;;
   esac
-elif grep -q "^${ssh_user}:" /etc/subuid 2>/dev/null && grep -q "^${ssh_user}:" /etc/subgid 2>/dev/null; then
-  fakeroot_flag="--fakeroot"
 fi
 
 TS_AUTHKEY="${TS_AUTHKEY:-${WORKER_TS_KEY:-}}"

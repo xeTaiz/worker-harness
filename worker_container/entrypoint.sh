@@ -82,8 +82,11 @@ if [ -z "$SSH_HOME_DIR" ]; then
 fi
 
 mkdir -p "$TS_STATE_DIR" "$TS_SOCKET_DIR" "$HARNESS_DIR" "$WORKER_DAEMON_DIR" "$TMUX_TMPDIR" "$SSH_HOME_DIR"
+# tmux tmpdir must be writable by the SSH user's uid, which may differ from
+# the entrypoint's uid on workers without fakeroot. 1777 (like /tmp) lets
+# any uid create its tmux-<uid> subdirectory.
 chown "$SSH_USER":"$SSH_USER" "$TMUX_TMPDIR" 2>/dev/null || chown "$SSH_USER" "$TMUX_TMPDIR" 2>/dev/null || true
-chmod 700 "$TMUX_TMPDIR" 2>/dev/null || true
+chmod 1777 "$TMUX_TMPDIR" 2>/dev/null || true
 export HOME="$SSH_HOME_DIR"
 export USER="$SSH_USER"
 export LOGNAME="$SSH_USER"
