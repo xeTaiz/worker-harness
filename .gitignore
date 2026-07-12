@@ -8,3 +8,4 @@ dist/*
 dist/.env
 !dist/.gitignore
 !dist/README.md
+/worker-harness-worker.sif
