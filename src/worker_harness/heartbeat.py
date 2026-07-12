@@ -70,7 +70,14 @@ def create_app(db: Database) -> FastAPI:
         if worker:
             return worker
         workers = await db.list_workers()
-        return next((w for w in workers if w.name == worker_id_or_name), None)
+        # Case-insensitive name match: worker hostnames register in varying cases
+        # (e.g. "KW60898" from the OS hostname vs "kw60898" from DNS) and callers
+        # naturally pass the lowercase form. Matching case-insensitively avoids
+        # spurious 404s that only affect single-worker/exec routes.
+        return next(
+            (w for w in workers if w.name.lower() == worker_id_or_name.lower()),
+            None,
+        )
 
     # ── Heartbeat/registration endpoints (existing behavior) ─────────────────
 
