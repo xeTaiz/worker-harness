@@ -5,7 +5,9 @@ Generated deploy bundle for a single worker host.
 Contents:
 - `start-wh.sh`
 - `install-service.sh`
-- `worker-harness.service`
+- `worker-harness.service` — main service (Restart=always)
+- `worker-harness-update.path` / `.service` — auto-swap new image + restart
+- `worker-harness-restart.path` / `.service` — restart on trigger file
 - `.env`
 - `worker-harness-worker.sif` (if built)
 

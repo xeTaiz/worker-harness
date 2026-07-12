@@ -33,6 +33,7 @@ image_src="$script_dir/worker-harness-worker.sif"
 unit_dir="$HOME/.config/systemd/user"
 config_dir="$HOME/.config/worker-harness"
 service_dst="$unit_dir/worker-harness.service"
+env_dst="$config_dir/worker-harness.env"
 
 for path in "$service_src" "$launcher_src" "$image_src"; do
   if [ ! -f "$path" ]; then
@@ -56,35 +57,34 @@ for unit_src in \
   fi
 done
 
+# Copy the .env as-is to the config location, then prompt for any missing
+# required values and patch them in place. This preserves all user-set vars
+# (WH_EXTRA_BINDS, WH_MOUNT_HOME_FOLDERS, etc.) without lossy re-emission.
 if [ -n "$env_src" ]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "$env_src"
-  set +a
+  cp -f "$env_src" "$env_dst"
+else
+  touch "$env_dst"
 fi
+chmod 600 "$env_dst"
 
-TS_AUTHKEY="${TS_AUTHKEY:-${WORKER_TS_KEY:-}}"
-if [ -z "${TS_AUTHKEY:-}" ]; then
+# Source the installed env to check for missing required values
+set -a
+# shellcheck disable=SC1090
+. "$env_dst"
+set +a
+
+_needed_patch=0
+if [ -z "${TS_AUTHKEY:-${WORKER_TS_KEY:-}}" ]; then
   read -r -s -p "TS_AUTHKEY: " TS_AUTHKEY
   echo
+  echo "export TS_AUTHKEY='$TS_AUTHKEY'" >> "$env_dst"
+  _needed_patch=1
 fi
 if [ -z "${ORCHESTRATOR_HOST:-}" ]; then
   read -r -p "ORCHESTRATOR_HOST [orchestrator.hs.d0me.xyz]: " ORCHESTRATOR_HOST
   ORCHESTRATOR_HOST="${ORCHESTRATOR_HOST:-orchestrator.hs.d0me.xyz}"
-fi
-TS_HOST="${TS_HOST:-https://headscale.d0me.xyz}"
-WH_DIR="${WH_DIR:-$HOME/.local/worker-harness}"
-
-cat > "$env_dst" <<EOF
-export TS_AUTHKEY='${TS_AUTHKEY}'
-export ORCHESTRATOR_HOST='${ORCHESTRATOR_HOST}'
-export TS_HOST='${TS_HOST}'
-export WH_DIR="${WH_DIR}"
-EOF
-chmod 600 "$env_dst"
-
-if [ "$bundle_mode" -eq 1 ] && [ -n "$env_src" ] && [ "$env_src" != "$env_dst" ]; then
-  rm -f "$env_src"
+  echo "export ORCHESTRATOR_HOST='$ORCHESTRATOR_HOST'" >> "$env_dst"
+  _needed_patch=1
 fi
 
 if ! command -v systemctl >/dev/null 2>&1; then
