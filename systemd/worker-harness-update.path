@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for new worker-harness image
+
+[Path]
+PathChanged=%h/.local/worker-harness/harness/new-image.sif
+Unit=worker-harness-update.service
+
+[Install]
+WantedBy=default.target

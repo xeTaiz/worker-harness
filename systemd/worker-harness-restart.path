@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for worker-harness restart trigger
+
+[Path]
+PathExists=%h/.local/worker-harness/harness/restart-trigger
+Unit=worker-harness-restart.service
+
+[Install]
+WantedBy=default.target

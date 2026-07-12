@@ -50,6 +50,17 @@ cp -f "$launcher_src" "$launcher_dst"
 cp -f "$image_src" "$image_dst"
 chmod +x "$launcher_dst"
 
+# Install update + restart path units (optional — only if source files exist)
+for unit_src in \
+  "$script_dir/worker-harness-update.path" \
+  "$script_dir/worker-harness-update.service" \
+  "$script_dir/worker-harness-restart.path" \
+  "$script_dir/worker-harness-restart.service"; do
+  if [ -f "$unit_src" ]; then
+    cp -f "$unit_src" "$unit_dir/$(basename "$unit_src")"
+  fi
+done
+
 if [ -n "$env_src" ]; then
   set -a
   # shellcheck disable=SC1090
@@ -89,10 +100,15 @@ fi
 systemctl --user daemon-reload
 systemctl --user enable --now worker-harness.service
 
+# Enable path units for image updates and restart triggers
+systemctl --user enable worker-harness-update.path 2>/dev/null && systemctl --user start worker-harness-update.path 2>/dev/null || true
+systemctl --user enable worker-harness-restart.path 2>/dev/null && systemctl --user start worker-harness-restart.path 2>/dev/null || true
+
 echo "[install-service] installed: $service_dst"
 echo "[install-service] env:       $env_dst"
 echo "[install-service] launcher:  $launcher_dst -> $launcher_src"
 echo "[install-service] image:     $image_dst -> $image_src"
+echo "[install-service] path units: update + restart watchers enabled"
 
 if command -v loginctl >/dev/null 2>&1; then
   if loginctl enable-linger "$USER" >/dev/null 2>&1; then

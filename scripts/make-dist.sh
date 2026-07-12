@@ -23,6 +23,10 @@ mkdir -p dist
 cp start-wh.sh dist/start-wh.sh
 cp install-service.sh dist/install-service.sh
 cp systemd/worker-harness.service dist/worker-harness.service
+cp systemd/worker-harness-update.path dist/worker-harness-update.path
+cp systemd/worker-harness-update.service dist/worker-harness-update.service
+cp systemd/worker-harness-restart.path dist/worker-harness-restart.path
+cp systemd/worker-harness-restart.service dist/worker-harness-restart.service
 
 cat > dist/.env <<EOF
 TS_AUTHKEY='${WORKER_TS_KEY}'

@@ -175,6 +175,16 @@ if [ -n "${WH_EXTRA_BINDS:-}" ]; then
   done
 fi
 
+# Auto-mount non-hidden home directories at the same path inside the container.
+# The glob */ naturally excludes .ssh, .gnupg, .config, .aws, .cache, etc.
+# Enable with WH_MOUNT_HOME_FOLDERS=1
+if [ "${WH_MOUNT_HOME_FOLDERS:-1}" = "1" ]; then
+  for _dir in "$HOME"/*/; do
+    _name="$(basename "$_dir")"
+    mount_args+=(--bind "${_dir%/}:$HOME/$_name")
+  done
+fi
+
 exec_env_args=(
   --env TS_AUTHKEY="$TS_AUTHKEY"
   --env TS_HOST="${TS_HOST:-https://headscale.d0me.xyz}"

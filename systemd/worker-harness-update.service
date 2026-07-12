@@ -1,0 +1,6 @@
+[Unit]
+Description=Swap new worker-harness image and restart
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -lc 'NEW="%h/.local/worker-harness/harness/new-image.sif"; CUR="%h/worker-harness-worker.sif"; if [ -f "$NEW" ]; then mv -f "$NEW" "$CUR" && systemctl --user restart worker-harness.service; fi'
