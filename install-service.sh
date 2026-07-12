@@ -33,9 +33,6 @@ image_src="$script_dir/worker-harness-worker.sif"
 unit_dir="$HOME/.config/systemd/user"
 config_dir="$HOME/.config/worker-harness"
 service_dst="$unit_dir/worker-harness.service"
-env_dst="$config_dir/worker-harness.env"
-launcher_dst="$HOME/start-wh.sh"
-image_dst="$HOME/worker-harness-worker.sif"
 
 for path in "$service_src" "$launcher_src" "$image_src"; do
   if [ ! -f "$path" ]; then
@@ -46,9 +43,7 @@ done
 
 mkdir -p "$unit_dir" "$config_dir"
 cp -f "$service_src" "$service_dst"
-cp -f "$launcher_src" "$launcher_dst"
-cp -f "$image_src" "$image_dst"
-chmod +x "$launcher_dst"
+chmod +x "$launcher_src"
 
 # Install update + restart path units (optional — only if source files exist)
 for unit_src in \
@@ -106,8 +101,8 @@ systemctl --user enable worker-harness-restart.path 2>/dev/null && systemctl --u
 
 echo "[install-service] installed: $service_dst"
 echo "[install-service] env:       $env_dst"
-echo "[install-service] launcher:  $launcher_dst -> $launcher_src"
-echo "[install-service] image:     $image_dst -> $image_src"
+echo "[install-service] launcher:  $launcher_src"
+echo "[install-service] image:     $image_src"
 echo "[install-service] path units: update + restart watchers enabled"
 
 if command -v loginctl >/dev/null 2>&1; then

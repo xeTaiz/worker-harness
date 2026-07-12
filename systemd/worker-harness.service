@@ -6,7 +6,7 @@ Type=simple
 Restart=always
 RestartSec=5
 KillMode=control-group
-ExecStart=/bin/bash -lc 'set -a; . "%h/.config/worker-harness/worker-harness.env"; set +a; exec "%h/start-wh.sh" "%h/worker-harness-worker.sif"'
+ExecStart=/bin/bash -lc 'set -a; . "%h/.config/worker-harness/worker-harness.env"; set +a; exec "%h/worker-harness/start-wh.sh" "%h/worker-harness/worker-harness-worker.sif"'
 
 [Install]
 WantedBy=default.target
