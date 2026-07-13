@@ -37,21 +37,30 @@ echo "moved new image into place" >>"$LOG"
 systemctl --user restart worker-harness.service
 echo "restart issued" >>"$LOG"
 
-# Poll for the service to reach active state. The SIF container takes a
-# few seconds to spin up (tailscale, etc.), so allow up to ~15s.
+# A single `active` poll races a Type=simple service: systemd marks the
+# process active before its entrypoint has necessarily survived startup.
+# Require ten uninterrupted active polls, allowing up to twenty seconds for
+# the service to reach that stable state. This preserves .old when a SIF
+# starts briefly and then enters Restart= failure loop.
 HEALTHY=no
-for _ in $(seq 1 15); do
+ACTIVE_STREAK=0
+for attempt in $(seq 1 20); do
   sleep 1
   state=$(systemctl --user is-active worker-harness.service 2>/dev/null || true)
-  echo "  poll: state=$state" >>"$LOG"
   if [ "$state" = "active" ]; then
+    ACTIVE_STREAK=$((ACTIVE_STREAK + 1))
+  else
+    ACTIVE_STREAK=0
+  fi
+  echo "  poll $attempt: state=$state active_streak=$ACTIVE_STREAK/10" >>"$LOG"
+  if [ "$ACTIVE_STREAK" -ge 10 ]; then
     HEALTHY=yes
     break
   fi
 done
 
 if [ "$HEALTHY" = "yes" ]; then
-  echo "service is active — new SIF is good" >>"$LOG"
+  echo "service stayed active for 10 seconds — new SIF is good" >>"$LOG"
   rm -f "${CUR}.old"
   exit 0
 fi
