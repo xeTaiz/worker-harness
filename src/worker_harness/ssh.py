@@ -345,7 +345,10 @@ async def ssh_upload_bytes(worker: Worker, content: bytes, remote_path: str, *, 
     remote_parent = shlex.quote(str(Path(remote_path).parent))
     remote_file = shlex.quote(remote_path)
     cmd = f"mkdir -p {remote_parent} && cat > {remote_file}"
-    args = _ssh_base_args(worker) + ["sh", "-lc", cmd]
+    # Tailscale SSH preserves a single remote-command argument reliably, but
+    # does not preserve a separate `sh`, `-lc`, command argv vector. Quote the
+    # complete shell invocation so remote paths and stdin redirection survive.
+    args = _ssh_base_args(worker) + [f"sh -lc {shlex.quote(cmd)}"]
     return await _exec_ssh(
         worker, args,
         lane_timeout=10.0,
@@ -365,7 +368,7 @@ async def ssh_download_bytes(
     """Download a file from a worker. Returns (content, ssh_result)."""
     remote_file = shlex.quote(remote_path)
     cmd = f"cat {remote_file}"
-    args = _ssh_base_args(worker) + ["sh", "-lc", cmd]
+    args = _ssh_base_args(worker) + [f"sh -lc {shlex.quote(cmd)}"]
     # We need bytes back, so use a custom path (not _exec_ssh which decodes).
     started = time.monotonic()
     from .metrics import get_metrics

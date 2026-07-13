@@ -5,11 +5,11 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from worker_harness.lanes import WorkerLanes
 from worker_harness.models import GPUInfo, Worker, WorkerRegistration
-from worker_harness.ssh import async_ssh_run, set_lanes
+from worker_harness.ssh import SSHResult, async_ssh_run, set_lanes, ssh_upload_bytes
 
 
 class SshCleanupTests(unittest.TestCase):
@@ -37,6 +37,26 @@ class SshCleanupTests(unittest.TestCase):
                 return
             time.sleep(0.02)
         self.fail(f"pid {pid} still exists after process-group cleanup")
+
+    def test_upload_uses_one_quoted_remote_shell_command(self):
+        async def run():
+            worker = self._worker()
+            result = SSHResult(stdout="", stderr="", returncode=0)
+            with patch("worker_harness.ssh._exec_ssh", new=AsyncMock(return_value=result)) as exec_mock:
+                received = await ssh_upload_bytes(worker, b"payload", "/tmp/with space.txt")
+
+            self.assertIs(received, result)
+            args = exec_mock.await_args.args[1]
+            self.assertEqual(args[:3], ["tailscale", "ssh", "root@100.64.0.99"])
+            # Tailscale SSH must receive exactly one remote command; passing
+            # `sh`, `-lc`, command as separate argv broke live upload_file.
+            self.assertEqual(len(args), 4)
+            self.assertTrue(args[-1].startswith("sh -lc "))
+            self.assertIn("mkdir -p /tmp", args[-1])
+            self.assertIn("with space.txt", args[-1])
+            self.assertEqual(exec_mock.await_args.kwargs["input_data"], b"payload")
+
+        asyncio.run(run())
 
     def test_timeout_kills_complete_ssh_process_group(self):
         async def run():
