@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: nvcr.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+From: nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
 
 %labels
     Maintainer worker-harness
@@ -12,8 +12,6 @@ From: nvcr.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
     worker_container/requirements.txt /requirements.txt
     worker_container/worker_daemon.py /worker_daemon.py
     worker_container/entrypoint.sh /entrypoint.sh
-    worker_container/wh-cuda-env /wh-cuda-env
-    worker_container/CUDA_ENV_GUIDE.md /opt/wh/CUDA_ENV_GUIDE.md
 
 %post
     set -eux
@@ -52,8 +50,14 @@ From: nvcr.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
     pip3 install --break-system-packages -r /requirements.txt
 
     chmod +x /entrypoint.sh
-    chmod +x /wh-cuda-env
-    ln -sf /wh-cuda-env /usr/local/bin/wh-cuda-env
+
+    # Make sure /usr/local/cuda/bin and /usr/local/nvidia/bin survive into
+    # login shells even when the container is started with `--cleanenv`
+    # (start-wh.sh uses --cleanenv, which strips /.singularity.d/env/* and
+    # leaves /etc/environment's default Debian PATH without CUDA).
+    sed -i 's|^PATH="\(/usr/local/sbin.*\)"|PATH="/usr/local/cuda/bin:/usr/local/nvidia/bin:\1"|' /etc/environment
+    grep -q '/usr/local/cuda/bin' /etc/environment || \
+        echo 'PATH="/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' >> /etc/environment
 
 %runscript
     exec /entrypoint.sh "$@"

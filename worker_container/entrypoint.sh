@@ -1,6 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
+# Put CUDA toolkit / NVIDIA tools on PATH so nvcc, nvidia-smi, etc. work
+# in any process spawned from the daemon (jobs, SSH logins via PAM, …).
+# The SIF's /.singularity.d/env/10-docker2singularity.sh would normally do
+# this, but `start-wh.sh` launches with `--cleanenv` which strips it.
+export PATH="/usr/local/cuda/bin:/usr/local/nvidia/bin:${PATH}"
+
+# Tailscale SSH uses this env var (read by tailscaled) as the default PATH
+# for spawned SSH sessions. Without it, Tailscale SSH falls back to a
+# hardcoded default that omits /usr/local/cuda/bin.
+export TAILSCALE_SSH_DEFAULT_PATH="${PATH}"
+
 echo "[entrypoint] Starting worker bootstrap..."
 
 # ── 1. Tailscale bootstrap (userspace mode only) ─────────────────────

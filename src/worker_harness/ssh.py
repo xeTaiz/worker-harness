@@ -45,7 +45,15 @@ def _worker_tmux_tmpdir(worker: Worker) -> str:
 
 
 def _tmux_env(worker: Worker) -> str:
-    return f"env -u TMUX -u TMUX_PANE TMUX_TMPDIR='{_worker_tmux_tmpdir(worker)}' tmux"
+    # Prepend /usr/local/cuda/bin and /usr/local/nvidia/bin to PATH so jobs
+    # can call `nvcc` / `nvidia-smi` directly. The base image is the CUDA
+    # devel variant so these binaries are always present at these paths.
+    return (
+        f"env -u TMUX -u TMUX_PANE "
+        f"TMUX_TMPDIR='{_worker_tmux_tmpdir(worker)}' "
+        f"PATH=/usr/local/cuda/bin:/usr/local/nvidia/bin:${{PATH}} "
+        f"tmux"
+    )
 
 
 def _run_ssh_sync(args: list[str], input_data: str | None = None, timeout: int = 30) -> SSHResult:

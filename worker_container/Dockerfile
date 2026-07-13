@@ -1,6 +1,7 @@
-FROM nvcr.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+FROM nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH=/usr/local/cuda/bin:/usr/local/nvidia/bin:${PATH}
 
 # Install system packages
 RUN rm -f /etc/apt/sources.list.d/*nvidia* /etc/apt/sources.list.d/cuda* 2>/dev/null || true \
@@ -36,13 +37,6 @@ RUN curl -fsSL https://tailscale.com/install.sh | sh
 
 COPY requirements.txt /requirements.txt
 RUN pip3 install --break-system-packages -r /requirements.txt
-
-# CUDA toolkit helper — installs nvcc from pip wheels on demand
-COPY wh-cuda-env /usr/local/bin/wh-cuda-env
-RUN chmod +x /usr/local/bin/wh-cuda-env
-
-# Guide for agents/users on how to set up CUDA + Python envs
-COPY CUDA_ENV_GUIDE.md /opt/wh/CUDA_ENV_GUIDE.md
 
 WORKDIR /workspace
 # Copy worker daemon

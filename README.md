@@ -203,4 +203,3 @@ See also:
 - `specs/TAILSCALE.md`
 - `docker-compose.tailscale.example.yml`
 - `headscale-policy.example.json`
-- `worker_container/CUDA_ENV_GUIDE.md` — how to install CUDA toolkits (nvcc) and Python ML environments on demand inside a worker
