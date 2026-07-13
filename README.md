@@ -135,7 +135,7 @@ If you want the worker to restart automatically after a crash:
 ./install-service.sh
 ```
 
-`install-service.sh` copies `start-wh.sh` and `worker-harness-worker.sif` into `$HOME`, stores the runtime env in `~/.config/worker-harness/worker-harness.env`, and prompts for any missing mandatory values if no bundle `.env` is present.
+`install-service.sh` keeps `start-wh.sh` and `worker-harness-worker.sif` in the install directory, and creates symlinks from `~/.config/systemd/user/` and `~/.config/worker-harness/` back into that directory. The runtime env remains mutable at `~/worker-harness/.env` (linked as `~/.config/worker-harness/worker-harness.env`). Updating scripts or units therefore requires no recopy; run `systemctl --user daemon-reload` after unit changes and restart the affected service as needed. Existing copied installations can migrate once with `./migrate-to-symlinks.sh`; it preserves a regular config env as the source of truth and backs up replaced files.
 
 For boot without login, enable user lingering:
 

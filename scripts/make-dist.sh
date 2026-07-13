@@ -22,6 +22,7 @@ mkdir -p dist
 
 cp start-wh.sh dist/start-wh.sh
 cp install-service.sh dist/install-service.sh
+cp migrate-to-symlinks.sh dist/migrate-to-symlinks.sh
 cp systemd/worker-harness.service dist/worker-harness.service
 cp systemd/worker-harness-update.path dist/worker-harness-update.path
 cp systemd/worker-harness-update.service dist/worker-harness-update.service
@@ -39,7 +40,7 @@ if [ -f worker-harness-worker.sif ]; then
   cp worker-harness-worker.sif dist/worker-harness-worker.sif
 fi
 
-chmod +x dist/start-wh.sh dist/install-service.sh
+chmod +x dist/start-wh.sh dist/install-service.sh dist/migrate-to-symlinks.sh
 
 cat > dist/README.md <<'EOF'
 # worker-harness dist
@@ -49,6 +50,7 @@ Generated deploy bundle for a single worker host.
 Contents:
 - `start-wh.sh`
 - `install-service.sh`
+- `migrate-to-symlinks.sh` — one-time migration for existing installs
 - `worker-harness.service` — main service (Restart=always)
 - `worker-harness-update.path` / `.service` — auto-swap new image + restart
 - `worker-harness-restart.path` / `.service` — restart on trigger file
@@ -61,7 +63,8 @@ Usage:
 3. If needed: `loginctl enable-linger "$USER"`
 
 The generated `.env` is derived from the repo `.env` and contains the runtime worker env.
-You can add extra vars (e.g. `WH_EXTRA_BINDS`, `WH_MOUNT_HOME_FOLDERS`) to this file before running install-service.sh — they will be preserved in the installed config.
+`install-service.sh` links the systemd units, path-service scripts, and runtime env from `~/.config/...` back to this install directory; update files here, then run `systemctl --user daemon-reload` after changing a unit.
+You can add extra vars (e.g. `WH_EXTRA_BINDS`, `WH_MOUNT_HOME_FOLDERS`) to `.env` before running install-service.sh — they remain the source of truth.
 All `WH_*` variables are automatically carried through.
 EOF
 
