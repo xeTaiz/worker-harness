@@ -38,7 +38,11 @@ ssh_user="${SSH_USER:-$(id -un)}"
 ssh_uid="$(id -u)"
 ssh_gid="$(id -g)"
 ssh_shell="${SSH_SHELL:-/bin/bash}"
-ssh_home_container="${wh_dir_container}/home/${ssh_user}"
+# Keep the SIF home backed by WH_DIR (rather than the host's full home), but
+# expose it at the conventional /home/<user> path. Non-hidden host home
+# directories are bound into this location below, so ~, $HOME, and absolute
+# /home/<user>/... paths all resolve to the same view in the SIF.
+ssh_home_container="/home/${ssh_user}"
 compat_dir="${wh_dir_host}/compat"
 passwd_file="${compat_dir}/passwd"
 group_file="${compat_dir}/group"
@@ -177,13 +181,17 @@ if [ -n "${WH_EXTRA_BINDS:-}" ]; then
   done
 fi
 
-# Auto-mount non-hidden home directories at the same path inside the container.
-# The glob */ naturally excludes .ssh, .gnupg, .config, .aws, .cache, etc.
-# Enable with WH_MOUNT_HOME_FOLDERS=1
+# Bind-mount the host's non-hidden home subdirs into the SIF's $HOME
+# (wh_dir_container/home/<user>/<subdir>). This makes `~/<subdir>` inside
+# the SIF point at the host's `~/<subdir>`, so the install dir at
+# `~/worker-harness/` is visible from inside the SIF.
+# Hidden folders (.ssh, .gnupg, .config, .aws, .cache, ...) are excluded
+# by the glob */ which doesn't match dotfiles.
+# Enable with WH_MOUNT_HOME_FOLDERS=1 (default). Set to 0 to skip.
 if [ "${WH_MOUNT_HOME_FOLDERS:-1}" = "1" ]; then
   for _dir in "$HOME"/*/; do
     _name="$(basename "$_dir")"
-    mount_args+=(--bind "${_dir%/}:$HOME/$_name")
+    mount_args+=(--bind "${_dir%/}:$ssh_home_container/$_name")
   done
 fi
 
