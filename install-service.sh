@@ -57,6 +57,18 @@ for unit_src in \
   fi
 done
 
+# Install the scripts that the path-triggered services ExecStart. They live
+# next to the env file in $config_dir so they are writable for in-place
+# edits and have a stable, known path.
+for script_src in \
+  "$script_dir/worker-harness-update.sh" \
+  "$script_dir/worker-harness-restart.sh"; do
+  if [ -f "$script_src" ]; then
+    cp -f "$script_src" "$config_dir/$(basename "$script_src")"
+    chmod +x "$config_dir/$(basename "$script_src")"
+  fi
+done
+
 # Copy the .env as-is to the config location, then prompt for any missing
 # required values and patch them in place. This preserves all user-set vars
 # (WH_EXTRA_BINDS, WH_MOUNT_HOME_FOLDERS, etc.) without lossy re-emission.

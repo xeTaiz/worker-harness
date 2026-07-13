@@ -3,4 +3,4 @@ Description=Restart worker-harness on trigger
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -lc 'TRIGGER="%h/.local/worker-harness/harness/restart-trigger"; if [ -f "$TRIGGER" ]; then rm -f "$TRIGGER" && systemctl --user restart worker-harness.service; fi'
+ExecStart=%h/.config/worker-harness/worker-harness-restart.sh

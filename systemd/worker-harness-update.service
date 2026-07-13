@@ -3,37 +3,4 @@ Description=Swap new worker-harness image and restart (with failsafe)
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -lc '
-  NEW="%h/.local/worker-harness/harness/new-image.sif"
-  CUR="%h/worker-harness/worker-harness-worker.sif"
-
-  if [ ! -f "$NEW" ]; then exit 0; fi
-
-  # Backup current image
-  if [ -f "$CUR" ]; then
-    mv -f "$CUR" "${CUR}.old"
-  fi
-
-  # Move new image into place
-  mv -f "$NEW" "$CUR"
-
-  # Detect runtime
-  RUNTIME=apptainer
-  command -v $RUNTIME >/dev/null 2>&1 || RUNTIME=singularity
-
-  # Validate the new image before restarting
-  if $RUNTIME exec "$CUR" true 2>/dev/null; then
-    # Image is valid — clean up backup and restart
-    rm -f "${CUR}.old"
-    systemctl --user restart worker-harness.service
-  else
-    # Image is broken — restore previous image
-    mv -f "$CUR" "${CUR}.failed"
-    if [ -f "${CUR}.old" ]; then
-      mv -f "${CUR}.old" "$CUR"
-      systemctl --user restart worker-harness.service
-    fi
-    echo "[worker-harness-update] New image failed validation, restored previous image" >&2
-    exit 1
-  fi
-'
+ExecStart=%h/.config/worker-harness/worker-harness-update.sh
