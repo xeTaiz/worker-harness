@@ -4,24 +4,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import subprocess
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Awaitable, Callable, TypeVar
 
-from fastapi import FastAPI, HTTPException, Query, status
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
+from .cache import TTLCache
 from .db import Database
 from .job import JobManager
+from .lanes import LaneTimeout, WorkerLanes
+from .metrics import Metrics, set_global_metrics
 from .models import JobStatus, PortForward, WorkerRegistration
-from .ssh import async_ssh_run, ssh_port_forward, ssh_upload_bytes, ssh_download_bytes
+from .ratelimit import AgentRateLimiter, RateLimited, resolve_agent_name
+from .reaper import reap_loop
+from .ssh import async_ssh_run, set_lanes, ssh_download_bytes, ssh_port_forward, ssh_upload_bytes
+from .tunnel_registry import TunnelProcess, TunnelRegistry
 
 log = logging.getLogger("heartbeat-server")
 
-# In-memory tunnel process handles for the current server process.
-_tunnel_processes: dict[str, subprocess.Popen] = {}
+T = TypeVar("T")
 
 
 class JobCreateRequest(BaseModel):
@@ -56,14 +61,86 @@ class FileDownloadRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: DB is already connected by the caller.
-    yield
-    # Shutdown: caller handles db.close().
+    """Start reliability background work and deterministically clean up.
+
+    Database ownership remains with the caller (`serve`), but every persistent
+    tunnel and every queued lane waiter belongs to this FastAPI app.
+    """
+    app.state.reaper_task = asyncio.create_task(reap_loop(app))
+    try:
+        yield
+    finally:
+        app.state.reaper_task.cancel()
+        try:
+            await app.state.reaper_task
+        except asyncio.CancelledError:
+            pass
+        reaped = app.state.tunnels.shutdown()
+        app.state.metrics.reaped_tunnels_total.inc(reaped)
+        await app.state.lanes.shutdown()
 
 
 def create_app(db: Database) -> FastAPI:
     app = FastAPI(title="Worker Harness Heartbeat API", lifespan=lifespan)
     jm = JobManager(db)
+
+    # Shared reliability services. They are attached before lifespan starts so
+    # handlers, reaper, and /api/v1/_stats all see one coherent state.
+    app.state.cache = TTLCache()
+    app.state.lanes = WorkerLanes(max_concurrent=4, max_queue=32)
+    app.state.rate_limiter = AgentRateLimiter(capacity=10, refill_rate=1.0)
+    app.state.metrics = Metrics()
+    app.state.tunnels = TunnelRegistry()
+    set_global_metrics(app.state.metrics)
+    set_lanes(app.state.lanes)
+
+    @app.middleware("http")
+    async def metrics_middleware(request: Request, call_next):
+        metrics = app.state.metrics
+        metrics.requests_total.inc()
+        metrics.in_flight_requests.inc()
+        try:
+            return await call_next(request)
+        finally:
+            metrics.in_flight_requests.dec()
+
+    @app.middleware("http")
+    async def rate_limit_middleware(request: Request, call_next):
+        # Worker heartbeat registration and /health are infrastructure traffic,
+        # not agent traffic. Rate-limit only the orchestration API.
+        if request.url.path.startswith("/api/v1/"):
+            peer_ip = request.client.host if request.client else "unknown"
+            agent = resolve_agent_name(dict(request.headers), peer_ip)
+            try:
+                app.state.rate_limiter.check(agent)
+            except RateLimited as e:
+                return JSONResponse(
+                    status_code=429,
+                    content={"error": {"code": "RATE_LIMITED", "message": str(e)}},
+                    headers={"Retry-After": str(max(1, int(e.retry_after_seconds + 0.999)))},
+                )
+        return await call_next(request)
+
+    @app.exception_handler(LaneTimeout)
+    async def lane_timeout_handler(_request: Request, exc: LaneTimeout):
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"code": "WORKER_LANE_BUSY", "message": str(exc), "worker_id": exc.worker_id}},
+            headers={"Retry-After": "2"},
+        )
+
+    async def cached(key: str, ttl_seconds: float, loader: Callable[[], Awaitable[T]]) -> T:
+        """Best-effort cache helper for read-heavy, eventually-consistent routes."""
+        value = await app.state.cache.get(key)
+        if value is not None:
+            return value
+        value = await loader()
+        await app.state.cache.set(key, value, ttl_seconds)
+        return value
+
+    async def invalidate_workers_cache() -> None:
+        await app.state.cache.invalidate("workers:list")
+        await app.state.cache.invalidate("workers:summary")
 
     async def resolve_worker(worker_id_or_name: str):
         worker = await db.get_worker(worker_id_or_name)
@@ -89,6 +166,7 @@ def create_app(db: Database) -> FastAPI:
         """
         try:
             worker = await db.upsert_worker(reg)
+            await invalidate_workers_cache()
             log.info(
                 f"Worker registered/updated: {worker.name} "
                 f"(id={worker.id}, ip={worker.worker_ip}, dns={getattr(worker, 'dns_name', '')}, gpus={worker.gpu_count})"
@@ -115,19 +193,23 @@ def create_app(db: Database) -> FastAPI:
 
     @app.get("/api/v1/workers")
     async def workers_list():
-        workers = await db.list_workers()
-        return [w.model_dump(mode="json") for w in workers]
+        async def load():
+            workers = await db.list_workers()
+            return [w.model_dump(mode="json") for w in workers]
+        return await cached("workers:list", 5.0, load)
 
     @app.get("/api/v1/workers/summary")
     async def workers_summary():
-        workers = await db.list_workers()
-        status_counts = Counter(w.status.value for w in workers)
-        return {
-            "total": len(workers),
-            "online": status_counts.get("online", 0),
-            "offline": status_counts.get("offline", 0),
-            "draining": status_counts.get("draining", 0),
-        }
+        async def load():
+            workers = await db.list_workers()
+            status_counts = Counter(w.status.value for w in workers)
+            return {
+                "total": len(workers),
+                "online": status_counts.get("online", 0),
+                "offline": status_counts.get("offline", 0),
+                "draining": status_counts.get("draining", 0),
+            }
+        return await cached("workers:summary", 2.0, load)
 
     @app.delete("/api/v1/workers/prune")
     async def workers_prune(minutes: int = Query(5, ge=0)):
@@ -135,6 +217,7 @@ def create_app(db: Database) -> FastAPI:
 
         cutoff = int(_time.time()) - (minutes * 60)
         removed = await db.prune_workers(cutoff)
+        await invalidate_workers_cache()
         return {"removed": removed, "minutes": minutes}
 
     @app.get("/api/v1/workers/{worker_id}")
@@ -328,9 +411,22 @@ def create_app(db: Database) -> FastAPI:
         )
 
         proc = await ssh_port_forward(worker, payload.local_port, payload.remote_port)
+        if proc.poll() is not None:
+            raise HTTPException(
+                status_code=502,
+                detail=f"SSH tunnel setup exited immediately (code={proc.returncode})",
+            )
         pf.pid = proc.pid
         await db.insert_port_forward(pf)
-        _tunnel_processes[pf.id] = proc
+        app.state.tunnels.add(TunnelProcess(
+            id=pf.id,
+            worker_id=worker.id,
+            local_port=payload.local_port,
+            remote_port=payload.remote_port,
+            proc=proc,
+            created_at=pf.created_at,
+        ))
+        await app.state.cache.invalidate("tunnels:list")
 
         return {
             **pf.model_dump(mode="json"),
@@ -339,15 +435,17 @@ def create_app(db: Database) -> FastAPI:
 
     @app.get("/api/v1/tunnels")
     async def tunnels_list():
-        tunnels = await db.list_port_forwards()
-        workers = {w.id: w for w in await db.list_workers()}
-        return [
-            {
-                **t.model_dump(mode="json"),
-                "worker_name": getattr(workers.get(t.worker_id), "name", None),
-            }
-            for t in tunnels
-        ]
+        async def load():
+            tunnels = await db.list_port_forwards()
+            workers = {w.id: w for w in await db.list_workers()}
+            return [
+                {
+                    **t.model_dump(mode="json"),
+                    "worker_name": getattr(workers.get(t.worker_id), "name", None),
+                }
+                for t in tunnels
+            ]
+        return await cached("tunnels:list", 10.0, load)
 
     @app.delete("/api/v1/tunnels/{tunnel_id}")
     async def tunnels_delete(tunnel_id: str):
@@ -356,15 +454,14 @@ def create_app(db: Database) -> FastAPI:
         if not pf:
             raise HTTPException(status_code=404, detail=f"Tunnel not found: {tunnel_id}")
 
-        proc = _tunnel_processes.pop(pf.id, None)
-        if proc:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        entry = app.state.tunnels.remove(pf.id)
+        if entry:
+            # Tunnel registry kills the complete process group off the event
+            # loop, so tunnel teardown never blocks unrelated HTTP calls.
+            await asyncio.to_thread(TunnelRegistry.stop, entry)
 
         await db.delete_port_forward(pf.id)
+        await app.state.cache.invalidate("tunnels:list")
         return {"tunnel_id": pf.id, "removed": True}
 
     @app.post("/api/v1/workers/{worker_id}/files")
@@ -439,6 +536,18 @@ def create_app(db: Database) -> FastAPI:
             "size": len(content),
             "content_b64": base64.b64encode(content).decode(),
         }
+
+    @app.get("/api/v1/_stats")
+    async def reliability_stats():
+        """Live reliability/queue/cache diagnostics for operators and agents."""
+        snapshot = app.state.metrics.snapshot()
+        # These components own their detailed state; compose it rather than
+        # duplicating counters in every hot request path.
+        snapshot["cache"] = app.state.cache.stats()
+        snapshot["lanes"]["workers"] = app.state.lanes.stats()
+        snapshot["rate_limit"]["agents"] = app.state.rate_limiter.stats()
+        snapshot["tunnels"] = app.state.tunnels.stats()
+        return snapshot
 
     @app.get("/api/v1/events")
     async def events_list(limit: int = Query(50, ge=1, le=1000)):

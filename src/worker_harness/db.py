@@ -29,6 +29,15 @@ class Database:
     async def connect(self) -> None:
         self._db = await aiosqlite.connect(str(self.path))
         self._db.row_factory = aiosqlite.Row
+        # Multi-agent reliability: without WAL + busy_timeout, two concurrent writers
+        # (e.g. the heartbeat server's heartbeat-upsert vs. a CLI's _init_schema
+        # ALTER TABLE) deadlock on a futex indefinitely. WAL allows concurrent
+        # readers + 1 writer; busy_timeout=5000 makes any residual lock contention
+        # retry for up to 5s instead of returning SQLITE_BUSY immediately.
+        # See specs/MULTI_AGENT_RELIABILITY.md.
+        await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._db.execute("PRAGMA synchronous=NORMAL")
+        await self._db.execute("PRAGMA busy_timeout=5000")
         await self._init_schema()
 
     async def close(self) -> None:
@@ -65,17 +74,18 @@ class Database:
                 created_at INTEGER DEFAULT 0
             )
         """)
-        # Migration: add gpu_used_vram_gb column if missing (for existing DBs)
-        try:
+        # Migrations are explicitly guarded by PRAGMA metadata. Never swallow
+        # arbitrary errors here: a real I/O/lock/schema error must be visible
+        # instead of leaving a process blocked or half-migrated.
+        cols = await self._db.execute_fetchall("PRAGMA table_info(workers)")
+        colnames = {c["name"] for c in cols}
+        if "gpu_used_vram_gb" not in colnames:
             await self._db.execute(
                 "ALTER TABLE workers ADD COLUMN gpu_used_vram_gb TEXT DEFAULT '[]'"
             )
-        except Exception:
-            pass  # Column already exists
+            colnames.add("gpu_used_vram_gb")
 
         # Migration: rename worker address column zerotier_ip -> worker_ip.
-        cols = await self._db.execute_fetchall("PRAGMA table_info(workers)")
-        colnames = {c["name"] for c in cols}
         if "worker_ip" not in colnames:
             if "zerotier_ip" in colnames:
                 await self._db.execute("ALTER TABLE workers ADD COLUMN worker_ip TEXT")
