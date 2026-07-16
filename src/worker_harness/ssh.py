@@ -135,11 +135,12 @@ def _worker_tmux_tmpdir(worker: Worker) -> str:
 
 
 def _tmux_env(worker: Worker) -> str:
-    # Prepend /usr/local/cuda/bin and /usr/local/nvidia/bin to PATH so jobs
-    # can call `nvcc` / `nvidia-smi` directly.
+    # Preserve the host-driver libraries that Apptainer binds under --nv, and
+    # put CUDA tools on PATH for jobs launched through tmux.
     return (
         f"env -u TMUX -u TMUX_PANE "
         f"TMUX_TMPDIR='{_worker_tmux_tmpdir(worker)}' "
+        f"LD_LIBRARY_PATH=/.singularity.d/libs${{LD_LIBRARY_PATH:+:${{LD_LIBRARY_PATH}}}} "
         f"PATH=/usr/local/cuda/bin:/usr/local/nvidia/bin:${{PATH}} "
         f"tmux"
     )

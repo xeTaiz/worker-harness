@@ -7,6 +7,12 @@ set -euo pipefail
 # this, but `start-wh.sh` launches with `--cleanenv` which strips it.
 export PATH="/usr/local/cuda/bin:/usr/local/nvidia/bin:${PATH}"
 
+# `--nv` bind-mounts the host-matched NVIDIA driver libraries here. The
+# `--cleanenv` instance-exec path can drop Apptainer's usual loader-path
+# setup, so make the bind directory explicit and prefer it to CUDA's in-image
+# compatibility library.
+export LD_LIBRARY_PATH="/.singularity.d/libs${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
 # Tailscale SSH uses this env var (read by tailscaled) as the default PATH
 # for spawned SSH sessions. Without it, Tailscale SSH falls back to a
 # hardcoded default that omits /usr/local/cuda/bin.
