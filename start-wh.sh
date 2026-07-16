@@ -172,8 +172,35 @@ if [ -n "$overlay_file" ] && [ -f "$overlay_file" ]; then
   mount_args+=(--overlay "$overlay_file")
 fi
 
-# Extra bind mounts (semicolon-separated host:container pairs)
+# Extra bind mounts (semicolon-separated host:container pairs).
+# Their container destinations are the complete, operator-chosen data inventory.
 # e.g. WH_EXTRA_BINDS="$HOME/Dev:/code;/data/datasets:/data"
+bind_manifest="$wh_dir_host/data/bind-paths.json"
+mkdir -p "$(dirname "$bind_manifest")"
+python3 - "$bind_manifest" "${WH_EXTRA_BINDS:-}" <<'PY'
+import json
+import os
+import sys
+
+manifest, raw = sys.argv[1:]
+paths = []
+for pair in filter(None, raw.split(";")):
+    # WH_EXTRA_BINDS follows Apptainer's host:container[:ro] shorthand.
+    # Literal ':' in the host source is intentionally unsupported here.
+    fields = pair.split(":")
+    if len(fields) < 2:
+        continue
+    destination = fields[1]
+    if destination.startswith("/") and destination != "/" and ".." not in destination.split("/"):
+        paths.append(destination.rstrip("/"))
+paths = sorted(set(paths))
+temporary = f"{manifest}.tmp-{os.getpid()}"
+with open(temporary, "w", encoding="utf-8") as handle:
+    json.dump({"paths": paths}, handle, separators=(",", ":"))
+    handle.write("\n")
+os.replace(temporary, manifest)
+PY
+
 if [ -n "${WH_EXTRA_BINDS:-}" ]; then
   IFS=';' read -ra _extra_pairs <<< "$WH_EXTRA_BINDS"
   for _pair in "${_extra_pairs[@]}"; do
@@ -198,7 +225,10 @@ fi
 exec_env_args=(
   --env TS_AUTHKEY="$TS_AUTHKEY"
   --env TS_HOST="${TS_HOST:-https://headscale.d0me.xyz}"
+  --env TS_HOSTNAME="${TS_HOSTNAME:-}"
+  --env TS_SOCKS5_ADDR="${TS_SOCKS5_ADDR:-127.0.0.1:1055}"
   --env ORCHESTRATOR_HOST="$ORCHESTRATOR_HOST"
+  --env ORCHESTRATOR_PORT="${ORCHESTRATOR_PORT:-12888}"
   --env SSH_USER="$ssh_user"
   --env USER="$ssh_user"
   --env LOGNAME="$ssh_user"

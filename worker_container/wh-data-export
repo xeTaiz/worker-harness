@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Start or clean up a one-transfer, read-only rsync export.
+set -euo pipefail
+
+usage() {
+  echo "usage: wh-data-export --transfer-id ID [--path PATH --ttl-seconds SECONDS] | --cleanup --transfer-id ID" >&2
+  exit 2
+}
+
+transfer_id=""
+source_path=""
+ttl_seconds=21600
+cleanup=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --transfer-id) transfer_id=${2:-}; shift 2 ;;
+    --path) source_path=${2:-}; shift 2 ;;
+    --ttl-seconds) ttl_seconds=${2:-}; shift 2 ;;
+    --cleanup) cleanup=1; shift ;;
+    *) usage ;;
+  esac
+done
+[[ "$transfer_id" =~ ^[A-Za-z0-9-]{8,128}$ ]] || usage
+base="${WH_DIR:-$HOME/.local/worker-harness}/data/transfers/${transfer_id}"
+socket="${WH_DIR:-$HOME/.local/worker-harness}/tailscale/run/tailscaled.sock"
+
+cleanup_export() {
+  if [[ -f "$base/port" ]]; then
+    port=$(cat "$base/port")
+    tailscale --socket="$socket" serve --tcp="$port" off >/dev/null 2>&1 || true
+  fi
+  if [[ -f "$base/rsync.pid" ]]; then
+    pid=$(cat "$base/rsync.pid")
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  rm -rf "$base"
+}
+
+if [[ "$cleanup" == 1 ]]; then
+  cleanup_export
+  exit 0
+fi
+
+[[ -n "$source_path" && -d "$source_path" ]] || { echo "source path is not a directory" >&2; exit 1; }
+[[ "$ttl_seconds" =~ ^[0-9]+$ ]] && (( ttl_seconds >= 60 && ttl_seconds <= 86400 )) || usage
+command -v rsync >/dev/null || { echo "rsync is not installed" >&2; exit 1; }
+command -v tailscale >/dev/null || { echo "tailscale is not installed" >&2; exit 1; }
+[[ -S "$socket" ]] || { echo "tailscale socket unavailable" >&2; exit 1; }
+
+mkdir -p "$base"
+chmod 700 "$base"
+# Select a free reserved port. The daemon binds localhost; tailscale serve owns
+# the tailnet-facing listener on the same numeric port.
+port=""
+for candidate in $(shuf -i 22000-22999 -n 100); do
+  if ! ss -ltn "sport = :$candidate" 2>/dev/null | grep -q LISTEN; then
+    port="$candidate"
+    break
+  fi
+done
+[[ -n "$port" ]] || { echo "no free worker data port" >&2; exit 1; }
+
+username="transfer"
+password=$(head -c 32 /dev/urandom | base64 | tr -d '=+/\n' | cut -c1-32)
+printf '%s:%s\n' "$username" "$password" > "$base/rsync.secrets"
+chmod 600 "$base/rsync.secrets"
+cat > "$base/rsyncd.conf" <<EOF
+use chroot = no
+pid file = $base/rsyncd.pid
+log file = $base/rsyncd.log
+[transfer]
+    path = $source_path
+    read only = yes
+    list = no
+    auth users = $username
+    secrets file = $base/rsync.secrets
+EOF
+
+nohup rsync --daemon --no-detach --address=127.0.0.1 --port="$port" --config="$base/rsyncd.conf" \
+  >"$base/rsync.stdout" 2>"$base/rsync.stderr" < /dev/null &
+pid=$!
+printf '%s\n' "$pid" > "$base/rsync.pid"
+printf '%s\n' "$port" > "$base/port"
+sleep 0.2
+if ! kill -0 "$pid" 2>/dev/null; then
+  cat "$base/rsync.stderr" >&2 || true
+  cleanup_export
+  exit 1
+fi
+
+if ! tailscale --socket="$socket" serve --bg --yes --tcp="$port" "tcp://127.0.0.1:$port"; then
+  cleanup_export
+  exit 1
+fi
+(
+  sleep "$ttl_seconds"
+  "$0" --cleanup --transfer-id "$transfer_id" >/dev/null 2>&1 || true
+) >/dev/null 2>&1 < /dev/null &
+# The credential is deliberately emitted only over the orchestrator's existing
+# SSH control channel; callers must not log or persist this JSON.
+printf '{"port":%s,"module":"transfer","username":"%s","password":"%s"}\n' "$port" "$username" "$password"

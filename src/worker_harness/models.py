@@ -64,6 +64,9 @@ class WorkerRegistration(BaseModel):
     used_disk_gb: float = 0.0
     active_jobs: list[dict[str, Any]] = Field(default_factory=list)
     active_ports: list[dict[str, Any]] = Field(default_factory=list)
+    # Exact container destinations declared by WH_EXTRA_BINDS. This is a
+    # discovery hint, not a recursive filesystem inventory.
+    data_paths: list[str] = Field(default_factory=list)
     timestamp: str = ""
 
 
@@ -85,6 +88,7 @@ class Worker(BaseModel):
     used_ram_gb: float = 0.0
     total_disk_gb: float = 0.0
     used_disk_gb: float = 0.0
+    data_paths: list[str] = Field(default_factory=list)
     status: WorkerStatus = WorkerStatus.OFFLINE
     last_heartbeat_ts: int = 0
     created_at: int = 0
@@ -112,6 +116,7 @@ class Worker(BaseModel):
             used_ram_gb=reg.used_ram_gb,
             total_disk_gb=reg.total_disk_gb,
             used_disk_gb=reg.used_disk_gb,
+            data_paths=reg.data_paths,
             status=WorkerStatus.ONLINE,
             last_heartbeat_ts=now,
             created_at=now,
@@ -132,6 +137,7 @@ class Worker(BaseModel):
         self.used_ram_gb = reg.used_ram_gb
         self.total_disk_gb = reg.total_disk_gb
         self.used_disk_gb = reg.used_disk_gb
+        self.data_paths = reg.data_paths
         self.status = WorkerStatus.ONLINE
         self.last_heartbeat_ts = int(datetime.now(timezone.utc).timestamp())
 

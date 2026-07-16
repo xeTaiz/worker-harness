@@ -177,6 +177,29 @@ def get_active_jobs() -> list[dict[str, Any]]:
         return []
 
 
+def get_data_paths() -> list[str]:
+    """Return exact container destinations declared by the launcher.
+
+    The host launcher writes this manifest from WH_EXTRA_BINDS.  Do not scan
+    /data or infer child paths: the operator chooses the useful index level.
+    """
+    manifest = WH_DIR / "data" / "bind-paths.json"
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    paths = payload.get("paths", []) if isinstance(payload, dict) else []
+    valid = {
+        value.rstrip("/")
+        for value in paths
+        if isinstance(value, str)
+        and value.startswith("/")
+        and value != "/"
+        and ".." not in value.split("/")
+    }
+    return sorted(valid)
+
+
 def get_active_ports() -> list[dict[str, Any]]:
     """Query SSH tunnels via ps to find active port forwards."""
     try:
@@ -248,6 +271,7 @@ def build_payload(worker_id: str, tailscale_ip: str, dns_name: str) -> dict[str,
         "used_disk_gb": sys_info.get("used_disk_gb", 0.0),
         "active_jobs": get_active_jobs(),
         "active_ports": [],
+        "data_paths": get_data_paths(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

@@ -1,14 +1,26 @@
 # Worker-Harness HTTP API Specification
 
-## Base URL
-http://localhost:8765/api/v1
+## Services
 
-## Endpoints
+| Service | Default URL | Purpose |
+|---|---|---|
+| Registration | `http://<orchestrator>:12888` | Worker-only `POST /register`, `GET /health` |
+| Control | `http://<orchestrator>:12889/api/v1` | Operator and agent API |
+
+Workers must only receive ACL access to the registration service. Control API
+access is intentionally separate.
+
+## Control endpoints
+
 ### Workers
 - GET /api/v1/workers
-- GET /api/v1/workers/:id  
+- GET /api/v1/workers/:id
 - DELETE /api/v1/workers/prune
 - GET /api/v1/workers/summary
+
+### Data
+- GET /api/v1/data — exact advertised bind-path → online-worker map
+- POST /api/v1/data/copy — start a direct, ephemeral rsync copy
 
 ### Jobs
 - POST /api/v1/jobs

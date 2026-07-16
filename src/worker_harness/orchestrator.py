@@ -22,7 +22,7 @@ from rich.console import Console
 
 from .config import Config
 from .db import Database
-from .heartbeat import run_heartbeat_server
+from .heartbeat import run_control_server, run_registration_server
 
 console = Console()
 
@@ -31,7 +31,8 @@ async def serve(config: Config) -> None:
     """Run the heartbeat HTTP server only."""
     db = Database(config.db_path)
     await db.connect()
-    console.print(f"[green]Starting heartbeat server on {config.heartbeat.host}:{config.heartbeat.port}[/]")
+    console.print(f"[green]Starting registration server on {config.heartbeat.host}:{config.heartbeat.port}[/]")
+    console.print(f"[green]Starting control server on {config.control.host}:{config.control.port}[/]")
     console.print(f"[dim]DB: {config.db_path}[/]")
 
     loop = asyncio.get_event_loop()
@@ -56,13 +57,17 @@ async def serve(config: Config) -> None:
                     console.print(f"[dim]Marked {count} worker(s) offline[/]")
 
         sweeper_task = asyncio.create_task(offline_sweeper())
-        server_task = asyncio.create_task(
-            run_heartbeat_server(db, config.heartbeat.host, config.heartbeat.port)
+        registration_task = asyncio.create_task(
+            run_registration_server(db, config.heartbeat.host, config.heartbeat.port)
+        )
+        control_task = asyncio.create_task(
+            run_control_server(db, config.control.host, config.control.port)
         )
 
         await stop_event.wait()
         sweeper_task.cancel()
-        server_task.cancel()
+        registration_task.cancel()
+        control_task.cancel()
     finally:
         await db.close()
 

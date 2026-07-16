@@ -3,17 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, TypeVar
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
 from .cache import TTLCache
+from .data import (
+    DataPathError,
+    destination_copy_command,
+    reverse_data_paths,
+    source_cleanup_command,
+    source_export_command,
+    validate_data_path,
+    with_worker_dir,
+)
 from .db import Database
 from .job import JobManager
 from .lanes import LaneTimeout, WorkerLanes
@@ -59,6 +70,14 @@ class FileDownloadRequest(BaseModel):
     max_bytes: int = MAX_FILE_TRANSFER_BYTES
 
 
+class DataCopyRequest(BaseModel):
+    src_worker: str
+    src_path: str
+    dst_worker: str
+    dst_path: str
+    ttl_seconds: int = 6 * 60 * 60
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start reliability background work and deterministically clean up.
@@ -80,8 +99,35 @@ async def lifespan(app: FastAPI):
         await app.state.lanes.shutdown()
 
 
+def create_registration_app(db: Database) -> FastAPI:
+    """Worker-only registration service, intentionally separate from control."""
+    app = FastAPI(title="Worker Harness Registration API")
+
+    @app.post("/register")
+    async def register(reg: WorkerRegistration):
+        try:
+            worker = await db.upsert_worker(reg)
+            log.info(
+                "Worker registered/updated: %s (id=%s, ip=%s)",
+                worker.name, worker.id, worker.worker_ip,
+            )
+            return {"status": "ok", "worker_id": worker.id}
+        except ValidationError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        except Exception as exc:
+            log.error("Registration failed: %s", exc)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+    @app.get("/health")
+    async def health():
+        return {"status": "healthy", "ts": datetime.now(timezone.utc).isoformat()}
+
+    return app
+
+
 def create_app(db: Database) -> FastAPI:
-    app = FastAPI(title="Worker Harness Heartbeat API", lifespan=lifespan)
+    """Create the privileged control API (kept as the public test factory)."""
+    app = FastAPI(title="Worker Harness Control API", lifespan=lifespan)
     jm = JobManager(db)
 
     # Shared reliability services. They are attached before lifespan starts so
@@ -141,6 +187,8 @@ def create_app(db: Database) -> FastAPI:
     async def invalidate_workers_cache() -> None:
         await app.state.cache.invalidate("workers:list")
         await app.state.cache.invalidate("workers:summary")
+        await app.state.cache.invalidate("data:paths:False")
+        await app.state.cache.invalidate("data:paths:True")
 
     async def resolve_worker(worker_id_or_name: str):
         worker = await db.get_worker(worker_id_or_name)
@@ -156,40 +204,7 @@ def create_app(db: Database) -> FastAPI:
             None,
         )
 
-    # ── Heartbeat/registration endpoints (existing behavior) ─────────────────
-
-    @app.post("/register")
-    async def register(reg: WorkerRegistration):
-        """
-        Full registration or heartbeat from a worker.
-        Workers send this on startup and every N seconds thereafter.
-        """
-        try:
-            worker = await db.upsert_worker(reg)
-            await invalidate_workers_cache()
-            log.info(
-                f"Worker registered/updated: {worker.name} "
-                f"(id={worker.id}, ip={worker.worker_ip}, dns={getattr(worker, 'dns_name', '')}, gpus={worker.gpu_count})"
-            )
-            return {"status": "ok", "worker_id": worker.id}
-        except ValidationError as e:
-            log.error(f"Invalid registration payload: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=str(e),
-            )
-        except Exception as e:
-            log.error(f"Registration failed: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=str(e),
-            )
-
-    @app.get("/health")
-    async def health():
-        return {"status": "healthy", "ts": datetime.now(timezone.utc).isoformat()}
-
-    # ── Orchestration API (/api/v1) ──────────────────────────────────────────
+    # ── Privileged orchestration API (/api/v1) ───────────────────────────────
 
     @app.get("/api/v1/workers")
     async def workers_list():
@@ -219,6 +234,102 @@ def create_app(db: Database) -> FastAPI:
         removed = await db.prune_workers(cutoff)
         await invalidate_workers_cache()
         return {"removed": removed, "minutes": minutes}
+
+    @app.get("/api/v1/data")
+    async def data_list(include_offline: bool = False):
+        async def load():
+            return reverse_data_paths(
+                await db.list_workers(), include_offline=include_offline
+            )
+        return await cached(f"data:paths:{include_offline}", 2.0, load)
+
+    @app.post("/api/v1/data/copy")
+    async def data_copy(payload: DataCopyRequest):
+        try:
+            src_path = validate_data_path(payload.src_path)
+            dst_path = validate_data_path(payload.dst_path)
+        except DataPathError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not 60 <= payload.ttl_seconds <= 24 * 60 * 60:
+            raise HTTPException(status_code=400, detail="ttl_seconds must be between 60 and 86400")
+
+        source = await resolve_worker(payload.src_worker)
+        destination = await resolve_worker(payload.dst_worker)
+        if not source:
+            raise HTTPException(status_code=404, detail=f"Source worker not found: {payload.src_worker}")
+        if not destination:
+            raise HTTPException(status_code=404, detail=f"Destination worker not found: {payload.dst_worker}")
+        if source.id == destination.id:
+            raise HTTPException(status_code=400, detail="source and destination workers must differ")
+        if source.status.value != "online" or destination.status.value != "online":
+            raise HTTPException(status_code=409, detail="source and destination workers must be online")
+        if src_path not in source.data_paths:
+            raise HTTPException(status_code=400, detail="source path is not advertised by the source worker")
+
+        transfer_id = str(uuid4())
+        exported = await async_ssh_run(
+            source,
+            with_worker_dir(source, source_export_command(src_path, transfer_id, payload.ttl_seconds)),
+            timeout=30,
+        )
+        if exported.returncode != 0:
+            raise HTTPException(status_code=502, detail=f"source export failed: {exported.stderr or 'unknown error'}")
+        try:
+            endpoint = json.loads(exported.stdout.strip().splitlines()[-1])
+            port = int(endpoint["port"])
+            username = str(endpoint["username"])
+            password = str(endpoint["password"])
+            if not 22000 <= port <= 22999 or not username or not password:
+                raise ValueError("invalid endpoint")
+        except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            await async_ssh_run(source, with_worker_dir(source, source_cleanup_command(transfer_id)), timeout=15)
+            raise HTTPException(status_code=502, detail="source export returned invalid metadata")
+
+        secret_path = f"{destination.harness_dir.rstrip('/')}/data-transfer-{transfer_id}.secret"
+        uploaded = await ssh_upload_bytes(destination, password.encode(), secret_path)
+        if uploaded.returncode != 0:
+            await async_ssh_run(source, with_worker_dir(source, source_cleanup_command(transfer_id)), timeout=15)
+            raise HTTPException(status_code=502, detail=f"destination credential upload failed: {uploaded.stderr or 'unknown error'}")
+
+        command = with_worker_dir(
+            destination,
+            destination_copy_command(source.ssh_host, port, dst_path, username, secret_path),
+        )
+        try:
+            job = await jm.start_job(destination, command, name=f"data-copy-{transfer_id}", pty_enabled=False)
+        except Exception as exc:
+            await async_ssh_run(source, with_worker_dir(source, source_cleanup_command(transfer_id)), timeout=15)
+            raise HTTPException(status_code=502, detail=f"destination copy job failed to start: {exc}")
+
+        async def cleanup_after_copy() -> None:
+            """End the source export promptly; TTL is the crash-safe fallback."""
+            deadline = asyncio.get_running_loop().time() + payload.ttl_seconds
+            try:
+                current = job
+                while asyncio.get_running_loop().time() < deadline:
+                    current = await jm.refresh_job_status(destination, current)
+                    if current.status in (JobStatus.DONE, JobStatus.FAILED):
+                        break
+                    await asyncio.sleep(5)
+            except Exception:
+                log.exception("Could not monitor data copy %s", transfer_id)
+            finally:
+                await async_ssh_run(
+                    source,
+                    with_worker_dir(source, source_cleanup_command(transfer_id)),
+                    timeout=15,
+                )
+
+        asyncio.create_task(cleanup_after_copy(), name=f"data-copy-cleanup-{transfer_id}")
+        return {
+            "transfer_id": transfer_id,
+            "job_id": job.id,
+            "source_worker": source.id,
+            "source_path": src_path,
+            "destination_worker": destination.id,
+            "destination_path": dst_path,
+            "expires_in_seconds": payload.ttl_seconds,
+        }
 
     @app.get("/api/v1/workers/{worker_id}")
     async def workers_get(worker_id: str):
@@ -568,15 +679,23 @@ def create_app(db: Database) -> FastAPI:
     return app
 
 
-async def run_heartbeat_server(
-    db: Database,
-    host: str = "0.0.0.0",
-    port: int = 12888,
-) -> None:
-    """Run the HTTP server using uvicorn."""
+async def _run_server(app: FastAPI, host: str, port: int) -> None:
     import uvicorn
 
-    app = create_app(db)
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
-    server = uvicorn.Server(config)
-    await server.serve()
+    await uvicorn.Server(config).serve()
+
+
+async def run_registration_server(db: Database, host: str = "0.0.0.0", port: int = 12888) -> None:
+    """Run the worker-only registration server."""
+    await _run_server(create_registration_app(db), host, port)
+
+
+async def run_control_server(db: Database, host: str = "0.0.0.0", port: int = 12889) -> None:
+    """Run the privileged operator/control server."""
+    await _run_server(create_app(db), host, port)
+
+
+# Compatibility alias for callers that previously started the combined server.
+# It now intentionally starts registration only.
+run_heartbeat_server = run_registration_server

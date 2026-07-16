@@ -12,6 +12,8 @@ From: nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
     worker_container/requirements.txt /requirements.txt
     worker_container/worker_daemon.py /worker_daemon.py
     worker_container/entrypoint.sh /entrypoint.sh
+    worker_container/wh-data-export /wh-data-export
+    worker_container/wh-data-import /wh-data-import
 
 %post
     set -eux
@@ -36,7 +38,8 @@ From: nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
         ninja-build \
         pkg-config \
         file \
-        ccache
+        ccache \
+        rsync
 
     ln -sf /usr/bin/python3 /usr/bin/python
 
@@ -49,6 +52,9 @@ From: nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
     pip3 install --break-system-packages uv
     pip3 install --break-system-packages -r /requirements.txt
 
+    mkdir -p /usr/local/lib/worker-harness
+    install -m 0755 /wh-data-export /usr/local/lib/worker-harness/wh-data-export
+    install -m 0755 /wh-data-import /usr/local/lib/worker-harness/wh-data-import
     chmod +x /entrypoint.sh
 
     # Make sure /usr/local/cuda/bin and /usr/local/nvidia/bin survive into

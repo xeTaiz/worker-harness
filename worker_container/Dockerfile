@@ -23,6 +23,7 @@ RUN rm -f /etc/apt/sources.list.d/*nvidia* /etc/apt/sources.list.d/cuda* 2>/dev/
     pkg-config \
     file \
     ccache \
+    rsync \
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -43,6 +44,7 @@ WORKDIR /workspace
 COPY worker_daemon.py /worker_daemon.py
 
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY wh-data-export wh-data-import /usr/local/lib/worker-harness/
+RUN chmod +x /entrypoint.sh /usr/local/lib/worker-harness/wh-data-export /usr/local/lib/worker-harness/wh-data-import
 
 ENTRYPOINT ["/entrypoint.sh"]

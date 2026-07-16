@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Pull a one-transfer rsync daemon through the local userspace Tailscale socket.
+set -euo pipefail
+
+host=""
+port=""
+destination=""
+username=""
+password_file=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --host) host=${2:-}; shift 2 ;;
+    --port) port=${2:-}; shift 2 ;;
+    --destination) destination=${2:-}; shift 2 ;;
+    --username) username=${2:-}; shift 2 ;;
+    --password-file) password_file=${2:-}; shift 2 ;;
+    *) echo "usage: wh-data-import --host HOST --port PORT --destination PATH --username USER --password-file PATH" >&2; exit 2 ;;
+  esac
+done
+[[ -n "$host" && "$port" =~ ^[0-9]+$ && "$port" -ge 22000 && "$port" -le 22999 && -n "$destination" && -n "$username" && -r "$password_file" ]] || exit 2
+[[ "$destination" != "/" && "$destination" != *".."* ]] || { echo "unsafe destination" >&2; exit 2; }
+
+socket="${WH_DIR:-$HOME/.local/worker-harness}/tailscale/run/tailscaled.sock"
+[[ -S "$socket" ]] || { echo "tailscale socket unavailable" >&2; exit 1; }
+mkdir -p "$destination"
+chmod 600 "$password_file"
+trap 'rm -f "$password_file"' EXIT
+
+# RSYNC_CONNECT_PROG gives rsync daemon mode a bidirectional stdio transport.
+# tailscale nc uses the existing userspace-networking daemon, so no kernel TUN
+# device or peer Tailscale SSH permission is required.
+export RSYNC_CONNECT_PROG="tailscale --socket=$socket nc %H $port"
+rsync -a --partial --append-verify --password-file="$password_file" \
+  "rsync://${username}@${host}/transfer/" "${destination%/}/"

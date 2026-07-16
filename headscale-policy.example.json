@@ -20,7 +20,7 @@
     {
       "action": "accept",
       "src": ["autogroup:member"],
-      "dst": ["tag:wh-orchestrator:*"]
+      "dst": ["tag:wh-orchestrator:12889"]
     },
     {
       "action": "accept",
