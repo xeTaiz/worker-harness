@@ -19,7 +19,7 @@ access is intentionally separate.
 - GET /api/v1/workers/summary
 
 ### Data
-- GET /api/v1/data — exact advertised bind-path → online-worker map
+- GET /api/v1/data — advertised immediate data-directory → online-worker map
 - POST /api/v1/data/copy — start a direct, ephemeral rsync copy
 
 ### Jobs

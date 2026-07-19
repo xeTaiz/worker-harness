@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
-from worker_harness.data import DataPathError, reverse_data_paths, validate_data_path
+from worker_harness.data import DataPathError, is_advertised_data_path, reverse_data_paths, validate_data_path
 from worker_harness.db import Database
 from worker_harness.heartbeat import create_app, create_registration_app
 from worker_harness.models import WorkerRegistration, WorkerStatus
@@ -78,11 +78,29 @@ class DataApiTests(unittest.TestCase):
         self.assertIn("wh-data-export", ssh.await_args.args[1])
         command = start_job.await_args.args[1]
         self.assertIn("wh-data-import", command)
+        self.assertIn("--host worker-one.tailnet", command)
         self.assertNotIn("tailscale ssh", command)
 
-    def test_copy_rejects_unadvertised_source(self):
+    def test_copy_accepts_child_of_advertised_bind_root(self):
+        with patch(
+            "worker_harness.heartbeat.async_ssh_run",
+            new=AsyncMock(return_value=SSHResult(
+                stdout=json.dumps({"port": 22003, "username": "transfer", "password": "secret"}) + "\n",
+                stderr="", returncode=0,
+            ))), patch(
+                "worker_harness.heartbeat.ssh_upload_bytes",
+                new=AsyncMock(return_value=SSHResult(stdout="", stderr="", returncode=0)),
+            ), patch("worker_harness.heartbeat.JobManager.start_job", new=AsyncMock()) as start_job:
+            start_job.return_value.id = "job-child-copy"
+            response = self.client.post("/api/v1/data/copy", json={
+                "src_worker": "w-one", "src_path": "/data/imagenet/train",
+                "dst_worker": "w-two", "dst_path": "/data/cache/train",
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_copy_rejects_source_outside_advertised_bind_roots(self):
         response = self.client.post("/api/v1/data/copy", json={
-            "src_worker": "w-one", "src_path": "/data/not-advertised",
+            "src_worker": "w-one", "src_path": "/share/not-advertised",
             "dst_worker": "w-two", "dst_path": "/data/cache/x",
         })
         self.assertEqual(response.status_code, 400)
@@ -107,6 +125,9 @@ class RegistrationIsolationTests(unittest.TestCase):
 class DataUtilityTests(unittest.TestCase):
     def test_validate_data_path(self):
         self.assertEqual(validate_data_path("/data/imagenet"), "/data/imagenet")
+        self.assertTrue(is_advertised_data_path("/data/imagenet/train", ["/data/imagenet"]))
+        self.assertFalse(is_advertised_data_path("/data", ["/data/imagenet"]))
+        self.assertFalse(is_advertised_data_path("/data-other/train", ["/data/imagenet"]))
         with self.assertRaises(DataPathError):
             validate_data_path("/data/../secret")
         with self.assertRaises(DataPathError):

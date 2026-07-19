@@ -18,7 +18,7 @@ host NAS / host rclone mount / host-local data
                                       ▼
                                 worker sees path
                                       │
-                         heartbeat advertises exact bind path
+                   heartbeat advertises immediate directories
                                       │
                                       ▼
                          agent finds source worker + path
@@ -114,9 +114,9 @@ a latent capability or deployment risk.
 
 ### Goal
 
-Advertise exactly the data-visible container paths chosen by the operator in
-`WH_EXTRA_BINDS`.  Do not infer datasets, scan arbitrary directories, or
-recursively index content.
+Advertise the immediate data directories inside each data-visible container
+path chosen by the operator in `WH_EXTRA_BINDS`. Do not recursively index
+content or scan outside those configured bind destinations.
 
 ### Bind manifest
 
@@ -152,29 +152,29 @@ literal `:` are unsupported and need not be added in this phase.
 ### Worker daemon behavior
 
 The worker daemon reads `bind-paths.json` on each heartbeat and reports the
-normalized, deduplicated absolute paths in `data_paths`.
+normalized, deduplicated **immediate non-symlink directory children** of each
+configured destination in `data_paths`. For example, a configured `/data`
+bind with `/data/ds1` and `/data/ds2` reports those two paths, not `/data`.
 
 It does not:
 
-- recursively scan `/data`, `/share`, `/code`, or the bound paths;
-- list child names, calculate size, hash files, or parse content;
-- report a path absent from the manifest;
-- report host-side source paths.
+- recursively scan below those immediate children;
+- list files, calculate size, hash content, or parse datasets;
+- report a bind root, a path outside a bind root, or a host-side source path;
+- follow or advertise symlinks.
 
-An optional `Path.is_dir()` check may suppress a broken/missing bind from the
-heartbeat, but does not discover any additional data.
+A missing or unreadable bind is simply absent from that heartbeat.
 
-The operator chooses the bind destination at the desired semantic level:
+The operator chooses a collection-level bind destination:
 
 ```text
-/mnt/nas/imagenet   → /data/imagenet       # index one dataset
-/mnt/nas/projects   → /code/projects       # index project collection
-/mnt/nas            → /share/institution   # index one broad share
+/mnt/nas/datasets   → /data                # advertises /data/imagenet, /data/coco, …
+/mnt/nas/projects   → /code                # advertises /code/project-a, /code/project-b, …
 ```
 
-Agents inspect a returned path with their existing worker shell access (`ls`,
-`find`, `du`, application-specific commands).  No content-inspection endpoint
-is added.
+Each returned directory is a copyable unit. Agents may inspect it with their
+existing worker shell access (`ls`, `find`, `du`, application-specific
+commands). No content-inspection endpoint is added.
 
 ### Orchestrator behavior
 
@@ -204,7 +204,7 @@ wh_read({ action: "list_data" })
 ### Tests
 
 - launcher manifest extraction for ordinary, read-only, and multiple bind pairs;
-- daemon ignores missing/invalid manifests and reports valid paths exactly;
+- daemon ignores missing/invalid manifests and reports only immediate valid directories;
 - DB migration, insert, update, and row decoding of `data_paths`;
 - endpoint excludes offline workers by default and has an explicit
   `include_offline` option;
@@ -251,8 +251,9 @@ Validate only operational invariants:
 - source/destination paths are normalized absolute paths and not `/`;
 - source and destination workers differ;
 - target destination parent can be created by the runtime user;
-- source is advertised in the source worker's `data_paths` (or an explicit
-  future `allow_unindexed_source` flag is added; default false).
+- source equals an advertised source directory or is below one of those
+  directories (an explicit future `allow_unindexed_source` flag may be added;
+  default false).
 
 This is not intended as a path authorization system: agents with worker
 control already have shell access.  Validation prevents accidental broad

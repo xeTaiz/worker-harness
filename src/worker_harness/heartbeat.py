@@ -19,6 +19,7 @@ from .cache import TTLCache
 from .data import (
     DataPathError,
     destination_copy_command,
+    is_advertised_data_path,
     reverse_data_paths,
     source_cleanup_command,
     source_export_command,
@@ -263,8 +264,11 @@ def create_app(db: Database) -> FastAPI:
             raise HTTPException(status_code=400, detail="source and destination workers must differ")
         if source.status.value != "online" or destination.status.value != "online":
             raise HTTPException(status_code=409, detail="source and destination workers must be online")
-        if src_path not in source.data_paths:
-            raise HTTPException(status_code=400, detail="source path is not advertised by the source worker")
+        if not is_advertised_data_path(src_path, source.data_paths):
+            raise HTTPException(
+                status_code=400,
+                detail="source path is outside the source worker's advertised data directories",
+            )
 
         transfer_id = str(uuid4())
         exported = await async_ssh_run(

@@ -25,6 +25,24 @@ def validate_data_path(path: str) -> str:
     return normalized
 
 
+def is_advertised_data_path(path: str, advertised_paths: Iterable[str]) -> bool:
+    """Return whether *path* is an advertised directory or one of its children.
+
+    Workers advertise only immediate directories below configured bind roots.
+    A copy may select one of those advertised directories, or a descendant
+    file/directory, but cannot select an unadvertised sibling or bind root.
+    """
+    candidate = validate_data_path(path)
+    for root in advertised_paths:
+        try:
+            normalized_root = validate_data_path(root)
+        except DataPathError:
+            continue
+        if candidate == normalized_root or candidate.startswith(normalized_root + "/"):
+            return True
+    return False
+
+
 def reverse_data_paths(
     workers: Iterable[Worker], *, include_offline: bool = False
 ) -> dict[str, list[dict[str, str]]]:

@@ -178,26 +178,41 @@ def get_active_jobs() -> list[dict[str, Any]]:
 
 
 def get_data_paths() -> list[str]:
-    """Return exact container destinations declared by the launcher.
+    """Return immediate shareable directories below configured bind roots.
 
-    The host launcher writes this manifest from WH_EXTRA_BINDS.  Do not scan
-    /data or infer child paths: the operator chooses the useful index level.
+    The host launcher writes bind destinations from ``WH_EXTRA_BINDS`` to the
+    manifest.  Each destination is a collection root, not itself an advertised
+    dataset: enumerate its direct, non-symlink directory children only.  This
+    deliberately avoids recursive indexing, file metadata, and host paths.
     """
     manifest = WH_DIR / "data" / "bind-paths.json"
     try:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         return []
-    paths = payload.get("paths", []) if isinstance(payload, dict) else []
-    valid = {
-        value.rstrip("/")
-        for value in paths
-        if isinstance(value, str)
-        and value.startswith("/")
-        and value != "/"
-        and ".." not in value.split("/")
-    }
-    return sorted(valid)
+
+    roots = payload.get("paths", []) if isinstance(payload, dict) else []
+    shareable: set[str] = set()
+    for value in roots:
+        if (
+            not isinstance(value, str)
+            or not value.startswith("/")
+            or value == "/"
+            or ".." in value.split("/")
+        ):
+            continue
+        try:
+            children = Path(value.rstrip("/")).iterdir()
+            for child in children:
+                # Do not advertise symlinks: an advertised path must stay in
+                # the configured bind tree rather than resolving elsewhere.
+                if child.is_symlink() or not child.is_dir():
+                    continue
+                shareable.add(str(child))
+        except OSError:
+            # A missing/unreadable mount is simply absent from this heartbeat.
+            continue
+    return sorted(shareable)
 
 
 def get_active_ports() -> list[dict[str, Any]]:
