@@ -51,6 +51,19 @@ if [[ -n "${PI_CONFIG_SOURCE:-}" ]]; then
   for name in auth.json settings.json models.json models-store.json; do
     [[ ! -f "$PI_CONFIG_SOURCE/$name" ]] || cp -a "$PI_CONFIG_SOURCE/$name" "$release_dir/agent-config/$name"
   done
+  # A normal interactive profile may declare npm packages for extensions. The
+  # delegated launcher intentionally has neither npm nor extensions, so retain
+  # its model defaults but strip package declarations before release.
+  if [[ -f "$release_dir/agent-config/settings.json" ]]; then
+    SETTINGS_PATH="$release_dir/agent-config/settings.json" python3 - <<'PY'
+import json, os
+from pathlib import Path
+path = Path(os.environ["SETTINGS_PATH"])
+settings = json.loads(path.read_text(encoding="utf-8"))
+settings.pop("packages", None)
+path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+PY
+  fi
 fi
 
 pi_version=$("$release_dir/bin/pi" --version)
