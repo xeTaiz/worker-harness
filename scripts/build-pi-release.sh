@@ -48,7 +48,7 @@ if [[ -n "${PI_CONFIG_SOURCE:-}" ]]; then
   mkdir -p "$release_dir/agent-config"
   # Never ship interaction history, crash logs, extensions, or arbitrary host
   # files. The allowlist is deliberately the small Pi provider/model surface.
-  for name in auth.json settings.json models.json models-store.json; do
+  for name in auth.json settings.json models.json models-store.json opencode-keys.json; do
     [[ ! -f "$PI_CONFIG_SOURCE/$name" ]] || cp -a "$PI_CONFIG_SOURCE/$name" "$release_dir/agent-config/$name"
   done
   # A normal interactive profile may declare npm packages for extensions. The
