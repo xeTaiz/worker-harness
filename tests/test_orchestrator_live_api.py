@@ -8,7 +8,9 @@ from urllib.parse import urlparse
 import httpx
 
 
-ORCH_URL = os.getenv("ORCHESTRATOR_URL", "http://orchestrator.hs.d0me.xyz:12888")
+# 12888 is the worker-only registration service; the privileged control API
+# (workers, jobs, Pi delegation) intentionally listens on 12889.
+ORCH_URL = os.getenv("ORCHESTRATOR_URL", "http://orchestrator.hs.d0me.xyz:12889")
 PREFERRED_WORKER_HINT = os.getenv("ORCHESTRATOR_WORKER_HINT", "userspace").strip().lower()
 TIMEOUT = 20.0
 

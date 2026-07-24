@@ -163,6 +163,11 @@ def create_app(db: Database) -> FastAPI:
     set_global_metrics(app.state.metrics)
     set_lanes(app.state.lanes)
 
+    @app.get("/health")
+    async def health():
+        """Control-plane liveness endpoint (separate from registration)."""
+        return {"status": "healthy", "ts": datetime.now(timezone.utc).isoformat()}
+
     @app.middleware("http")
     async def metrics_middleware(request: Request, call_next):
         metrics = app.state.metrics

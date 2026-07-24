@@ -12,9 +12,12 @@ This repository targets **Tailscale + Headscale**.
 
 Required ACL directions:
 
-1. `tag:wh-worker` -> `tag:wh-orchestrator:12888` (heartbeat/register API)
+1. `tag:wh-worker` -> `tag:wh-orchestrator:12888` (heartbeat/register API only)
 2. `tag:wh-orchestrator` -> `tag:wh-worker:*` (worker control traffic)
-3. `tag:client` -> `tag:wh-orchestrator:12888` (optional external access)
+3. Operator/client Tailnet members -> `tag:wh-orchestrator:12889` (privileged control API, including Pi delegation)
+
+`tag:wh-worker` must not be granted access to port `12889`; worker registration
+and the operator control plane are deliberately separate services.
 
 Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 
