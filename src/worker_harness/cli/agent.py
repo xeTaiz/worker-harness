@@ -55,6 +55,9 @@ def _agent_workers_impl():
                     status=w.status,
                     last_heartbeat_ts=w.last_heartbeat_ts,
                     running_job_count=running_count,
+                    pi_relay_port=w.pi_relay_port,
+                    pi_relay_available=w.pi_relay_available,
+                    pi_relay_protocol_version=w.pi_relay_protocol_version,
                 ))
 
             response = AgentWorkersResponse(

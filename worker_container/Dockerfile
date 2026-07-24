@@ -40,8 +40,8 @@ COPY requirements.txt /requirements.txt
 RUN pip3 install --break-system-packages -r /requirements.txt
 
 WORKDIR /workspace
-# Copy worker daemon
-COPY worker_daemon.py /worker_daemon.py
+# Copy worker daemon and its loopback Pi-session relay.
+COPY worker_daemon.py pi_relay.py /
 
 COPY entrypoint.sh /entrypoint.sh
 COPY wh-data-export wh-data-import /usr/local/lib/worker-harness/

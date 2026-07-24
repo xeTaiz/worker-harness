@@ -67,6 +67,12 @@ class WorkerRegistration(BaseModel):
     # Exact container destinations declared by WH_EXTRA_BINDS. This is a
     # discovery hint, not a recursive filesystem inventory.
     data_paths: list[str] = Field(default_factory=list)
+    # Worker-local Pi relay published through userspace Tailscale Serve.
+    # `available` is false when bind/publication failed, even though a port is
+    # configured, so clients can avoid a dead direct-attach route.
+    pi_relay_port: int = Field(default=0, ge=0, le=65535)
+    pi_relay_available: bool = False
+    pi_relay_protocol_version: int = Field(default=0, ge=0)
     timestamp: str = ""
 
 
@@ -89,6 +95,9 @@ class Worker(BaseModel):
     total_disk_gb: float = 0.0
     used_disk_gb: float = 0.0
     data_paths: list[str] = Field(default_factory=list)
+    pi_relay_port: int = Field(default=0, ge=0, le=65535)
+    pi_relay_available: bool = False
+    pi_relay_protocol_version: int = Field(default=0, ge=0)
     status: WorkerStatus = WorkerStatus.OFFLINE
     last_heartbeat_ts: int = 0
     created_at: int = 0
@@ -117,6 +126,9 @@ class Worker(BaseModel):
             total_disk_gb=reg.total_disk_gb,
             used_disk_gb=reg.used_disk_gb,
             data_paths=reg.data_paths,
+            pi_relay_port=reg.pi_relay_port,
+            pi_relay_available=reg.pi_relay_available,
+            pi_relay_protocol_version=reg.pi_relay_protocol_version,
             status=WorkerStatus.ONLINE,
             last_heartbeat_ts=now,
             created_at=now,
@@ -138,6 +150,9 @@ class Worker(BaseModel):
         self.total_disk_gb = reg.total_disk_gb
         self.used_disk_gb = reg.used_disk_gb
         self.data_paths = reg.data_paths
+        self.pi_relay_port = reg.pi_relay_port
+        self.pi_relay_available = reg.pi_relay_available
+        self.pi_relay_protocol_version = reg.pi_relay_protocol_version
         self.status = WorkerStatus.ONLINE
         self.last_heartbeat_ts = int(datetime.now(timezone.utc).timestamp())
 
@@ -200,6 +215,9 @@ class WorkerSummary(BaseModel):
     status: WorkerStatus
     last_heartbeat_ts: int
     running_job_count: int = 0
+    pi_relay_port: int = 0
+    pi_relay_available: bool = False
+    pi_relay_protocol_version: int = 0
 
     @property
     def ssh_host(self) -> str:

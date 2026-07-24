@@ -240,8 +240,19 @@ if [ "$launch_mode" = "instance" ]; then
   # Stop any leftover instance from a previous run (crash, restart, etc.)
   "$runtime" instance stop "$instance_name" 2>/dev/null || true
   echo "[start-wh] Starting instance $instance_name using $runtime..."
-  "$runtime" instance start --cleanenv "${mount_args[@]}" "$image" "$instance_name"
-  exec "$runtime" exec --cleanenv "${exec_env_args[@]}" instance://"$instance_name" /entrypoint.sh
+  # `instance start` runs the SIF startscript (which is /entrypoint.sh), so
+  # its environment must be supplied here rather than only to a later exec.
+  "$runtime" instance start --cleanenv "${mount_args[@]}" "${exec_env_args[@]}" "$image" "$instance_name"
+
+  # Keep this systemd service attached to the instance without starting a
+  # second entrypoint (and thus a second tailscaled/worker daemon).
+  # If the instance exits, return failure so Restart=always recreates it.
+  trap '"$runtime" instance stop "$instance_name" 2>/dev/null || true' EXIT INT TERM
+  while "$runtime" instance list "$instance_name" | awk -v name="$instance_name" '$1 == name { found = 1 } END { exit !found }'; do
+    sleep 1
+  done
+  echo "[start-wh] ERROR: instance $instance_name exited" >&2
+  exit 1
 fi
 
 echo "[start-wh] Starting one-shot container using $runtime..."

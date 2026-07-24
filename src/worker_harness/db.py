@@ -70,6 +70,9 @@ class Database:
                 total_disk_gb REAL DEFAULT 0,
                 used_disk_gb REAL DEFAULT 0,
                 data_paths TEXT DEFAULT '[]',
+                pi_relay_port INTEGER DEFAULT 0,
+                pi_relay_available INTEGER DEFAULT 0,
+                pi_relay_protocol_version INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'offline',
                 last_heartbeat_ts INTEGER DEFAULT 0,
                 created_at INTEGER DEFAULT 0
@@ -104,6 +107,12 @@ class Database:
             await self._db.execute("ALTER TABLE workers ADD COLUMN harness_dir TEXT NOT NULL DEFAULT '/harness'")
         if "data_paths" not in colnames:
             await self._db.execute("ALTER TABLE workers ADD COLUMN data_paths TEXT DEFAULT '[]'")
+        if "pi_relay_port" not in colnames:
+            await self._db.execute("ALTER TABLE workers ADD COLUMN pi_relay_port INTEGER DEFAULT 0")
+        if "pi_relay_available" not in colnames:
+            await self._db.execute("ALTER TABLE workers ADD COLUMN pi_relay_available INTEGER DEFAULT 0")
+        if "pi_relay_protocol_version" not in colnames:
+            await self._db.execute("ALTER TABLE workers ADD COLUMN pi_relay_protocol_version INTEGER DEFAULT 0")
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
@@ -186,14 +195,16 @@ class Database:
             """INSERT INTO workers
                (id, name, worker_ip, dns_name, ssh_user, harness_dir, gpu_count, gpu_names, gpu_vram_gb,
                 gpu_used_vram_gb, cpu_cores, total_ram_gb, used_ram_gb, total_disk_gb, used_disk_gb,
-                data_paths, status, last_heartbeat_ts, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                data_paths, pi_relay_port, pi_relay_available, pi_relay_protocol_version,
+                status, last_heartbeat_ts, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 w.id, w.name, w.worker_ip, w.dns_name, w.ssh_user, w.harness_dir, w.gpu_count,
                 json.dumps(w.gpu_names), json.dumps(w.gpu_vram_gb),
                 json.dumps(w.gpu_used_vram_gb),
                 w.cpu_cores, w.total_ram_gb, w.used_ram_gb,
                 w.total_disk_gb, w.used_disk_gb, json.dumps(w.data_paths),
+                w.pi_relay_port, int(w.pi_relay_available), w.pi_relay_protocol_version,
                 w.status.value, w.last_heartbeat_ts, w.created_at,
             ),
         )
@@ -204,7 +215,8 @@ class Database:
             """UPDATE workers SET
                name=?, worker_ip=?, dns_name=?, ssh_user=?, harness_dir=?, gpu_count=?, gpu_names=?,
                gpu_vram_gb=?, gpu_used_vram_gb=?, cpu_cores=?, total_ram_gb=?, used_ram_gb=?,
-               total_disk_gb=?, used_disk_gb=?, data_paths=?, status=?, last_heartbeat_ts=?
+               total_disk_gb=?, used_disk_gb=?, data_paths=?, pi_relay_port=?, pi_relay_available=?,
+               pi_relay_protocol_version=?, status=?, last_heartbeat_ts=?
                WHERE id=?""",
             (
                 w.name, w.worker_ip, w.dns_name, w.ssh_user, w.harness_dir, w.gpu_count,
@@ -212,6 +224,7 @@ class Database:
                 json.dumps(w.gpu_used_vram_gb),
                 w.cpu_cores, w.total_ram_gb, w.used_ram_gb,
                 w.total_disk_gb, w.used_disk_gb, json.dumps(w.data_paths),
+                w.pi_relay_port, int(w.pi_relay_available), w.pi_relay_protocol_version,
                 w.status.value, w.last_heartbeat_ts, w.id,
             ),
         )
@@ -235,6 +248,9 @@ class Database:
             total_disk_gb=row["total_disk_gb"],
             used_disk_gb=row["used_disk_gb"],
             data_paths=json.loads(row["data_paths"] or "[]"),
+            pi_relay_port=row["pi_relay_port"],
+            pi_relay_available=bool(row["pi_relay_available"]),
+            pi_relay_protocol_version=row["pi_relay_protocol_version"],
             status=WorkerStatus(row["status"]),
             last_heartbeat_ts=row["last_heartbeat_ts"],
             created_at=row["created_at"],

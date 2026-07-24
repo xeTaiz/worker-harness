@@ -2,3 +2,5 @@
 # ML/CUDA stacks (torch, transformers, etc.) are installed per-job via uv.
 httpx[socks]>=0.28
 psutil>=6.1
+fastapi>=0.115
+uvicorn[standard]>=0.34

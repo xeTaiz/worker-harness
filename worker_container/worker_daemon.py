@@ -4,8 +4,9 @@ Worker Daemon — runs inside each worker container.
 
 Responsibilities:
   - Send initial registration + periodic heartbeats to the orchestrator
-  - Expose a Unix socket for in-container queries (optional, future use)
-  - Do nothing else. Keep it minimal.
+  - Run the loopback-only Pi-session relay and publish it through Tailscale
+    Serve for trusted non-worker Tailnet members
+  - Keep Pi process launch/PTY ownership out of this first transport slice
 """
 
 import asyncio
@@ -13,6 +14,7 @@ import getpass
 import json
 import logging
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -24,6 +26,13 @@ from urllib.parse import urlparse
 
 import httpx
 
+# worker_daemon.py and pi_relay.py are copied together to / in the worker
+# image.  This also makes path-based test imports resolve the sibling module.
+MODULE_DIR = Path(__file__).resolve().parent
+if str(MODULE_DIR) not in sys.path:
+    sys.path.insert(0, str(MODULE_DIR))
+from pi_relay import PROTOCOL_VERSION, RelayServer
+
 # ── Configuration from env ──────────────────────────────────────────
 ORCHESTRATOR_HOST: str = os.environ.get("ORCHESTRATOR_HOST", "")
 ORCHESTRATOR_PORT: int = int(os.environ.get("ORCHESTRATOR_PORT", "12888"))
@@ -34,6 +43,7 @@ TS_SOCKET: str = str(WH_DIR / "tailscale" / "run" / "tailscaled.sock")
 HARNESS_DIR: Path = WH_DIR / "harness"
 WORKER_ID_FILE: Path = WH_DIR / "worker-daemon" / "id"
 WH_PROXY: str = os.environ.get("WH_PROXY", "").strip()
+PI_RELAY_PORT: int = int(os.environ.get("WH_PI_RELAY_PORT", "27888"))
 def _detect_ssh_user() -> str:
     for key in (
         "SSH_USER",
@@ -267,7 +277,78 @@ def build_http_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(**kwargs)
 
 
-def build_payload(worker_id: str, tailscale_ip: str, dns_name: str) -> dict[str, Any]:
+def publish_pi_relay(port: int) -> bool:
+    """Publish the loopback relay without changing any other Serve rule."""
+    command = [
+        "tailscale",
+        f"--socket={TS_SOCKET}",
+        "serve",
+        "--bg",
+        "--yes",
+        f"--tcp={port}",
+        f"tcp://127.0.0.1:{port}",
+    ]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.error("Pi relay publication failed: %s", exc)
+        return False
+    if result.returncode != 0:
+        log.error("Pi relay publication failed: %s", result.stderr.strip())
+        return False
+    log.info("Pi relay published on Tailnet TCP port %s", port)
+    return True
+
+
+def is_pi_relay_published(port: int) -> bool:
+    """Check the exact Serve target without disturbing unrelated rules."""
+    command = ["tailscale", f"--socket={TS_SOCKET}", "serve", "status"]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("Pi relay Serve status check failed: %s", exc)
+        return False
+    return result.returncode == 0 and f"tcp://127.0.0.1:{port}" in result.stdout
+
+
+def unpublish_pi_relay(port: int) -> None:
+    """Remove only this relay's TCP Serve rule, never global Serve state."""
+    command = [
+        "tailscale",
+        f"--socket={TS_SOCKET}",
+        "serve",
+        f"--tcp={port}",
+        "off",
+    ]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("Pi relay unpublish failed: %s", exc)
+        return
+    if result.returncode != 0:
+        log.warning("Pi relay unpublish failed: %s", result.stderr.strip())
+    else:
+        log.info("Pi relay unpublished from Tailnet TCP port %s", port)
+
+
+def reconcile_pi_relay(relay: RelayServer) -> bool:
+    """Return an accurate advertised capability and repair a lost Serve rule."""
+    if not relay.is_running:
+        log.error("Pi relay task is no longer running; withholding direct-attach capability")
+        return False
+    if is_pi_relay_published(PI_RELAY_PORT):
+        return True
+    log.warning("Pi relay Serve rule is missing; attempting republish")
+    return publish_pi_relay(PI_RELAY_PORT)
+
+
+def build_payload(
+    worker_id: str,
+    tailscale_ip: str,
+    dns_name: str,
+    *,
+    pi_relay_available: bool = False,
+) -> dict[str, Any]:
     gpu_info = get_gpu_info()
     sys_info = get_system_info()
     return {
@@ -287,12 +368,27 @@ def build_payload(worker_id: str, tailscale_ip: str, dns_name: str) -> dict[str,
         "active_jobs": get_active_jobs(),
         "active_ports": [],
         "data_paths": get_data_paths(),
+        "pi_relay_port": PI_RELAY_PORT,
+        "pi_relay_available": pi_relay_available,
+        "pi_relay_protocol_version": PROTOCOL_VERSION,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
-async def send_heartbeat(worker_id: str, tailscale_ip: str, dns_name: str, client: httpx.AsyncClient) -> bool:
-    payload = build_payload(worker_id, tailscale_ip, dns_name)
+async def send_heartbeat(
+    worker_id: str,
+    tailscale_ip: str,
+    dns_name: str,
+    client: httpx.AsyncClient,
+    *,
+    pi_relay_available: bool = False,
+) -> bool:
+    payload = build_payload(
+        worker_id,
+        tailscale_ip,
+        dns_name,
+        pi_relay_available=pi_relay_available,
+    )
     url = f"http://{ORCHESTRATOR_HOST}:{ORCHESTRATOR_PORT}/register"
     try:
         resp = await client.post(url, json=payload, timeout=10.0)
@@ -316,11 +412,14 @@ async def main() -> None:
     if not ORCHESTRATOR_HOST:
         log.error("ORCHESTRATOR_HOST is not set — cannot register. Exiting.")
         sys.exit(1)
+    if not 1 <= PI_RELAY_PORT <= 65535:
+        log.error("WH_PI_RELAY_PORT must be in range 1..65535; got %s", PI_RELAY_PORT)
+        sys.exit(1)
 
     worker_id = get_worker_id()
     proxy_mode = "enabled" if WH_PROXY else "disabled"
     log.info(
-        "Worker daemon starting. ID=%s, name=%s, ssh_user=%s, wh_dir=%s, proxy=%s, orchestrator=%s:%s",
+        "Worker daemon starting. ID=%s, name=%s, ssh_user=%s, wh_dir=%s, proxy=%s, orchestrator=%s:%s, pi_relay_port=%s",
         worker_id,
         WORKER_NAME,
         SSH_USER,
@@ -328,6 +427,7 @@ async def main() -> None:
         proxy_mode,
         ORCHESTRATOR_HOST,
         ORCHESTRATOR_PORT,
+        PI_RELAY_PORT,
     )
 
     try:
@@ -336,17 +436,58 @@ async def main() -> None:
         log.error(f"Invalid WH_PROXY: {e}")
         sys.exit(1)
 
-    async with client:
-        # Initial registration
-        tailscale_ip, dns_name = get_tailscale_identity()
-        log.info(f"Tailscale IP: {tailscale_ip} DNS: {dns_name or '(none)'}")
-        await send_heartbeat(worker_id, tailscale_ip, dns_name, client)
+    relay = RelayServer(PI_RELAY_PORT)
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for signal_number in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signal_number, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            # The worker runs on Linux, but retain normal asyncio portability.
+            signal.signal(signal_number, lambda *_: stop_event.set())
 
-        # Periodic heartbeats
-        while True:
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
+    try:
+        # Bind before publishing so Serve never exposes a dead target.
+        await relay.start()
+        if not publish_pi_relay(PI_RELAY_PORT):
+            log.error("Pi relay remains loopback-only; heartbeat will advertise it as unavailable")
+
+        async with client:
+            # Initial registration
             tailscale_ip, dns_name = get_tailscale_identity()
-            await send_heartbeat(worker_id, tailscale_ip, dns_name, client)
+            relay_available = reconcile_pi_relay(relay)
+            log.info(f"Tailscale IP: {tailscale_ip} DNS: {dns_name or '(none)'}")
+            await send_heartbeat(
+                worker_id,
+                tailscale_ip,
+                dns_name,
+                client,
+                pi_relay_available=relay_available,
+            )
+
+            # Periodic heartbeats. Signal handlers wake this wait so the
+            # finally block removes the persistent Serve rule immediately.
+            while not stop_event.is_set():
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=HEARTBEAT_INTERVAL)
+                except TimeoutError:
+                    pass
+                if stop_event.is_set():
+                    break
+                tailscale_ip, dns_name = get_tailscale_identity()
+                relay_available = reconcile_pi_relay(relay)
+                await send_heartbeat(
+                    worker_id,
+                    tailscale_ip,
+                    dns_name,
+                    client,
+                    pi_relay_available=relay_available,
+                )
+    finally:
+        # This removes only the reserved relay port, not data-export or other
+        # independent Serve rules that may coexist on the worker.
+        unpublish_pi_relay(PI_RELAY_PORT)
+        await relay.stop()
 
 
 if __name__ == "__main__":
