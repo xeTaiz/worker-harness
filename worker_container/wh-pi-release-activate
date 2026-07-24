@@ -33,9 +33,13 @@ def main() -> int:
             raise RuntimeError("unsafe release archive")
         release_id = Path(names[0]).parts[0]
         staging = releases / f".{release_id}.tmp"
-        shutil.rmtree(staging, ignore_errors=True)
-        tar.extractall(releases, filter="data")
         extracted = releases / release_id
+        # A re-push of an existing release ID must not overlay a prior tree:
+        # otherwise removed files (including stale credentials/history) survive
+        # manifest validation and become current.
+        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(extracted, ignore_errors=True)
+        tar.extractall(releases, filter="data")
         if not extracted.is_dir():
             raise RuntimeError("archive does not contain a release directory")
         extracted.rename(staging)
