@@ -48,7 +48,9 @@ PI_SESSIONS_DIR: Path = WH_DIR / "pi" / "sessions"
 PI_AGENT_CONFIG_DIR: Path = WH_DIR / "pi" / "current" / "agent-config"
 # Releases provide this path atomically. Operators may override it for a
 # canary/runtime migration without changing worker daemon code.
-PI_COMMAND: str = os.environ.get("WH_PI_COMMAND", str(WH_DIR / "pi" / "current" / "bin" / "pi-worker"))
+# Empty-string env values must fall back to the default: start-wh.sh passes
+# the variable through even when unset on the host.
+PI_COMMAND: str = os.environ.get("WH_PI_COMMAND") or str(WH_DIR / "pi" / "current" / "bin" / "pi-worker")
 # Optional orchestrator ingest target. The worker relays state transitions
 # here so the durable projection stays truthful. Workers do not authenticate;
 # Tailnet membership is the trust boundary (spec §7.2).

@@ -290,7 +290,8 @@ class RelayState:
             if not record:
                 raise KeyError(session_id)
             result = await self._tmux("kill-session", "-t", record.tmux_session)
-            if result.returncode and "can't find session" not in result.stderr:
+            benign = ("can't find session", "no server running")
+            if result.returncode and not any(marker in result.stderr for marker in benign):
                 raise RuntimeError(result.stderr.strip() or "failed to stop tmux session")
             record.state = "stopped"
             record.detail = "cancelled"
