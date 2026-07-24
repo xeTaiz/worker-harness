@@ -65,8 +65,13 @@ class RelayState:
     default_cwd: Path
     tmux_tmpdir: Path | None = None
     agent_config: Path | None = None
+    # Optional orchestrator ingest hook. When set, the relay uploades state
+    # transitions and events so the orchestrator's projection stays truthful.
+    orchestrator_url: str | None = None
+    worker_id: str | None = None
     sessions: dict[str, SessionRecord] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _observer_task: asyncio.Task[None] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -124,7 +129,38 @@ class RelayState:
                 record.detail = "tmux session exited"
                 record.updated_at = int(time())
                 self._persist(record)
+                await self._upload_state(record, "tmux-session-exited")
         return record
+
+    async def _upload_state(self, record: SessionRecord, event_type: str) -> None:
+        """Report a state transition to the orchestrator (best-effort)."""
+        if not self.orchestrator_url or not self.worker_id:
+            return
+        import urllib.request
+
+        url = (
+            f"{self.orchestrator_url.rstrip('/')}/pi/worker/{self.worker_id}"
+            f"/sessions/{record.session_id}/events"
+        )
+        payload = {
+            "session_id": record.session_id,
+            "state": record.state,
+            "detail": record.detail,
+            "events": [{"event_type": event_type, "payload": {"tmux_session": record.tmux_session}}],
+        }
+        body = json.dumps(payload).encode()
+
+        def _send() -> None:
+            req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"}, method="POST")
+            urllib.request.urlopen(req, timeout=5).read()
+
+        try:
+            await asyncio.to_thread(_send)
+        except Exception:
+            # Worker remains the source of truth on its local record; the
+            # orchestrator catch-up happens via the next operator-initiated
+            # command or the next state-poll if implemented.
+            return
 
     async def create(self, request: SessionCreate) -> SessionRecord:
         async with self._lock:
@@ -174,6 +210,7 @@ class RelayState:
                 record.detail = "Pi process started"
             record.updated_at = int(time())
             self._persist(record)
+            await self._upload_state(record, f"create-{record.state}")
 
         if record.state == "working" and request.task:
             # Give the TUI a short time to enter raw mode before injecting the
@@ -212,6 +249,7 @@ class RelayState:
                 record.detail = "prompt delivered"
             record.updated_at = int(time())
             self._persist(record)
+            await self._upload_state(record, f"prompt-{record.state}")
             return record
 
     async def cancel(self, session_id: str) -> SessionRecord:
@@ -226,6 +264,7 @@ class RelayState:
             record.detail = "cancelled"
             record.updated_at = int(time())
             self._persist(record)
+            await self._upload_state(record, "cancelled")
             return record
 
 
@@ -313,6 +352,8 @@ def create_relay_app(
     default_cwd: Path | None = None,
     tmux_tmpdir: Path | None = None,
     agent_config: Path | None = None,
+    orchestrator_url: str | None = None,
+    worker_id: str | None = None,
 ) -> FastAPI:
     """Create the loopback-only HTTP/WebSocket application."""
 
@@ -322,6 +363,8 @@ def create_relay_app(
         default_cwd=default_cwd or Path.home(),
         tmux_tmpdir=tmux_tmpdir,
         agent_config=agent_config,
+        orchestrator_url=orchestrator_url,
+        worker_id=worker_id,
     )
     app = FastAPI(title="Worker Harness Pi Relay", docs_url=None, redoc_url=None)
     app.state.pi_relay = relay_state
@@ -410,6 +453,8 @@ class RelayServer:
         default_cwd: Path | None = None,
         tmux_tmpdir: Path | None = None,
         agent_config: Path | None = None,
+        orchestrator_url: str | None = None,
+        worker_id: str | None = None,
     ) -> None:
         if not 1 <= port <= 65535:
             raise ValueError("Pi relay port must be in range 1..65535")
@@ -421,6 +466,8 @@ class RelayServer:
             default_cwd=default_cwd,
             tmux_tmpdir=tmux_tmpdir,
             agent_config=agent_config,
+            orchestrator_url=orchestrator_url,
+            worker_id=worker_id,
         )
         self._server = _EmbeddedUvicornServer(
             uvicorn.Config(self.app, host="127.0.0.1", port=port, log_level="warning", access_log=False, lifespan="off")

@@ -49,6 +49,10 @@ PI_AGENT_CONFIG_DIR: Path = WH_DIR / "pi" / "current" / "agent-config"
 # Releases provide this path atomically. Operators may override it for a
 # canary/runtime migration without changing worker daemon code.
 PI_COMMAND: str = os.environ.get("WH_PI_COMMAND", str(WH_DIR / "pi" / "current" / "bin" / "pi-worker"))
+# Optional orchestrator ingest target. The worker relays state transitions
+# here so the durable projection stays truthful. Workers do not authenticate;
+# Tailnet membership is the trust boundary (spec §7.2).
+PI_INGEST_BASE_URL: str = os.environ.get("WH_PI_INGEST_BASE_URL", "").strip()
 def _detect_ssh_user() -> str:
     for key in (
         "SSH_USER",
@@ -448,6 +452,8 @@ async def main() -> None:
         default_cwd=Path.home(),
         tmux_tmpdir=HARNESS_DIR / "pi-tmux",
         agent_config=PI_AGENT_CONFIG_DIR,
+        orchestrator_url=PI_INGEST_BASE_URL or None,
+        worker_id=worker_id,
     )
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()

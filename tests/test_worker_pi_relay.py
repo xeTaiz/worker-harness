@@ -14,7 +14,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -99,6 +99,27 @@ class PiRelayTests(unittest.TestCase):
     def test_relay_server_rejects_invalid_port(self):
         with self.assertRaisesRegex(ValueError, "1..65535"):
             self.relay.RelayServer(0)
+
+    def test_state_refresh_uploads_terminated_state_to_orchestrator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmux_mock = AsyncMock(return_value=SimpleNamespace(returncode=1, stdout="", stderr="not running"))
+            upload_mock = AsyncMock()
+            with patch.object(self.relay.RelayState, "_tmux", new=tmux_mock), \
+                 patch.object(self.relay.RelayState, "_upload_state", new=upload_mock):
+                state = self.relay.RelayState(
+                    root=Path(tmp),
+                    command="/bin/sh",
+                    default_cwd=Path(tmp),
+                    orchestrator_url="http://orchestrator:12888",
+                    worker_id="wkr",
+                )
+                asyncio.run(state.create(self.relay.SessionCreate(session_id="child")))
+                upload_mock.assert_awaited()
+                args = upload_mock.await_args
+                record, event_type = args.args
+                self.assertEqual(event_type, "create-failed")
+                self.assertEqual(record.state, "failed")
+                self.assertTrue(record.detail)
 
 
 class PiRelayPublicationTests(unittest.TestCase):

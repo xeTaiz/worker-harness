@@ -196,6 +196,24 @@ class PiSessionEvent(BaseModel):
     created_at: int = 0
 
 
+class PiIngestEvent(BaseModel):
+    """Worker-relay reported event for a delegated session (spec §7.2)."""
+
+    id: str | None = Field(default=None, max_length=128)
+    event_type: str = Field(min_length=1, max_length=64)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: int = 0
+
+
+class PiIngestPayload(BaseModel):
+    """Batch envelope for worker-relay uploads."""
+
+    session_id: str = Field(min_length=1, max_length=64)
+    state: PiSessionState | None = None
+    detail: str = ""
+    events: list[PiIngestEvent] = Field(default_factory=list)
+
+
 class PiDelegation(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     parent_session_id: str | None = None

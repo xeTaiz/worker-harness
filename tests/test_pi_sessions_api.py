@@ -11,7 +11,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from worker_harness.db import Database
-from worker_harness.heartbeat import create_app
+from worker_harness.heartbeat import create_app, create_registration_app
 from worker_harness.models import WorkerRegistration
 
 
@@ -108,6 +108,105 @@ class PiSessionsApiTests(unittest.TestCase):
 
             events = client.get(f"/api/v1/pi/sessions/{child}/events")
             self.assertEqual([event["event_type"] for event in events.json()], ["starting", "working", "prompt", "cancelled"])
+
+
+class PiWorkerIngestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+        self.tmp.close()
+        self.db = Database(self.tmp.name)
+        asyncio.run(self.db.connect())
+        asyncio.run(
+            self.db.upsert_worker(
+                WorkerRegistration(
+                    worker_id="archdome",
+                    name="archdome",
+                    worker_ip="100.64.0.89",
+                    pi_relay_port=27888,
+                    pi_relay_available=True,
+                    pi_relay_protocol_version=2,
+                )
+            )
+        )
+        asyncio.run(self.db.upsert_worker(
+            WorkerRegistration(
+                worker_id="kwworker",
+                name="kwworker",
+                worker_ip="100.64.0.99",
+                pi_relay_port=27888,
+                pi_relay_available=True,
+                pi_relay_protocol_version=2,
+            )
+        ))
+        self.app = create_registration_app(self.db)
+
+    def tearDown(self) -> None:
+        asyncio.run(self.db.close())
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def _seed_child(self) -> str:
+        from worker_harness.models import PiSession, PiSessionState, PiSessionType
+        from uuid import uuid4
+        sid = str(uuid4())
+        asyncio.run(self.db.insert_pi_session(PiSession(
+            id=sid,
+            worker_id="archdome",
+            parent_session_id="parent",
+            session_type=PiSessionType.DELEGATED,
+            state=PiSessionState.WORKING,
+            task="t",
+            cwd="/tmp",
+            tmux_session="wh_pi_x",
+            detail="started",
+            created_at=1,
+            updated_at=1,
+        )))
+        return sid
+
+    def test_worker_can_ingest_state_and_events(self):
+        sid = self._seed_child()
+        with TestClient(self.app) as client:
+            resp = client.post(
+                f"/pi/worker/archdome/sessions/{sid}/events",
+                json={
+                    "session_id": sid,
+                    "state": "idle",
+                    "detail": "model returned",
+                    "events": [
+                        {"event_type": "idle", "payload": {"reason": "completed"}},
+                        {"event_type": "working", "payload": {"reason": "follow-up"}},
+                    ],
+                },
+            )
+            self.assertEqual(resp.status_code, 200, resp.text)
+            self.assertEqual(resp.json()["events_persisted"], 2)
+
+            session = asyncio.run(self.db.get_pi_session(sid))
+            self.assertEqual(session.state.value, "idle")
+            self.assertEqual(session.detail, "model returned")
+
+            events = asyncio.run(self.db.list_pi_session_events(sid))
+            types = [e.event_type for e in events]
+            self.assertIn("idle", types)
+            self.assertIn("working", types)
+
+    def test_ingest_rejects_wrong_worker(self):
+        sid = self._seed_child()
+        with TestClient(self.app) as client:
+            resp = client.post(
+                f"/pi/worker/kwworker/sessions/{sid}/events",
+                json={"session_id": sid, "state": "idle", "events": []},
+            )
+            self.assertEqual(resp.status_code, 404, resp.text)
+
+    def test_ingest_rejects_session_id_mismatch(self):
+        sid = self._seed_child()
+        with TestClient(self.app) as client:
+            resp = client.post(
+                f"/pi/worker/archdome/sessions/{sid}/events",
+                json={"session_id": "wrong", "state": "idle", "events": []},
+            )
+            self.assertEqual(resp.status_code, 422, resp.text)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ from .metrics import Metrics, set_global_metrics
 from .models import (
     JobStatus,
     PiDelegation,
+    PiIngestPayload,
     PiSession,
     PiSessionEvent,
     PiSessionState,
@@ -144,6 +145,30 @@ def create_registration_app(db: Database) -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "healthy", "ts": datetime.now(timezone.utc).isoformat()}
+
+    @app.post("/pi/worker/{worker_id}/sessions/{session_id}/events")
+    async def worker_pi_session_events(worker_id: str, session_id: str, payload: PiIngestPayload):
+        # Workers may only upload events for sessions they own. The orchestrator's
+        # session table is the single writer of the durable projection; the
+        # reported state is layered on top so the projection stays truthful even
+        # when nothing else is happening on the wire.
+        if payload.session_id != session_id:
+            raise HTTPException(status_code=422, detail="session_id mismatch between path and payload")
+        worker = await db.get_worker(worker_id)
+        if not worker:
+            raise HTTPException(status_code=404, detail="worker not found")
+        session = await db.get_pi_session(session_id)
+        if not session or session.worker_id != worker_id:
+            raise HTTPException(status_code=404, detail="session not found for worker")
+        try:
+            persisted = await db.apply_pi_ingest(worker_id, payload)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "session_id": session_id,
+            "events_persisted": len(persisted),
+            "state": payload.state.value if payload.state else None,
+        }
 
     return app
 

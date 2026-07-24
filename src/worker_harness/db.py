@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import aiosqlite
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -348,6 +349,43 @@ class Database:
             (event.id, event.session_id, event.event_type, json.dumps(event.payload), event.created_at),
         )
         await self._db.commit()
+
+    async def apply_pi_ingest(self, worker_id: str, payload) -> list[PiSessionEvent]:
+        """Persist a worker-reported Pi session state update and its events.
+
+        Workers are the only writers of the *reported* state themselves; the
+        orchestrator's durable session row is updated only when an explicit
+        event crosses this boundary. ``INSERT OR IGNORE`` on the event id keeps
+        replay tolerant. Returns the events actually persisted.
+        """
+        from uuid import uuid4
+        async with self._db.execute("SELECT id FROM pi_sessions WHERE id=?", (payload.session_id,)) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            raise KeyError(payload.session_id)
+        persisted: list[PiSessionEvent] = []
+        for event in payload.events:
+            event_id = event.id or str(uuid4())
+            await self._db.execute(
+                "INSERT OR IGNORE INTO pi_session_events (id, session_id, event_type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                (event_id, payload.session_id, event.event_type, json.dumps(event.payload), event.created_at or int(time.time())),
+            )
+            row = await self._db.execute_fetchall(
+                "SELECT id FROM pi_session_events WHERE id=?", (event_id,)
+            )
+            if row:
+                persisted.append(PiSessionEvent(
+                    id=event_id, session_id=payload.session_id,
+                    event_type=event.event_type, payload=event.payload,
+                    created_at=event.created_at or int(time.time()),
+                ))
+        if payload.state is not None:
+            await self._db.execute(
+                "UPDATE pi_sessions SET state=?, detail=?, updated_at=? WHERE id=?",
+                (payload.state.value, payload.detail, int(time.time()), payload.session_id),
+            )
+        await self._db.commit()
+        return persisted
 
     async def list_pi_session_events(self, session_id: str) -> list[PiSessionEvent]:
         rows = await self._db.execute_fetchall(
