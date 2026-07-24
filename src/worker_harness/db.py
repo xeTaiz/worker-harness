@@ -11,6 +11,11 @@ from .models import (
     Failure,
     Job,
     JobStatus,
+    PiDelegation,
+    PiSession,
+    PiSessionEvent,
+    PiSessionState,
+    PiSessionType,
     PortForward,
     Worker,
     WorkerRegistration,
@@ -147,6 +152,42 @@ class Database:
                 summary TEXT
             )
         """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS pi_sessions (
+                id TEXT PRIMARY KEY,
+                worker_id TEXT REFERENCES workers(id),
+                parent_session_id TEXT,
+                session_type TEXT NOT NULL,
+                state TEXT NOT NULL,
+                task TEXT DEFAULT '',
+                cwd TEXT DEFAULT '',
+                tmux_session TEXT DEFAULT '',
+                detail TEXT DEFAULT '',
+                created_at INTEGER DEFAULT 0,
+                updated_at INTEGER DEFAULT 0
+            )
+        """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS pi_session_events (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES pi_sessions(id),
+                event_type TEXT NOT NULL,
+                payload TEXT DEFAULT '{}',
+                created_at INTEGER DEFAULT 0
+            )
+        """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS pi_delegations (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                worker_id TEXT NOT NULL REFERENCES workers(id),
+                child_session_id TEXT NOT NULL REFERENCES pi_sessions(id),
+                task TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at INTEGER DEFAULT 0,
+                completed_at INTEGER DEFAULT 0
+            )
+        """)
         await self._db.commit()
 
     # ── Workers ──────────────────────────────────────────────────────
@@ -254,6 +295,96 @@ class Database:
             status=WorkerStatus(row["status"]),
             last_heartbeat_ts=row["last_heartbeat_ts"],
             created_at=row["created_at"],
+        )
+
+    # ── Pi sessions ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _row_to_pi_session(row: aiosqlite.Row) -> PiSession:
+        return PiSession(
+            id=row["id"], worker_id=row["worker_id"], parent_session_id=row["parent_session_id"],
+            session_type=PiSessionType(row["session_type"]), state=PiSessionState(row["state"]),
+            task=row["task"], cwd=row["cwd"], tmux_session=row["tmux_session"], detail=row["detail"],
+            created_at=row["created_at"], updated_at=row["updated_at"],
+        )
+
+    async def insert_pi_session(self, session: PiSession) -> None:
+        await self._db.execute(
+            """INSERT INTO pi_sessions
+               (id, worker_id, parent_session_id, session_type, state, task, cwd, tmux_session, detail, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (session.id, session.worker_id, session.parent_session_id, session.session_type.value,
+             session.state.value, session.task, session.cwd, session.tmux_session, session.detail,
+             session.created_at, session.updated_at),
+        )
+        await self._db.commit()
+
+    async def update_pi_session(self, session: PiSession) -> None:
+        await self._db.execute(
+            """UPDATE pi_sessions SET worker_id=?, parent_session_id=?, session_type=?, state=?, task=?, cwd=?,
+               tmux_session=?, detail=?, updated_at=? WHERE id=?""",
+            (session.worker_id, session.parent_session_id, session.session_type.value, session.state.value,
+             session.task, session.cwd, session.tmux_session, session.detail, session.updated_at, session.id),
+        )
+        await self._db.commit()
+
+    async def get_pi_session(self, session_id: str) -> PiSession | None:
+        cursor = await self._db.execute("SELECT * FROM pi_sessions WHERE id=?", (session_id,))
+        row = await cursor.fetchone()
+        return self._row_to_pi_session(row) if row else None
+
+    async def list_pi_sessions(self, worker_id: str | None = None) -> list[PiSession]:
+        if worker_id:
+            rows = await self._db.execute_fetchall(
+                "SELECT * FROM pi_sessions WHERE worker_id=? ORDER BY updated_at DESC", (worker_id,)
+            )
+        else:
+            rows = await self._db.execute_fetchall("SELECT * FROM pi_sessions ORDER BY updated_at DESC")
+        return [self._row_to_pi_session(row) for row in rows]
+
+    async def insert_pi_session_event(self, event: PiSessionEvent) -> None:
+        await self._db.execute(
+            "INSERT OR IGNORE INTO pi_session_events (id, session_id, event_type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+            (event.id, event.session_id, event.event_type, json.dumps(event.payload), event.created_at),
+        )
+        await self._db.commit()
+
+    async def list_pi_session_events(self, session_id: str) -> list[PiSessionEvent]:
+        rows = await self._db.execute_fetchall(
+            "SELECT * FROM pi_session_events WHERE session_id=? ORDER BY rowid", (session_id,)
+        )
+        return [
+            PiSessionEvent(id=row["id"], session_id=row["session_id"], event_type=row["event_type"],
+                           payload=json.loads(row["payload"] or "{}"), created_at=row["created_at"])
+            for row in rows
+        ]
+
+    async def insert_pi_delegation(self, delegation: PiDelegation) -> None:
+        await self._db.execute(
+            """INSERT INTO pi_delegations
+               (id, parent_session_id, worker_id, child_session_id, task, state, created_at, completed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (delegation.id, delegation.parent_session_id, delegation.worker_id, delegation.child_session_id,
+             delegation.task, delegation.state.value, delegation.created_at, delegation.completed_at),
+        )
+        await self._db.commit()
+
+    async def update_pi_delegation(self, delegation: PiDelegation) -> None:
+        await self._db.execute(
+            "UPDATE pi_delegations SET state=?, completed_at=? WHERE id=?",
+            (delegation.state.value, delegation.completed_at, delegation.id),
+        )
+        await self._db.commit()
+
+    async def get_pi_delegation(self, delegation_id: str) -> PiDelegation | None:
+        cursor = await self._db.execute("SELECT * FROM pi_delegations WHERE id=?", (delegation_id,))
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return PiDelegation(
+            id=row["id"], parent_session_id=row["parent_session_id"], worker_id=row["worker_id"],
+            child_session_id=row["child_session_id"], task=row["task"], state=PiSessionState(row["state"]),
+            created_at=row["created_at"], completed_at=row["completed_at"],
         )
 
     # ── Jobs ──────────────────────────────────────────────────────────

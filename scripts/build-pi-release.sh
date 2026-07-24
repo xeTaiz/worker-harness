@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Build a self-contained, immutable Pi runtime release for direct worker push.
+# The source runtime/config stays on the operator/orchestrator; workers never
+# clone dotfiles or fetch Git themselves.
+set -euo pipefail
+
+source_bun="${PI_BUN_HOME:-$HOME/.bun}"
+release_id="${1:?usage: build-pi-release.sh <release-id> [output-dir]}"
+output_root="${2:-$PWD/dist/pi-releases}"
+release_dir="$output_root/$release_id"
+mkdir -p "$output_root"
+
+bun="$source_bun/bin/bun"
+global_modules="$source_bun/install/global/node_modules"
+pi_cli="$global_modules/@earendil-works/pi-coding-agent/dist/cli.js"
+[[ -x "$bun" ]] || { echo "missing Bun binary: $bun" >&2; exit 1; }
+[[ -f "$pi_cli" ]] || { echo "missing Pi CLI: $pi_cli" >&2; exit 1; }
+
+rm -rf "$release_dir"
+mkdir -p "$release_dir/bin" "$release_dir/runtime"
+install -m 0755 "$bun" "$release_dir/runtime/bun"
+cp -a "$global_modules" "$release_dir/runtime/node_modules"
+
+cat >"$release_dir/bin/pi" <<'EOF'
+#!/usr/bin/env sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec "$root/runtime/bun" "$root/runtime/node_modules/@earendil-works/pi-coding-agent/dist/cli.js" "$@"
+EOF
+chmod 0755 "$release_dir/bin/pi"
+
+# Delegated children are started in an isolated tool profile. In particular,
+# auto-discovered host extensions (wh_ tools, vault, planners, subagents) are
+# never inherited by a worker child.
+cat >"$release_dir/bin/pi-worker" <<'EOF'
+#!/usr/bin/env sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec "$root/bin/pi" --no-extensions --no-skills --tools read,write,edit,bash,grep,find,ls "$@"
+EOF
+chmod 0755 "$release_dir/bin/pi-worker"
+
+# Config is intentionally optional and copied only from an explicit,
+# operator-controlled source. Secrets must be injected separately, never saved
+# in this release tree or manifest.
+if [[ -n "${PI_CONFIG_SOURCE:-}" ]]; then
+  [[ -d "$PI_CONFIG_SOURCE" ]] || { echo "PI_CONFIG_SOURCE is not a directory" >&2; exit 1; }
+  cp -a "$PI_CONFIG_SOURCE" "$release_dir/agent-config"
+fi
+
+pi_version=$("$release_dir/bin/pi" --version)
+RELEASE_DIR="$release_dir" RELEASE_ID="$release_id" PI_VERSION="$pi_version" python3 - <<'PY'
+import hashlib, json, os
+from pathlib import Path
+root = Path(os.environ["RELEASE_DIR"])
+files = {}
+for path in sorted(p for p in root.rglob("*") if p.is_file()):
+    if path.name == "manifest.json":
+        continue
+    files[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
+(root / "manifest.json").write_text(json.dumps({
+    "release_id": os.environ["RELEASE_ID"],
+    "pi_version": os.environ["PI_VERSION"],
+    "files": files,
+}, indent=2) + "\n")
+PY
+
+tar -C "$output_root" -czf "$output_root/$release_id.tar.gz" "$release_id"
+printf 'built %s\n' "$output_root/$release_id.tar.gz"

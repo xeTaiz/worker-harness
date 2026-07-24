@@ -122,6 +122,9 @@ sleep 2
 
 echo "[entrypoint] Joining tailnet with Tailscale SSH enabled..."
 UP_ARGS=(
+  # The worker exclusively owns this userspace tailscaled state. Reset makes
+  # restarts idempotent when a prior partial `tailscale up` persisted flags.
+  --reset
   --login-server="$TS_HOST"
   --authkey="$TS_AUTHKEY"
   --accept-routes="$TS_ACCEPT_ROUTES"

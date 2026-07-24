@@ -25,6 +25,21 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
+class PiSessionType(str, Enum):
+    INTERACTIVE = "interactive"
+    DELEGATED = "delegated"
+    GLOBAL_ROUTER = "global-router"
+
+
+class PiSessionState(str, Enum):
+    QUEUED = "queued"
+    STARTING = "starting"
+    WORKING = "working"
+    IDLE = "idle"
+    STOPPED = "stopped"
+    FAILED = "failed"
+
+
 # ── GPU ───────────────────────────────────────────────────────────────
 
 class GPUInfo(BaseModel):
@@ -155,6 +170,41 @@ class Worker(BaseModel):
         self.pi_relay_protocol_version = reg.pi_relay_protocol_version
         self.status = WorkerStatus.ONLINE
         self.last_heartbeat_ts = int(datetime.now(timezone.utc).timestamp())
+
+
+# ── Pi sessions ───────────────────────────────────────────────────────
+
+class PiSession(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    worker_id: str | None = None
+    parent_session_id: str | None = None
+    session_type: PiSessionType = PiSessionType.DELEGATED
+    state: PiSessionState = PiSessionState.QUEUED
+    task: str = ""
+    cwd: str = ""
+    tmux_session: str = ""
+    detail: str = ""
+    created_at: int = 0
+    updated_at: int = 0
+
+
+class PiSessionEvent(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    session_id: str
+    event_type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: int = 0
+
+
+class PiDelegation(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    parent_session_id: str | None = None
+    worker_id: str
+    child_session_id: str
+    task: str
+    state: PiSessionState = PiSessionState.QUEUED
+    created_at: int = 0
+    completed_at: int = 0
 
 
 # ── Job ────────────────────────────────────────────────────────────────

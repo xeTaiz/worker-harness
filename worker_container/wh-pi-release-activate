@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Verify and atomically activate a pushed Pi runtime release archive."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tarfile
+from pathlib import Path
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print(f"usage: {Path(sys.argv[0]).name} <release.tar.gz>", file=sys.stderr)
+        return 2
+    archive = Path(sys.argv[1]).resolve()
+    wh_dir = Path(os.environ.get("WH_DIR", Path.home() / ".local" / "worker-harness"))
+    releases = wh_dir / "pi" / "releases"
+    releases.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive, "r:gz") as tar:
+        names = tar.getnames()
+        if not names or any(Path(name).is_absolute() or ".." in Path(name).parts for name in names):
+            raise RuntimeError("unsafe release archive")
+        release_id = Path(names[0]).parts[0]
+        staging = releases / f".{release_id}.tmp"
+        shutil.rmtree(staging, ignore_errors=True)
+        tar.extractall(releases, filter="data")
+        extracted = releases / release_id
+        if not extracted.is_dir():
+            raise RuntimeError("archive does not contain a release directory")
+        extracted.rename(staging)
+    manifest = json.loads((staging / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("release_id") != release_id:
+        raise RuntimeError("release ID does not match manifest")
+    for relative, expected in manifest.get("files", {}).items():
+        path = staging / relative
+        if not path.is_file() or sha256(path) != expected:
+            raise RuntimeError(f"release checksum mismatch: {relative}")
+    destination = releases / release_id
+    if destination.exists():
+        shutil.rmtree(destination)
+    staging.rename(destination)
+    current = wh_dir / "pi" / "current"
+    pending = wh_dir / "pi" / ".current.tmp"
+    pending.unlink(missing_ok=True)
+    pending.symlink_to(Path("releases") / release_id)
+    pending.replace(current)
+    print(json.dumps({"release_id": release_id, "current": str(current)}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

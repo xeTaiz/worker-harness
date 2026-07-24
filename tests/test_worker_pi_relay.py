@@ -41,47 +41,60 @@ class PiRelayTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.relay = load_module("pi_relay_for_test", RELAY_PATH)
 
-    def test_health_session_registry_and_attach_status_frames(self):
-        app = self.relay.create_relay_app()
-        with TestClient(app) as client:
-            health = client.get("/healthz")
-            self.assertEqual(health.status_code, 200)
-            self.assertEqual(
-                health.json(),
-                {"status": "healthy", "protocol_version": 1, "session_count": 0},
+    def test_health_session_lifecycle_and_real_tmux_websocket_attach(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.relay.create_relay_app(
+                sessions_root=Path(tmp),
+                pi_command="/bin/sh",
+                default_cwd=Path(tmp),
             )
-
-            created = client.post(
-                "/v1/sessions",
-                json={"session_id": "delegate-1", "state": "working", "parent_session_id": "parent-1"},
-            )
-            self.assertEqual(created.status_code, 201)
-            self.assertEqual(created.json()["session_id"], "delegate-1")
-            self.assertEqual(client.get("/v1/sessions").json()[0]["state"], "working")
-
-            with client.websocket_connect("/v1/sessions/delegate-1/attach") as websocket:
+            with TestClient(app) as client:
+                health = client.get("/healthz")
+                self.assertEqual(health.status_code, 200)
                 self.assertEqual(
-                    websocket.receive_json(),
-                    {
-                        "type": "status",
-                        "session_id": "delegate-1",
-                        "state": "working",
-                        "terminal": "not_ready",
-                        "protocol_version": 1,
-                    },
+                    health.json(),
+                    {"status": "healthy", "protocol_version": 2, "session_count": 0},
                 )
-                with self.assertRaises(WebSocketDisconnect) as closed:
-                    websocket.receive_text()
-                self.assertEqual(closed.exception.code, 1013)
 
-            with client.websocket_connect("/v1/sessions/missing/attach") as websocket:
-                self.assertEqual(
-                    websocket.receive_json(),
-                    {"type": "error", "code": "session_not_found", "session_id": "missing"},
+                created = client.post(
+                    "/v1/sessions",
+                    json={"session_id": "delegate-1", "parent_session_id": "parent-1"},
                 )
-                with self.assertRaises(WebSocketDisconnect) as closed:
-                    websocket.receive_text()
-                self.assertEqual(closed.exception.code, 4404)
+                self.assertEqual(created.status_code, 201)
+                self.assertEqual(created.json()["state"], "working")
+                self.assertEqual(client.get("/v1/sessions").json()[0]["session_id"], "delegate-1")
+
+                with client.websocket_connect("/v1/sessions/delegate-1/attach") as websocket:
+                    self.assertEqual(
+                        websocket.receive_json(),
+                        {
+                            "type": "status",
+                            "session_id": "delegate-1",
+                            "state": "working",
+                            "terminal": "ready",
+                            "protocol_version": 2,
+                        },
+                    )
+                    websocket.send_bytes(b"printf 'relay-pty-ok\\n'\\n")
+                    output = b""
+                    for _ in range(20):
+                        output += websocket.receive_bytes()
+                        if b"relay-pty-ok" in output:
+                            break
+                    self.assertIn(b"relay-pty-ok", output)
+
+                cancelled = client.post("/v1/sessions/delegate-1:cancel")
+                self.assertEqual(cancelled.status_code, 200)
+                self.assertEqual(cancelled.json()["state"], "stopped")
+
+                with client.websocket_connect("/v1/sessions/missing/attach") as websocket:
+                    self.assertEqual(
+                        websocket.receive_json(),
+                        {"type": "error", "code": "session_not_found", "session_id": "missing"},
+                    )
+                    with self.assertRaises(WebSocketDisconnect) as closed:
+                        websocket.receive_text()
+                    self.assertEqual(closed.exception.code, 4404)
 
     def test_relay_server_rejects_invalid_port(self):
         with self.assertRaisesRegex(ValueError, "1..65535"):
@@ -161,7 +174,7 @@ class PiRelayPublicationTests(unittest.TestCase):
                 async def __aexit__(self, *args): return False
             class Relay:
                 is_running = True
-                def __init__(self, port): pass
+                def __init__(self, port, **kwargs): pass
                 async def start(self): pass
                 async def stop(self): pass
 
@@ -271,7 +284,7 @@ class PiRelayPublicationTests(unittest.TestCase):
             )
         self.assertEqual(payload["pi_relay_port"], self.daemon.PI_RELAY_PORT)
         self.assertTrue(payload["pi_relay_available"])
-        self.assertEqual(payload["pi_relay_protocol_version"], 1)
+        self.assertEqual(payload["pi_relay_protocol_version"], 2)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable, TypeVar
 from uuid import uuid4
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
@@ -30,7 +31,17 @@ from .db import Database
 from .job import JobManager
 from .lanes import LaneTimeout, WorkerLanes
 from .metrics import Metrics, set_global_metrics
-from .models import JobStatus, PortForward, WorkerRegistration
+from .models import (
+    JobStatus,
+    PiDelegation,
+    PiSession,
+    PiSessionEvent,
+    PiSessionState,
+    PiSessionType,
+    PortForward,
+    WorkerRegistration,
+    WorkerStatus,
+)
 from .ratelimit import AgentRateLimiter, RateLimited, resolve_agent_name
 from .reaper import reap_loop
 from .ssh import async_ssh_run, set_lanes, ssh_download_bytes, ssh_port_forward, ssh_upload_bytes
@@ -77,6 +88,17 @@ class DataCopyRequest(BaseModel):
     dst_worker: str
     dst_path: str
     ttl_seconds: int = 6 * 60 * 60
+
+
+class PiDelegationCreateRequest(BaseModel):
+    task: str
+    worker_id: str | None = None
+    parent_session_id: str | None = None
+    cwd: str = ""
+
+
+class PiPromptRequest(BaseModel):
+    message: str
 
 
 @asynccontextmanager
@@ -205,6 +227,23 @@ def create_app(db: Database) -> FastAPI:
             None,
         )
 
+    async def worker_relay_request(worker, method: str, path: str, payload: dict | None = None) -> dict:
+        if worker.status != WorkerStatus.ONLINE:
+            raise HTTPException(status_code=409, detail=f"worker is {worker.status.value}")
+        if not worker.pi_relay_available or not worker.pi_relay_port:
+            raise HTTPException(status_code=409, detail="worker does not advertise a Pi relay")
+        # Userspace Tailscale Serve exposes the worker's Tailnet IP; prefer it
+        # over MagicDNS because an operator's resolver may not have MagicDNS.
+        url = f"http://{worker.worker_ip}:{worker.pi_relay_port}{path}"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.request(method, url, json=payload)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"worker Pi relay unavailable: {exc}") from exc
+        if response.status_code >= 400:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+        return response.json()
+
     # ── Privileged orchestration API (/api/v1) ───────────────────────────────
 
     @app.get("/api/v1/workers")
@@ -235,6 +274,138 @@ def create_app(db: Database) -> FastAPI:
         removed = await db.prune_workers(cutoff)
         await invalidate_workers_cache()
         return {"removed": removed, "minutes": minutes}
+
+    @app.get("/api/v1/pi/sessions")
+    async def pi_sessions_list(worker_id: str | None = None):
+        return [session.model_dump(mode="json") for session in await db.list_pi_sessions(worker_id)]
+
+    @app.get("/api/v1/pi/sessions/{session_id}")
+    async def pi_session_get(session_id: str):
+        session = await db.get_pi_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        return session.model_dump(mode="json")
+
+    @app.get("/api/v1/pi/sessions/{session_id}/events")
+    async def pi_session_events(session_id: str):
+        if not await db.get_pi_session(session_id):
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        return [event.model_dump(mode="json") for event in await db.list_pi_session_events(session_id)]
+
+    @app.post("/api/v1/pi/delegations", status_code=201)
+    async def pi_delegations_create(payload: PiDelegationCreateRequest):
+        if not payload.task.strip():
+            raise HTTPException(status_code=422, detail="task must not be empty")
+        if payload.worker_id:
+            worker = await resolve_worker(payload.worker_id)
+        else:
+            workers = await db.list_workers()
+            worker = next(
+                (item for item in workers if item.status == WorkerStatus.ONLINE and item.pi_relay_available),
+                None,
+            )
+        if not worker:
+            raise HTTPException(status_code=404, detail="no Pi-capable online worker found")
+
+        now = int(datetime.now(timezone.utc).timestamp())
+        session = PiSession(
+            worker_id=worker.id,
+            parent_session_id=payload.parent_session_id,
+            session_type=PiSessionType.DELEGATED,
+            state=PiSessionState.STARTING,
+            task=payload.task,
+            cwd=payload.cwd,
+            created_at=now,
+            updated_at=now,
+        )
+        delegation = PiDelegation(
+            worker_id=worker.id,
+            parent_session_id=payload.parent_session_id,
+            child_session_id=session.id,
+            task=payload.task,
+            state=PiSessionState.STARTING,
+            created_at=now,
+        )
+        await db.insert_pi_session(session)
+        await db.insert_pi_delegation(delegation)
+        await db.insert_pi_session_event(PiSessionEvent(
+            session_id=session.id, event_type="starting", payload={"worker_id": worker.id}, created_at=now
+        ))
+        try:
+            remote = await worker_relay_request(
+                worker,
+                "POST",
+                "/v1/sessions",
+                {"session_id": session.id, "parent_session_id": payload.parent_session_id, "task": payload.task,
+                 "cwd": payload.cwd or None},
+            )
+        except HTTPException as exc:
+            session.state = PiSessionState.FAILED
+            session.detail = str(exc.detail)
+            session.updated_at = int(datetime.now(timezone.utc).timestamp())
+            delegation.state = PiSessionState.FAILED
+            delegation.completed_at = session.updated_at
+            await db.update_pi_session(session)
+            await db.update_pi_delegation(delegation)
+            await db.insert_pi_session_event(PiSessionEvent(
+                session_id=session.id, event_type="failed", payload={"detail": session.detail}, created_at=session.updated_at
+            ))
+            raise
+        session.state = PiSessionState(remote["state"])
+        session.tmux_session = remote.get("tmux_session", "")
+        session.detail = remote.get("detail", "")
+        session.updated_at = remote.get("updated_at", int(datetime.now(timezone.utc).timestamp()))
+        delegation.state = session.state
+        await db.update_pi_session(session)
+        await db.update_pi_delegation(delegation)
+        await db.insert_pi_session_event(PiSessionEvent(
+            session_id=session.id, event_type=session.state.value, payload=remote, created_at=session.updated_at
+        ))
+        return {"delegation_id": delegation.id, "child_session_id": session.id, "state": session.state.value,
+                "status_url": f"/api/v1/pi/delegations/{delegation.id}"}
+
+    @app.get("/api/v1/pi/delegations/{delegation_id}")
+    async def pi_delegation_get(delegation_id: str):
+        delegation = await db.get_pi_delegation(delegation_id)
+        if not delegation:
+            raise HTTPException(status_code=404, detail="Pi delegation not found")
+        return delegation.model_dump(mode="json")
+
+    @app.post("/api/v1/pi/sessions/{session_id}:prompt")
+    async def pi_session_prompt(session_id: str, payload: PiPromptRequest):
+        session = await db.get_pi_session(session_id)
+        if not session or not session.worker_id:
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        worker = await db.get_worker(session.worker_id)
+        if not worker:
+            raise HTTPException(status_code=404, detail="worker not found")
+        remote = await worker_relay_request(worker, "POST", f"/v1/sessions/{session_id}:prompt", {"message": payload.message})
+        session.state = PiSessionState(remote["state"])
+        session.detail = remote.get("detail", "")
+        session.updated_at = remote.get("updated_at", int(datetime.now(timezone.utc).timestamp()))
+        await db.update_pi_session(session)
+        await db.insert_pi_session_event(PiSessionEvent(
+            session_id=session.id, event_type="prompt", payload={"message": payload.message}, created_at=session.updated_at
+        ))
+        return session.model_dump(mode="json")
+
+    @app.post("/api/v1/pi/sessions/{session_id}:cancel")
+    async def pi_session_cancel(session_id: str):
+        session = await db.get_pi_session(session_id)
+        if not session or not session.worker_id:
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        worker = await db.get_worker(session.worker_id)
+        if not worker:
+            raise HTTPException(status_code=404, detail="worker not found")
+        remote = await worker_relay_request(worker, "POST", f"/v1/sessions/{session_id}:cancel")
+        session.state = PiSessionState(remote["state"])
+        session.detail = remote.get("detail", "")
+        session.updated_at = remote.get("updated_at", int(datetime.now(timezone.utc).timestamp()))
+        await db.update_pi_session(session)
+        await db.insert_pi_session_event(PiSessionEvent(
+            session_id=session.id, event_type="cancelled", payload=remote, created_at=session.updated_at
+        ))
+        return session.model_dump(mode="json")
 
     @app.get("/api/v1/data")
     async def data_list(include_offline: bool = False):
