@@ -38,6 +38,8 @@ class PiSessionState(str, Enum):
     IDLE = "idle"
     STOPPED = "stopped"
     FAILED = "failed"
+    # Timed out without the worker acknowledging the terminal state (spec §8.1).
+    TERMINATION_UNKNOWN = "termination_unknown"
 
 
 # ── GPU ───────────────────────────────────────────────────────────────
@@ -221,6 +223,7 @@ class PiDelegation(BaseModel):
     child_session_id: str
     task: str
     state: PiSessionState = PiSessionState.QUEUED
+    timeout_seconds: int = 0
     created_at: int = 0
     completed_at: int = 0
 

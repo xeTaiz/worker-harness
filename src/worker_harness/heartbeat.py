@@ -96,10 +96,67 @@ class PiDelegationCreateRequest(BaseModel):
     worker_id: str | None = None
     parent_session_id: str | None = None
     cwd: str = ""
+    # 0 disables the timeout gate (spec §8.1: duration is the only session-level
+    # policy knob; unacknowledged expiry becomes termination_unknown).
+    timeout_seconds: int = 0
 
 
 class PiPromptRequest(BaseModel):
     message: str
+
+
+# Timeout gate (spec §8.1): an expired delegation is cancelled through the
+# worker relay; without an acknowledgement the terminal state is unknown,
+# never a fabricated cancellation.
+PI_DELEGATION_TERMINAL_STATES = {
+    PiSessionState.STOPPED,
+    PiSessionState.FAILED,
+    PiSessionState.TERMINATION_UNKNOWN,
+}
+
+
+async def sweep_expired_pi_delegations(db: Database, relay_request_fn, now: int | None = None) -> None:
+    """Expire delegations past their timeout gate.
+
+    ``relay_request_fn`` matches the orchestrator's worker relay client
+    signature ``(worker, method, path, payload=None) -> dict``.
+    """
+    now = now if now is not None else int(datetime.now(timezone.utc).timestamp())
+    for delegation in await db.list_pi_delegations():
+        if (
+            delegation.timeout_seconds <= 0
+            or delegation.state in PI_DELEGATION_TERMINAL_STATES
+            or now - delegation.created_at < delegation.timeout_seconds
+        ):
+            continue
+        session = await db.get_pi_session(delegation.child_session_id)
+        if not session:
+            continue
+        worker = await db.get_worker(delegation.worker_id)
+        ack = False
+        if worker:
+            try:
+                await relay_request_fn(worker, "POST", f"/v1/sessions/{session.id}:cancel")
+                ack = True
+            except Exception as exc:
+                log.warning("Pi delegation %s timeout cancel was not acknowledged: %s", delegation.id, exc)
+        if ack:
+            session.state = PiSessionState.STOPPED
+            session.detail = "delegation timed out"
+            event_type = "timeout"
+            delegation.state = PiSessionState.STOPPED
+        else:
+            session.state = PiSessionState.TERMINATION_UNKNOWN
+            session.detail = "delegation timed out; worker unreachable"
+            event_type = "timeout_unknown"
+            delegation.state = PiSessionState.TERMINATION_UNKNOWN
+        session.updated_at = now
+        delegation.completed_at = now
+        await db.update_pi_session(session)
+        await db.update_pi_delegation(delegation)
+        await db.insert_pi_session_event(PiSessionEvent(
+            session_id=session.id, event_type=event_type, payload={"delegation_id": delegation.id}, created_at=now
+        ))
 
 
 @asynccontextmanager
@@ -110,10 +167,19 @@ async def lifespan(app: FastAPI):
     tunnel and every queued lane waiter belongs to this FastAPI app.
     """
     app.state.reaper_task = asyncio.create_task(reap_loop(app))
+    sweeper = getattr(app.state, "pi_delegation_sweeper", None)
+    if sweeper is not None:
+        app.state.pi_sweeper_task = asyncio.create_task(sweeper())
     try:
         yield
     finally:
         app.state.reaper_task.cancel()
+        if sweeper is not None:
+            app.state.pi_sweeper_task.cancel()
+            try:
+                await app.state.pi_sweeper_task
+            except asyncio.CancelledError:
+                pass
         try:
             await app.state.reaper_task
         except asyncio.CancelledError:
@@ -354,6 +420,7 @@ def create_app(db: Database) -> FastAPI:
             child_session_id=session.id,
             task=payload.task,
             state=PiSessionState.STARTING,
+            timeout_seconds=max(0, payload.timeout_seconds),
             created_at=now,
         )
         await db.insert_pi_session(session)
@@ -393,6 +460,16 @@ def create_app(db: Database) -> FastAPI:
         ))
         return {"delegation_id": delegation.id, "child_session_id": session.id, "state": session.state.value,
                 "status_url": f"/api/v1/pi/delegations/{delegation.id}"}
+
+    async def _pi_delegation_sweeper() -> None:
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await sweep_expired_pi_delegations(db, worker_relay_request)
+            except Exception:
+                log.exception("Pi delegation sweeper iteration failed")
+
+    app.state.pi_delegation_sweeper = _pi_delegation_sweeper
 
     @app.get("/api/v1/pi/delegations/{delegation_id}")
     async def pi_delegation_get(delegation_id: str):

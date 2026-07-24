@@ -189,6 +189,10 @@ class Database:
                 completed_at INTEGER DEFAULT 0
             )
         """)
+        cursor = await self._db.execute("PRAGMA table_info(pi_delegations)")
+        delegation_cols = {row[1] for row in await cursor.fetchall()}
+        if "timeout_seconds" not in delegation_cols:
+            await self._db.execute("ALTER TABLE pi_delegations ADD COLUMN timeout_seconds INTEGER DEFAULT 0")
         await self._db.commit()
 
     # ── Workers ──────────────────────────────────────────────────────
@@ -400,10 +404,11 @@ class Database:
     async def insert_pi_delegation(self, delegation: PiDelegation) -> None:
         await self._db.execute(
             """INSERT INTO pi_delegations
-               (id, parent_session_id, worker_id, child_session_id, task, state, created_at, completed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, parent_session_id, worker_id, child_session_id, task, state, timeout_seconds, created_at, completed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (delegation.id, delegation.parent_session_id, delegation.worker_id, delegation.child_session_id,
-             delegation.task, delegation.state.value, delegation.created_at, delegation.completed_at),
+             delegation.task, delegation.state.value, delegation.timeout_seconds, delegation.created_at,
+             delegation.completed_at),
         )
         await self._db.commit()
 
@@ -414,16 +419,23 @@ class Database:
         )
         await self._db.commit()
 
-    async def get_pi_delegation(self, delegation_id: str) -> PiDelegation | None:
-        cursor = await self._db.execute("SELECT * FROM pi_delegations WHERE id=?", (delegation_id,))
-        row = await cursor.fetchone()
-        if not row:
-            return None
+    @staticmethod
+    def _row_to_pi_delegation(row: aiosqlite.Row) -> PiDelegation:
         return PiDelegation(
             id=row["id"], parent_session_id=row["parent_session_id"], worker_id=row["worker_id"],
             child_session_id=row["child_session_id"], task=row["task"], state=PiSessionState(row["state"]),
+            timeout_seconds=row["timeout_seconds"] if "timeout_seconds" in row.keys() else 0,
             created_at=row["created_at"], completed_at=row["completed_at"],
         )
+
+    async def get_pi_delegation(self, delegation_id: str) -> PiDelegation | None:
+        cursor = await self._db.execute("SELECT * FROM pi_delegations WHERE id=?", (delegation_id,))
+        row = await cursor.fetchone()
+        return self._row_to_pi_delegation(row) if row else None
+
+    async def list_pi_delegations(self) -> list[PiDelegation]:
+        rows = await self._db.execute_fetchall("SELECT * FROM pi_delegations ORDER BY created_at DESC")
+        return [self._row_to_pi_delegation(row) for row in rows]
 
     # ── Jobs ──────────────────────────────────────────────────────────
 

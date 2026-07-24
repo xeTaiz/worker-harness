@@ -11,8 +11,8 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from worker_harness.db import Database
-from worker_harness.heartbeat import create_app, create_registration_app
-from worker_harness.models import WorkerRegistration
+from worker_harness.heartbeat import create_app, create_registration_app, sweep_expired_pi_delegations
+from worker_harness.models import PiDelegation, PiSession, PiSessionState, PiSessionType, WorkerRegistration
 
 
 class _Response:
@@ -207,6 +207,91 @@ class PiWorkerIngestTests(unittest.TestCase):
                 json={"session_id": "wrong", "state": "idle", "events": []},
             )
             self.assertEqual(resp.status_code, 422, resp.text)
+
+
+class PiDelegationTimeoutTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+        self.tmp.close()
+        self.db = Database(self.tmp.name)
+        asyncio.run(self.db.connect())
+        asyncio.run(
+            self.db.upsert_worker(
+                WorkerRegistration(
+                    worker_id="archdome",
+                    name="archdome",
+                    worker_ip="100.64.0.89",
+                    pi_relay_port=27888,
+                    pi_relay_available=True,
+                    pi_relay_protocol_version=2,
+                )
+            )
+        )
+        self.session_id = "child-1"
+        asyncio.run(self.db.insert_pi_session(PiSession(
+            id=self.session_id,
+            worker_id="archdome",
+            session_type=PiSessionType.DELEGATED,
+            state=PiSessionState.WORKING,
+            task="t",
+            created_at=100,
+            updated_at=100,
+        )))
+        self.delegation = PiDelegation(
+            id="del-1",
+            worker_id="archdome",
+            child_session_id=self.session_id,
+            task="t",
+            state=PiSessionState.WORKING,
+            timeout_seconds=60,
+            created_at=100,
+        )
+        asyncio.run(self.db.insert_pi_delegation(self.delegation))
+
+    def tearDown(self) -> None:
+        asyncio.run(self.db.close())
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_unexpired_delegation_is_untouched(self):
+        async def relay(_worker, _method, _path, _payload=None):
+            raise AssertionError("relay must not be called")
+
+        asyncio.run(sweep_expired_pi_delegations(self.db, relay, now=120))
+        session = asyncio.run(self.db.get_pi_session(self.session_id))
+        self.assertEqual(session.state, PiSessionState.WORKING)
+
+    def test_acknowledged_timeout_stops_session(self):
+        calls = []
+
+        async def relay(_worker, method, path, _payload=None):
+            calls.append((method, path))
+            return {"state": "stopped"}
+
+        asyncio.run(sweep_expired_pi_delegations(self.db, relay, now=200))
+        session = asyncio.run(self.db.get_pi_session(self.session_id))
+        delegation = asyncio.run(self.db.get_pi_delegation("del-1"))
+        self.assertEqual(session.state, PiSessionState.STOPPED)
+        self.assertEqual(session.detail, "delegation timed out")
+        self.assertEqual(delegation.state, PiSessionState.STOPPED)
+        self.assertEqual(calls, [("POST", f"/v1/sessions/{self.session_id}:cancel")])
+        events = asyncio.run(self.db.list_pi_session_events(self.session_id))
+        self.assertEqual(events[-1].event_type, "timeout")
+
+    def test_unacknowledged_timeout_is_termination_unknown(self):
+        async def relay(_worker, _method, _path, _payload=None):
+            raise RuntimeError("worker unreachable")
+
+        asyncio.run(sweep_expired_pi_delegations(self.db, relay, now=200))
+        session = asyncio.run(self.db.get_pi_session(self.session_id))
+        delegation = asyncio.run(self.db.get_pi_delegation("del-1"))
+        self.assertEqual(session.state, PiSessionState.TERMINATION_UNKNOWN)
+        self.assertEqual(delegation.state, PiSessionState.TERMINATION_UNKNOWN)
+        events = asyncio.run(self.db.list_pi_session_events(self.session_id))
+        self.assertEqual(events[-1].event_type, "timeout_unknown")
+
+    def test_timeout_seconds_round_trips_through_delegation(self):
+        delegation = asyncio.run(self.db.get_pi_delegation("del-1"))
+        self.assertEqual(delegation.timeout_seconds, 60)
 
 
 if __name__ == "__main__":
