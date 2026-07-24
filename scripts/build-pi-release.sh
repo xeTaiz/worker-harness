@@ -45,7 +45,12 @@ chmod 0755 "$release_dir/bin/pi-worker"
 # in this release tree or manifest.
 if [[ -n "${PI_CONFIG_SOURCE:-}" ]]; then
   [[ -d "$PI_CONFIG_SOURCE" ]] || { echo "PI_CONFIG_SOURCE is not a directory" >&2; exit 1; }
-  cp -a "$PI_CONFIG_SOURCE" "$release_dir/agent-config"
+  mkdir -p "$release_dir/agent-config"
+  # Never ship interaction history, crash logs, extensions, or arbitrary host
+  # files. The allowlist is deliberately the small Pi provider/model surface.
+  for name in auth.json settings.json models.json models-store.json; do
+    [[ ! -f "$PI_CONFIG_SOURCE/$name" ]] || cp -a "$PI_CONFIG_SOURCE/$name" "$release_dir/agent-config/$name"
+  done
 fi
 
 pi_version=$("$release_dir/bin/pi" --version)

@@ -16,6 +16,7 @@ import os
 import pty
 import re
 import shlex
+import shutil
 import signal
 import struct
 import subprocess
@@ -63,6 +64,7 @@ class RelayState:
     command: str
     default_cwd: Path
     tmux_tmpdir: Path | None = None
+    agent_config: Path | None = None
     sessions: dict[str, SessionRecord] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -147,11 +149,22 @@ class RelayState:
             self.sessions[record.session_id] = record
             self._persist(record)
 
+            # Each child gets an isolated home, with the immutable managed
+            # release config copied before launch. This keeps history/auth state
+            # out of the image and avoids sharing mutable ~/.pi between children.
+            session_home = self._path(record.session_id).parent / "home"
+            if self.agent_config and self.agent_config.is_dir():
+                destination = session_home / ".pi" / "agent"
+                if not destination.exists():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(self.agent_config, destination)
+            session_home.mkdir(parents=True, exist_ok=True)
             # This is an operator-controlled command from worker configuration,
             # never a request field. A requested task is written after launch
             # through normal terminal input.
+            command = f"HOME={shlex.quote(str(session_home))} {self.command}"
             result = await self._tmux(
-                "new-session", "-d", "-s", record.tmux_session, "-c", record.cwd, self.command
+                "new-session", "-d", "-s", record.tmux_session, "-c", record.cwd, command
             )
             if result.returncode != 0:
                 record.state = "failed"
@@ -299,6 +312,7 @@ def create_relay_app(
     pi_command: str = "pi",
     default_cwd: Path | None = None,
     tmux_tmpdir: Path | None = None,
+    agent_config: Path | None = None,
 ) -> FastAPI:
     """Create the loopback-only HTTP/WebSocket application."""
 
@@ -307,6 +321,7 @@ def create_relay_app(
         command=pi_command,
         default_cwd=default_cwd or Path.home(),
         tmux_tmpdir=tmux_tmpdir,
+        agent_config=agent_config,
     )
     app = FastAPI(title="Worker Harness Pi Relay", docs_url=None, redoc_url=None)
     app.state.pi_relay = relay_state
@@ -394,6 +409,7 @@ class RelayServer:
         pi_command: str = "pi",
         default_cwd: Path | None = None,
         tmux_tmpdir: Path | None = None,
+        agent_config: Path | None = None,
     ) -> None:
         if not 1 <= port <= 65535:
             raise ValueError("Pi relay port must be in range 1..65535")
@@ -404,6 +420,7 @@ class RelayServer:
             pi_command=pi_command,
             default_cwd=default_cwd,
             tmux_tmpdir=tmux_tmpdir,
+            agent_config=agent_config,
         )
         self._server = _EmbeddedUvicornServer(
             uvicorn.Config(self.app, host="127.0.0.1", port=port, log_level="warning", access_log=False, lifespan="off")

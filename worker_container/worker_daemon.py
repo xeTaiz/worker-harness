@@ -45,6 +45,7 @@ WORKER_ID_FILE: Path = WH_DIR / "worker-daemon" / "id"
 WH_PROXY: str = os.environ.get("WH_PROXY", "").strip()
 PI_RELAY_PORT: int = int(os.environ.get("WH_PI_RELAY_PORT", "27888"))
 PI_SESSIONS_DIR: Path = WH_DIR / "pi" / "sessions"
+PI_AGENT_CONFIG_DIR: Path = WH_DIR / "pi" / "current" / "agent-config"
 # Releases provide this path atomically. Operators may override it for a
 # canary/runtime migration without changing worker daemon code.
 PI_COMMAND: str = os.environ.get("WH_PI_COMMAND", str(WH_DIR / "pi" / "current" / "bin" / "pi-worker"))
@@ -446,6 +447,7 @@ async def main() -> None:
         pi_command=PI_COMMAND,
         default_cwd=Path.home(),
         tmux_tmpdir=HARNESS_DIR / "pi-tmux",
+        agent_config=PI_AGENT_CONFIG_DIR,
     )
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
