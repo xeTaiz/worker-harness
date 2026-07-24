@@ -234,6 +234,9 @@ exec_env_args=(
   --env LOGNAME="$ssh_user"
   --env WH_DIR="$wh_dir_container"
   --env WH_PROXY="${WH_PROXY:-socks5://127.0.0.1:1055}"
+  --env WH_PI_INGEST_BASE_URL="${WH_PI_INGEST_BASE_URL:-}"
+  --env WH_PI_RELAY_PORT="${WH_PI_RELAY_PORT:-27888}"
+  --env WH_PI_COMMAND="${WH_PI_COMMAND:-}"
 )
 
 if [ "$launch_mode" = "instance" ]; then

@@ -107,19 +107,51 @@ class RelayState:
                 continue
             self.sessions[record.session_id] = record
 
+    def _clear_stale_tmux_socket(self) -> None:
+        """Remove a dead server's socket so the next command can start one.
+
+        After a worker/daemon restart, ``$TMUX_TMPDIR/tmux-<uid>/default``
+        can survive with no listening server. tmux then reports ``no server
+        running on ...`` instead of starting a fresh one, which breaks every
+        subsequent session create. Deleting the orphaned socket is safe: a
+        live server would hold it connected, and deletion of an in-use socket
+        only detaches new clients, which we never have at this point.
+        """
+        socket_dir = self.tmux_tmpdir / f"tmux-{os.getuid()}"
+        socket_path = socket_dir / "default"
+        try:
+            socket_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     async def _tmux(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["TMUX_TMPDIR"] = str(self.tmux_tmpdir)
-        return await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", *args],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=15,
-            env=env,
-        )
+
+        def _run() -> subprocess.CompletedProcess[str]:
+            result = subprocess.run(
+                ["tmux", *args],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=15,
+                env=env,
+            )
+            if result.returncode != 0 and "no server running" in result.stderr:
+                self._clear_stale_tmux_socket()
+                result = subprocess.run(
+                    ["tmux", *args],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=15,
+                    env=env,
+                )
+            return result
+
+        return await asyncio.to_thread(_run)
 
     async def _refresh(self, record: SessionRecord) -> SessionRecord:
         if record.state not in {"stopped", "failed"}:
