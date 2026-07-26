@@ -42,6 +42,7 @@ WORKER_NAME: str = os.environ.get("WORKER_NAME", socket.gethostname())
 WH_DIR: Path = Path(os.environ.get("WH_DIR", os.path.join(Path.home(), ".local", "worker-harness"))).expanduser()
 TS_SOCKET: str = str(WH_DIR / "tailscale" / "run" / "tailscaled.sock")
 HARNESS_DIR: Path = WH_DIR / "harness"
+JOB_TMUX_DIR: Path = HARNESS_DIR / "job-tmux"
 WORKER_ID_FILE: Path = WH_DIR / "worker-daemon" / "id"
 WH_PROXY: str = os.environ.get("WH_PROXY", "").strip()
 PI_RELAY_PORT: int = int(os.environ.get("WH_PI_RELAY_PORT", "27888"))
@@ -183,7 +184,7 @@ def get_active_jobs() -> list[dict[str, Any]]:
     """Query job-plane tmux only; Pi relay sessions use a separate socket."""
     try:
         env = os.environ.copy()
-        env["TMUX_TMPDIR"] = str(WH_DIR / "tmux")
+        env["TMUX_TMPDIR"] = str(JOB_TMUX_DIR)
         out = subprocess.check_output(
             ["tmux", "list-sessions", "-F", "#{session_name} #{session_created}"],
             stderr=subprocess.DEVNULL,
@@ -480,7 +481,7 @@ async def main() -> None:
             sessions=relay.state,
             sessions_root=PI_SESSIONS_DIR,
             harness_dir=HARNESS_DIR,
-            tmux_tmpdir=WH_DIR / "tmux",
+            tmux_tmpdir=JOB_TMUX_DIR,
             orchestrator_url=PI_INGEST_BASE_URL or None,
             worker_id=worker_id,
             proxy=WH_PROXY or None,

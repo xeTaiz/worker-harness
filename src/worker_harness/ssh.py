@@ -131,7 +131,9 @@ def _worker_harness_dir(worker: Worker) -> str:
 
 
 def _worker_tmux_tmpdir(worker: Worker) -> str:
-    return f"{Path(_worker_harness_dir(worker)).parent}/tmux"
+    # Keep job sockets beneath the writable harness bind.  The historical
+    # sibling `${WH_DIR}/tmux` can be shadowed by a read-only SIF overlay.
+    return f"{_worker_harness_dir(worker)}/job-tmux"
 
 
 def _tmux_env(worker: Worker) -> str:

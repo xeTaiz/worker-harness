@@ -32,8 +32,9 @@ TS_STATE_DIR="${WH_DIR}/tailscale/state"
 TS_SOCKET_DIR="${WH_DIR}/tailscale/run"
 TS_SOCKET="${TS_SOCKET_DIR}/tailscaled.sock"
 HARNESS_DIR="${WH_DIR}/harness"
+JOB_TMUX_TMPDIR="${HARNESS_DIR}/job-tmux"
 WORKER_DAEMON_DIR="${WH_DIR}/worker-daemon"
-TMUX_TMPDIR="${WH_DIR}/tmux"
+TMUX_TMPDIR="$JOB_TMUX_TMPDIR"
 SSH_HOME_DIR=""
 
 _detect_ssh_user() {
@@ -98,7 +99,7 @@ if [ -z "$SSH_HOME_DIR" ]; then
   SSH_HOME_DIR="${WH_DIR}/home/${SSH_USER}"
 fi
 
-mkdir -p "$TS_STATE_DIR" "$TS_SOCKET_DIR" "$HARNESS_DIR" "$WORKER_DAEMON_DIR" "$TMUX_TMPDIR" "$SSH_HOME_DIR"
+mkdir -p "$TS_STATE_DIR" "$TS_SOCKET_DIR" "$HARNESS_DIR" "$JOB_TMUX_TMPDIR" "$WORKER_DAEMON_DIR" "$TMUX_TMPDIR" "$SSH_HOME_DIR"
 # tmux tmpdir must be writable by the SSH user's uid, which may differ from
 # the entrypoint's uid on workers without fakeroot. 1777 (like /tmp) lets
 # any uid create its tmux-<uid> subdirectory.
@@ -156,6 +157,9 @@ done
 
 # ── 2. Harness directory ─────────────────────────────────────────────
 chmod 1777 "$HARNESS_DIR"
+# The job socket lives under the writable harness bind rather than the
+# overlay-shadowed ${WH_DIR}/tmux path. SSH and delegated jobs share it.
+chmod 1777 "$JOB_TMUX_TMPDIR"
 echo "[entrypoint] Harness directory ready at $HARNESS_DIR"
 
 # ── 3. Worker daemon ─────────────────────────────────────────────────
