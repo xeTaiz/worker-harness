@@ -300,6 +300,17 @@ class RelayState:
         """Persist a transition; the background outbox performs delivery."""
         self._enqueue_state(record, event_type)
 
+    async def _wait_until_bridge_ready(self, record: SessionRecord, timeout: float = 10.0) -> bool:
+        """Wait for Pi's session_start hook, never for terminal output."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            if record.state == "idle" and record.detail == "bridge ready":
+                return True
+            if record.state in {"stopped", "failed"}:
+                return False
+            await asyncio.sleep(0.1)
+        return False
+
     async def create(self, request: SessionCreate) -> SessionRecord:
         async with self._lock:
             existing = self.sessions.get(request.session_id)
@@ -358,9 +369,12 @@ class RelayState:
             await self._upload_state(record, f"create-{record.state}")
 
         if record.state == "working" and request.task:
-            # Give the TUI a short time to enter raw mode before injecting the
-            # first prompt. Subsequent prompts use the same safe tmux path.
-            await asyncio.sleep(0.25)
+            # Pi's session_start hook reports readiness through the private UDS.
+            # Fall back after a bounded wait for compatibility with an older
+            # release, but never infer readiness from tmux output.
+            ready = await self._wait_until_bridge_ready(record)
+            if not ready:
+                await asyncio.sleep(0.25)
             await self.prompt(record.session_id, request.task)
         return record
 
@@ -418,7 +432,11 @@ class RelayState:
             if record.state in {"stopped", "failed"}:
                 raise RuntimeError(f"session is {record.state}")
             record.state = state
-            record.detail = detail or ("agent settled" if state == "idle" else "agent working")
+            record.detail = detail or (
+                "bridge ready" if event_type == "bridge-ready"
+                else "agent settled" if state == "idle"
+                else "agent working"
+            )
             record.updated_at = int(time())
             self._persist(record)
             await self._upload_state(record, event_type)

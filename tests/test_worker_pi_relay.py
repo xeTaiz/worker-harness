@@ -242,6 +242,29 @@ class PiRelayTests(unittest.TestCase):
             reloaded._enqueue_state(persisted, "relay-restarted")
             self.assertEqual(persisted.outbox, [])
 
+    def test_prompt_readiness_requires_explicit_bridge_ready_lifecycle(self):
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                state = self.relay.RelayState(root=Path(tmp), command="/bin/sh", default_cwd=Path(tmp))
+                record = self.relay.SessionRecord(
+                    session_id="child", cwd=tmp, tmux_session="wh_pi_child",
+                    state="idle", detail="agent settled", created_at=10, updated_at=10,
+                )
+                self.assertFalse(await state._wait_until_bridge_ready(record, timeout=0.02))
+                record.state = "working"
+                record.detail = "Pi process started"
+
+                async def mark_ready() -> None:
+                    await asyncio.sleep(0.02)
+                    record.state = "idle"
+                    record.detail = "bridge ready"
+
+                task = asyncio.create_task(mark_ready())
+                self.assertTrue(await state._wait_until_bridge_ready(record, timeout=0.2))
+                await task
+
+        asyncio.run(run())
+
     def test_failed_ingest_is_persisted_and_replayed_in_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = self.relay.RelayState(

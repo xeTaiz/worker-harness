@@ -103,6 +103,11 @@ async function postState(state: "working" | "idle", eventType: string): Promise<
 export default function registerWorkerBash(pi: ExtensionAPI) {
   // These are Pi lifecycle signals, rather than terminal heuristics; `idle`
   // therefore means the agent truly settled and can drive sync delegation.
+  pi.on("session_start", async () => {
+    // Readiness is explicit: a process merely existing in tmux does not prove
+    // that Pi has loaded its TUI and can accept a submitted prompt.
+    await postState("idle", "bridge-ready");
+  });
   pi.on("agent_start", async () => {
     await postState("working", "agent-start");
   });
