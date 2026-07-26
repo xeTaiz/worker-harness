@@ -658,6 +658,7 @@ def create_app(db: Database) -> FastAPI:
         session.detail = remote.get("detail", "")
         session.updated_at = remote.get("updated_at", int(datetime.now(timezone.utc).timestamp()))
         await db.update_pi_session(session)
+        await db.update_pi_delegation_state_for_session(session.id, session.state, now=session.updated_at)
         await db.insert_pi_session_event(PiSessionEvent(
             session_id=session.id, event_type="prompt", payload={"message": payload.message}, created_at=session.updated_at
         ))
@@ -676,6 +677,7 @@ def create_app(db: Database) -> FastAPI:
         session.detail = remote.get("detail", "")
         session.updated_at = remote.get("updated_at", int(datetime.now(timezone.utc).timestamp()))
         await db.update_pi_session(session)
+        await db.update_pi_delegation_state_for_session(session.id, session.state, now=session.updated_at)
         await db.insert_pi_session_event(PiSessionEvent(
             session_id=session.id, event_type="cancelled", payload=remote, created_at=session.updated_at
         ))

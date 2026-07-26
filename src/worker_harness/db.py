@@ -617,9 +617,20 @@ class Database:
                 and payload.state in {PiSessionState.STOPPED, PiSessionState.FAILED}
             )
             if may_update:
+                now = int(time.time())
                 await self._db.execute(
                     "UPDATE pi_sessions SET state=?, detail=?, updated_at=? WHERE id=?",
-                    (payload.state.value, payload.detail, int(time.time()), payload.session_id),
+                    (payload.state.value, payload.detail, now, payload.session_id),
+                )
+                completed_at = now if payload.state in {
+                    PiSessionState.IDLE,
+                    PiSessionState.STOPPED,
+                    PiSessionState.FAILED,
+                    PiSessionState.TERMINATION_UNKNOWN,
+                } else 0
+                await self._db.execute(
+                    "UPDATE pi_delegations SET state=?, completed_at=? WHERE child_session_id=?",
+                    (payload.state.value, completed_at, payload.session_id),
                 )
         await self._db.commit()
         return persisted
@@ -649,6 +660,22 @@ class Database:
         await self._db.execute(
             "UPDATE pi_delegations SET state=?, completed_at=? WHERE id=?",
             (delegation.state.value, delegation.completed_at, delegation.id),
+        )
+        await self._db.commit()
+
+    async def update_pi_delegation_state_for_session(
+        self, session_id: str, state: PiSessionState, now: int | None = None,
+    ) -> None:
+        now = now if now is not None else int(time.time())
+        completed_at = now if state in {
+            PiSessionState.IDLE,
+            PiSessionState.STOPPED,
+            PiSessionState.FAILED,
+            PiSessionState.TERMINATION_UNKNOWN,
+        } else 0
+        await self._db.execute(
+            "UPDATE pi_delegations SET state=?, completed_at=? WHERE child_session_id=?",
+            (state.value, completed_at, session_id),
         )
         await self._db.commit()
 

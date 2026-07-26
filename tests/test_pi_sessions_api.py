@@ -186,6 +186,7 @@ class PiSessionsApiTests(unittest.TestCase):
             self.assertEqual(created.status_code, 201, created.text)
             body = created.json()
             child = body["child_session_id"]
+            delegation_id = body["delegation_id"]
             self.assertEqual(body["state"], "working")
             self.assertEqual(_RelayClient.calls[0][1], "http://100.64.0.89:27888/v1/sessions")
 
@@ -203,6 +204,10 @@ class PiSessionsApiTests(unittest.TestCase):
 
             events = client.get(f"/api/v1/pi/sessions/{child}/events")
             self.assertEqual([event["event_type"] for event in events.json()], ["starting", "working", "prompt", "cancelled"])
+
+        delegation = asyncio.run(self.db.get_pi_delegation(delegation_id))
+        self.assertEqual(delegation.state, PiSessionState.STOPPED)
+        self.assertGreater(delegation.completed_at, 0)
 
 
 class PiWorkerIngestTests(unittest.TestCase):
@@ -260,6 +265,14 @@ class PiWorkerIngestTests(unittest.TestCase):
 
     def test_worker_can_ingest_state_and_events(self):
         sid = self._seed_child()
+        asyncio.run(self.db.insert_pi_delegation(PiDelegation(
+            id="ingest-delegation",
+            worker_id="archdome",
+            child_session_id=sid,
+            task="t",
+            state=PiSessionState.WORKING,
+            created_at=1,
+        )))
         with TestClient(self.app) as client:
             resp = client.post(
                 f"/pi/worker/archdome/sessions/{sid}/events",
@@ -284,6 +297,9 @@ class PiWorkerIngestTests(unittest.TestCase):
             types = [e.event_type for e in events]
             self.assertIn("idle", types)
             self.assertIn("working", types)
+            delegation = asyncio.run(self.db.get_pi_delegation("ingest-delegation"))
+            self.assertEqual(delegation.state, PiSessionState.IDLE)
+            self.assertGreater(delegation.completed_at, 0)
 
     def test_late_ingest_cannot_resurrect_terminal_projection(self):
         sid = self._seed_child()
