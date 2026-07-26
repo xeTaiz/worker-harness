@@ -67,6 +67,13 @@ from pathlib import Path
 path = Path(os.environ["SETTINGS_PATH"])
 settings = json.loads(path.read_text(encoding="utf-8"))
 settings.pop("packages", None)
+provider = os.environ.get("PI_DELEGATED_PROVIDER", "").strip()
+model = os.environ.get("PI_DELEGATED_MODEL", "").strip()
+if bool(provider) != bool(model):
+    raise SystemExit("PI_DELEGATED_PROVIDER and PI_DELEGATED_MODEL must be set together")
+if provider:
+    settings["defaultProvider"] = provider
+    settings["defaultModel"] = model
 path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
 PY
   fi
