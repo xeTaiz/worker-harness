@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#090d14">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Mobile control surface for Worker Harness Pi sessions">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icon-maskable.svg">
+  <link rel="stylesheet" href="/app.css">
+  <title>Pi Sessions</title>
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <header class="topbar">
+      <button id="back" class="icon-button hidden" aria-label="Back to sessions">←</button>
+      <div class="brand-mark" aria-hidden="true">π</div>
+      <div class="title-wrap">
+        <h1 id="page-title">Pi sessions</h1>
+        <p id="page-subtitle">Worker Harness</p>
+      </div>
+      <span id="connection-dot" class="connection-dot" title="Disconnected"></span>
+      <button id="install" class="install-button hidden">Install</button>
+      <button id="refresh" class="icon-button" aria-label="Refresh sessions">↻</button>
+    </header>
+
+    <main id="session-list-view" class="view list-view">
+      <section class="hero">
+        <p class="eyebrow">TAILNET SESSION FABRIC</p>
+        <h2>Continue anywhere.</h2>
+        <p>Open a live Pi session, follow its output, and steer it from this device.</p>
+      </section>
+      <div id="summary" class="summary-row"></div>
+      <section id="session-list" class="session-list" aria-live="polite"></section>
+      <div id="empty-state" class="empty-state hidden">
+        <div class="empty-glyph">π</div>
+        <h2>No sessions found</h2>
+        <p>Start Pi with the Worker Harness bridge, then refresh.</p>
+      </div>
+    </main>
+
+    <main id="session-detail-view" class="view detail-view hidden">
+      <section id="session-meta" class="session-meta"></section>
+      <section id="transcript" class="transcript" aria-live="polite" aria-label="Session transcript"></section>
+      <button id="jump-latest" class="jump-latest hidden">↓ Latest</button>
+      <form id="composer" class="composer">
+        <div class="composer-controls">
+          <label for="delivery">Delivery</label>
+          <select id="delivery" name="delivery">
+            <option value="steer">Steer current turn</option>
+            <option value="followUp">Follow up</option>
+          </select>
+        </div>
+        <div class="composer-row">
+          <textarea id="message" rows="1" maxlength="20000" placeholder="Message this Pi session…" aria-label="Message"></textarea>
+          <button id="send" type="submit" aria-label="Send message">↑</button>
+        </div>
+        <p id="composer-status" class="composer-status" role="status"></p>
+      </form>
+    </main>
+  </div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

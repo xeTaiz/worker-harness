@@ -213,8 +213,35 @@ class Database:
                 session_id TEXT NOT NULL REFERENCES pi_sessions(id),
                 event_type TEXT NOT NULL,
                 payload TEXT DEFAULT '{}',
-                created_at INTEGER DEFAULT 0
+                created_at INTEGER DEFAULT 0,
+                sequence INTEGER NOT NULL DEFAULT 0
             )
+        """)
+        cursor = await self._db.execute("PRAGMA table_info(pi_session_events)")
+        pi_event_cols = {row[1] for row in await cursor.fetchall()}
+        if "sequence" not in pi_event_cols:
+            await self._db.execute(
+                "ALTER TABLE pi_session_events ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0"
+            )
+        # Give pre-streaming events stable per-session cursors in insertion order.
+        await self._db.execute("""
+            UPDATE pi_session_events AS event SET sequence = (
+                SELECT COUNT(*) FROM pi_session_events AS prior
+                WHERE prior.session_id=event.session_id AND prior.rowid<=event.rowid
+            ) WHERE sequence=0
+        """)
+        await self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pi_events_sequence ON pi_session_events(session_id, sequence)"
+        )
+        await self._db.execute("""
+            CREATE TRIGGER IF NOT EXISTS assign_pi_session_event_sequence
+            AFTER INSERT ON pi_session_events WHEN NEW.sequence=0
+            BEGIN
+                UPDATE pi_session_events SET sequence = (
+                    SELECT COALESCE(MAX(sequence), 0) + 1 FROM pi_session_events
+                    WHERE session_id=NEW.session_id AND rowid!=NEW.rowid
+                ) WHERE rowid=NEW.rowid;
+            END
         """)
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS pi_session_commands (
@@ -635,13 +662,20 @@ class Database:
         await self._db.commit()
         return persisted
 
-    async def list_pi_session_events(self, session_id: str) -> list[PiSessionEvent]:
+    async def list_pi_session_events(
+        self, session_id: str, after: int = 0, limit: int = 1000,
+    ) -> list[PiSessionEvent]:
         rows = await self._db.execute_fetchall(
-            "SELECT * FROM pi_session_events WHERE session_id=? ORDER BY rowid", (session_id,)
+            """SELECT * FROM pi_session_events
+               WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT ?""",
+            (session_id, max(0, after), max(1, min(limit, 1000))),
         )
         return [
-            PiSessionEvent(id=row["id"], session_id=row["session_id"], event_type=row["event_type"],
-                           payload=json.loads(row["payload"] or "{}"), created_at=row["created_at"])
+            PiSessionEvent(
+                id=row["id"], session_id=row["session_id"], event_type=row["event_type"],
+                payload=json.loads(row["payload"] or "{}"), created_at=row["created_at"],
+                sequence=row["sequence"],
+            )
             for row in rows
         ]
 

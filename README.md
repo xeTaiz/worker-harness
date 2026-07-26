@@ -17,7 +17,10 @@ Required ACL directions:
 3. Operator/client Tailnet members -> `tag:wh-orchestrator:12889` (privileged control API, including Pi delegation)
 
 `tag:wh-worker` must not be granted access to port `12889`; worker registration
-and the operator control plane are deliberately separate services.
+and the operator control plane are deliberately separate services. The mobile
+Pi-session webapp is served from the control service root, for example
+`http://<orchestrator-tailnet-name>:12889/`, and uses the same Tailnet trust
+boundary—there is no separate browser credential.
 
 Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 

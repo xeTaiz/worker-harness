@@ -324,6 +324,36 @@ class PiJobServiceTests(unittest.TestCase):
             finally:
                 asyncio.run(self._cleanup(relay, service))
 
+    def test_private_child_transcript_events_enter_durable_relay_outbox(self):
+        async def setup(raw: str):
+            return await self._make_service(Path(raw))
+
+        with tempfile.TemporaryDirectory() as raw:
+            relay, service = asyncio.run(setup(raw))
+            try:
+                app = self.jobs.create_job_app(service)
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/v1/sessions/child/events",
+                        json={"events": [{
+                            "id": "message-final-1",
+                            "event_type": "message-end",
+                            "payload": {
+                                "message_id": "assistant:1:message",
+                                "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+                            },
+                            "created_at": 123,
+                        }]},
+                    )
+                self.assertEqual(response.status_code, 200, response.text)
+                session = asyncio.run(relay.get("child"))
+                pending = session.outbox[-1]
+                self.assertEqual(pending.id, "message-final-1")
+                self.assertEqual(pending.event_type, "message-end")
+                self.assertEqual(pending.payload["message"]["content"][0]["text"], "done")
+            finally:
+                asyncio.run(self._cleanup(relay, service))
+
     def test_public_terminal_relay_has_no_job_execution_route(self):
         with tempfile.TemporaryDirectory() as raw:
             app = self.relay.create_relay_app(

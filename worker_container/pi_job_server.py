@@ -47,6 +47,17 @@ class SessionStateUpdate(BaseModel):
     event_type: str = Field(default="bridge-state", min_length=1, max_length=64)
 
 
+class ChildSessionEvent(BaseModel):
+    id: str = Field(min_length=1, max_length=128)
+    event_type: str = Field(min_length=1, max_length=64)
+    payload: dict = Field(default_factory=dict)
+    created_at: int = Field(ge=0)
+
+
+class ChildSessionEventBatch(BaseModel):
+    events: list[ChildSessionEvent] = Field(min_length=1, max_length=100)
+
+
 class JobReport(BaseModel):
     """Wire shape accepted by the registration-port worker job ingest API."""
 
@@ -492,6 +503,18 @@ def create_job_app(service: PiJobService) -> FastAPI:
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"session_id": session_id, "state": payload.state}
+
+    @app.post("/v1/sessions/{session_id}/events")
+    async def append_session_events(session_id: str, payload: ChildSessionEventBatch):
+        try:
+            await service.sessions.append_reported_events(
+                session_id, [event.model_dump(mode="json") for event in payload.events],
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="unknown session") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"session_id": session_id, "events_persisted": len(payload.events)}
 
     return app
 

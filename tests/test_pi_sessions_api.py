@@ -13,7 +13,12 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from worker_harness.db import Database
-from worker_harness.heartbeat import create_app, create_registration_app, sweep_expired_pi_delegations
+from worker_harness.heartbeat import (
+    create_app,
+    create_registration_app,
+    stream_pi_session_events,
+    sweep_expired_pi_delegations,
+)
 from worker_harness.models import (
     PiBridgeRegister,
     PiDelegation,
@@ -91,6 +96,17 @@ class PiSessionsApiTests(unittest.TestCase):
         asyncio.run(self.db.close())
         Path(self.tmp.name).unlink(missing_ok=True)
 
+    def test_mobile_webapp_is_served_by_control_app(self):
+        with TestClient(self.app) as client:
+            page = client.get("/")
+            manifest = client.get("/manifest.webmanifest")
+            script = client.get("/app.js")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Pi sessions", page.text)
+        self.assertEqual(manifest.status_code, 200)
+        self.assertEqual(manifest.json()["display"], "standalone")
+        self.assertIn("EventSource", script.text)
+
     def test_interactive_bridge_register_events_prompt_and_ack(self):
         session_id = "plain-pi-session"
         first_incarnation = "incarnation-1"
@@ -140,6 +156,12 @@ class PiSessionsApiTests(unittest.TestCase):
             )
             self.assertEqual(empty.json(), [])
 
+            replayed = client.get(
+                f"/api/v1/pi/sessions/{session_id}/events",
+                params={"after": 1, "limit": 10},
+            )
+            self.assertEqual([event["sequence"] for event in replayed.json()], [2, 3])
+
         session = asyncio.run(self.db.get_pi_session(session_id))
         self.assertEqual(session.state, PiSessionState.WORKING)
         events = asyncio.run(self.db.list_pi_session_events(session_id))
@@ -147,6 +169,35 @@ class PiSessionsApiTests(unittest.TestCase):
             [event.event_type for event in events],
             ["bridge-registered", "agent-start", "prompt-queued"],
         )
+        self.assertEqual([event.sequence for event in events], [1, 2, 3])
+
+    def test_pi_session_sse_replays_from_durable_cursor(self):
+        session_id = "stream-session"
+        asyncio.run(self.db.register_interactive_pi_session(
+            PiBridgeRegister(session_id=session_id, incarnation="inc"), now=100,
+        ))
+        from worker_harness.models import PiSessionEvent
+        asyncio.run(self.db.insert_pi_session_event(PiSessionEvent(
+            id="first-stream-event", session_id=session_id,
+            event_type="message-start", payload={"message_id": "m1"}, created_at=101,
+        )))
+
+        class ConnectedRequest:
+            async def is_disconnected(self):
+                return False
+
+        async def read_one():
+            stream = stream_pi_session_events(ConnectedRequest(), self.db, session_id)
+            try:
+                return await anext(stream)
+            finally:
+                await stream.aclose()
+
+        frame = asyncio.run(read_one())
+        self.assertIn("id: 1\n", frame)
+        self.assertIn("event: pi-event\n", frame)
+        self.assertIn('"event_type":"message-start"', frame)
+        self.assertIn('"sequence":1', frame)
 
     def test_interactive_bridge_new_incarnation_rejects_stale_client(self):
         session_id = "reload-session"

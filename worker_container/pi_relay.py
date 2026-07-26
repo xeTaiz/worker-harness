@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import time
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 import httpx
@@ -54,7 +54,7 @@ class PendingIngest(BaseModel):
     state: Literal["starting", "working", "idle", "stopped", "failed"]
     detail: str = ""
     created_at: int
-    payload: dict[str, str] = Field(default_factory=dict)
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class SessionRecord(BaseModel):
@@ -440,6 +440,29 @@ class RelayState:
             record.updated_at = int(time())
             self._persist(record)
             await self._upload_state(record, event_type)
+            return record
+
+    async def append_reported_events(
+        self, session_id: str, events: list[dict[str, Any]],
+    ) -> SessionRecord:
+        """Durably enqueue transcript events reported over the private child UDS."""
+        async with self._lock:
+            record = self.sessions.get(session_id)
+            if not record:
+                raise KeyError(session_id)
+            await self._refresh(record)
+            if record.state in {"stopped", "failed"}:
+                raise RuntimeError(f"session is {record.state}")
+            for event in events:
+                record.outbox.append(PendingIngest(
+                    id=event["id"],
+                    event_type=event["event_type"],
+                    state=record.state,
+                    detail=record.detail,
+                    created_at=event["created_at"],
+                    payload=event.get("payload", {}),
+                ))
+            self._persist(record)
             return record
 
     async def cancel(self, session_id: str) -> SessionRecord:

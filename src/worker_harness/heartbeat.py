@@ -5,15 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Literal, TypeVar
+from pathlib import Path
+from typing import AsyncIterator, Awaitable, Callable, Literal, TypeVar
 from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 
 from .cache import TTLCache
@@ -272,6 +275,30 @@ def create_registration_app(db: Database) -> FastAPI:
     return app
 
 
+async def stream_pi_session_events(
+    request: Request, db: Database, session_id: str, after: int = 0,
+) -> AsyncIterator[str]:
+    """Replay and tail one session's durable event log as SSE."""
+    cursor = max(0, after)
+    heartbeat_at = asyncio.get_running_loop().time() + 15.0
+    while True:
+        if await request.is_disconnected():
+            return
+        events = await db.list_pi_session_events(session_id, after=cursor, limit=500)
+        if events:
+            for event in events:
+                cursor = event.sequence
+                data = json.dumps(event.model_dump(mode="json"), separators=(",", ":"))
+                yield f"id: {cursor}\nevent: pi-event\ndata: {data}\n\n"
+            heartbeat_at = asyncio.get_running_loop().time() + 15.0
+            continue
+        now = asyncio.get_running_loop().time()
+        if now >= heartbeat_at:
+            yield ": keep-alive\n\n"
+            heartbeat_at = now + 15.0
+        await asyncio.sleep(0.25)
+
+
 def create_app(db: Database) -> FastAPI:
     """Create the privileged control API (kept as the public test factory)."""
     app = FastAPI(title="Worker Harness Control API", lifespan=lifespan)
@@ -475,10 +502,36 @@ def create_app(db: Database) -> FastAPI:
         return session.model_dump(mode="json")
 
     @app.get("/api/v1/pi/sessions/{session_id}/events")
-    async def pi_session_events(session_id: str):
+    async def pi_session_events(
+        session_id: str,
+        after: int = Query(0, ge=0),
+        limit: int = Query(500, ge=1, le=1000),
+    ):
         if not await db.get_pi_session(session_id):
             raise HTTPException(status_code=404, detail="Pi session not found")
-        return [event.model_dump(mode="json") for event in await db.list_pi_session_events(session_id)]
+        events = await db.list_pi_session_events(session_id, after=after, limit=limit)
+        return [event.model_dump(mode="json") for event in events]
+
+    @app.get("/api/v1/pi/sessions/{session_id}/stream")
+    async def pi_session_stream(
+        request: Request,
+        session_id: str,
+        after: int = Query(0, ge=0),
+    ):
+        if not await db.get_pi_session(session_id):
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        last_event_id = request.headers.get("last-event-id", "")
+        if last_event_id.isdigit():
+            after = max(after, int(last_event_id))
+        return StreamingResponse(
+            stream_pi_session_events(request, db, session_id, after),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.post("/api/v1/pi/delegations", status_code=201)
     async def pi_delegations_create(payload: PiDelegationCreateRequest):
@@ -1133,6 +1186,11 @@ def create_app(db: Database) -> FastAPI:
             }
             for f in failures
         ]
+
+    web_default = Path(__file__).resolve().parents[2] / "web"
+    web_dir = Path(os.environ.get("WH_WEB_DIR", str(web_default)))
+    if web_dir.is_dir():
+        app.mount("/", StaticFiles(directory=web_dir, html=True), name="web")
 
     return app
 

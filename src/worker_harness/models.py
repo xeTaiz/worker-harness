@@ -206,6 +206,8 @@ class PiSessionEvent(BaseModel):
     event_type: str
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: int = 0
+    # Durable, per-session replay cursor assigned by SQLite. Producers omit it.
+    sequence: int = 0
 
 
 class PiIngestEvent(BaseModel):
