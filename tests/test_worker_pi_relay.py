@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import os
 import subprocess
 import sqlite3
@@ -120,6 +121,55 @@ class PiRelayTests(unittest.TestCase):
                 self.assertEqual(event_type, "create-failed")
                 self.assertEqual(record.state, "failed")
                 self.assertTrue(record.detail)
+
+    def test_failed_ingest_is_persisted_and_replayed_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self.relay.RelayState(
+                root=Path(tmp),
+                command="/bin/sh",
+                default_cwd=Path(tmp),
+                orchestrator_url="http://orchestrator:12888",
+                worker_id="wkr",
+            )
+            record = self.relay.SessionRecord(
+                session_id="child",
+                cwd=tmp,
+                tmux_session="wh_pi_child",
+                state="working",
+                detail="Pi process started",
+                created_at=10,
+                updated_at=11,
+            )
+            state.sessions[record.session_id] = record
+            state._persist(record)
+
+            with patch("urllib.request.urlopen", side_effect=OSError("offline")):
+                asyncio.run(state._upload_state(record, "create-working"))
+            self.assertEqual(len(record.outbox), 1)
+            event_id = record.outbox[0].id
+
+            # A new RelayState proves the durable JSON record, rather than
+            # memory, owns retry state after a daemon restart.
+            reloaded = self.relay.RelayState(
+                root=Path(tmp),
+                command="/bin/sh",
+                default_cwd=Path(tmp),
+                orchestrator_url="http://orchestrator:12888",
+                worker_id="wkr",
+            )
+            sent: list[dict] = []
+
+            def success(request, **_kwargs):
+                sent.append(json.loads(request.data.decode()))
+                return SimpleNamespace(read=lambda: b"{}")
+
+            with patch("urllib.request.urlopen", side_effect=success):
+                asyncio.run(reloaded._flush_all_outboxes())
+            replayed = reloaded.sessions["child"]
+            self.assertEqual(replayed.outbox, [])
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0]["events"][0]["id"], event_id)
+            self.assertEqual(sent[0]["events"][0]["event_type"], "create-working")
 
 
 class PiRelayPublicationTests(unittest.TestCase):

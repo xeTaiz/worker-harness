@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from time import time
 from typing import Literal
+from uuid import uuid4
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket
@@ -44,6 +45,17 @@ class SessionCreate(BaseModel):
     cwd: str | None = Field(default=None, max_length=4096)
 
 
+class PendingIngest(BaseModel):
+    """One durable, idempotent worker→orchestrator state report."""
+
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    event_type: str
+    state: Literal["starting", "working", "idle", "stopped", "failed"]
+    detail: str = ""
+    created_at: int
+    payload: dict[str, str] = Field(default_factory=dict)
+
+
 class SessionRecord(BaseModel):
     session_id: str
     parent_session_id: str | None = None
@@ -54,6 +66,9 @@ class SessionRecord(BaseModel):
     detail: str = ""
     created_at: int
     updated_at: int
+    # Persisted alongside the session record so a worker restart or lost HTTP
+    # response cannot erase an unacknowledged orchestrator transition.
+    outbox: list[PendingIngest] = Field(default_factory=list)
 
 
 @dataclass
@@ -71,7 +86,7 @@ class RelayState:
     worker_id: str | None = None
     sessions: dict[str, SessionRecord] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    _observer_task: asyncio.Task[None] | None = field(default=None, init=False)
+    _outbox_task: asyncio.Task[None] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -164,35 +179,101 @@ class RelayState:
                 await self._upload_state(record, "tmux-session-exited")
         return record
 
-    async def _upload_state(self, record: SessionRecord, event_type: str) -> None:
-        """Report a state transition to the orchestrator (best-effort)."""
+    def _enqueue_state(self, record: SessionRecord, event_type: str) -> None:
+        """Append an immutable state snapshot before attempting delivery."""
+        record.outbox.append(
+            PendingIngest(
+                event_type=event_type,
+                state=record.state,
+                detail=record.detail,
+                created_at=record.updated_at,
+                payload={"tmux_session": record.tmux_session},
+            )
+        )
+        self._persist(record)
+
+    async def _flush_record_outbox(self, record: SessionRecord) -> bool:
+        """Deliver one session's FIFO outbox without losing failed reports."""
         if not self.orchestrator_url or not self.worker_id:
-            return
+            return False
         import urllib.request
 
         url = (
             f"{self.orchestrator_url.rstrip('/')}/pi/worker/{self.worker_id}"
             f"/sessions/{record.session_id}/events"
         )
-        payload = {
-            "session_id": record.session_id,
-            "state": record.state,
-            "detail": record.detail,
-            "events": [{"event_type": event_type, "payload": {"tmux_session": record.tmux_session}}],
-        }
-        body = json.dumps(payload).encode()
+        while record.outbox:
+            pending = record.outbox[0]
+            body = json.dumps(
+                {
+                    "session_id": record.session_id,
+                    "state": pending.state,
+                    "detail": pending.detail,
+                    "events": [
+                        {
+                            "id": pending.id,
+                            "event_type": pending.event_type,
+                            "payload": pending.payload,
+                            "created_at": pending.created_at,
+                        }
+                    ],
+                }
+            ).encode()
 
-        def _send() -> None:
-            req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"}, method="POST")
-            urllib.request.urlopen(req, timeout=5).read()
+            def _send() -> None:
+                req = urllib.request.Request(
+                    url, data=body, headers={"content-type": "application/json"}, method="POST"
+                )
+                urllib.request.urlopen(req, timeout=5).read()
 
-        try:
-            await asyncio.to_thread(_send)
-        except Exception:
-            # Worker remains the source of truth on its local record; the
-            # orchestrator catch-up happens via the next operator-initiated
-            # command or the next state-poll if implemented.
+            try:
+                await asyncio.to_thread(_send)
+            except Exception:
+                # Keep the current item (and later items) on disk.  Retrying
+                # the same event id is safe because orchestrator ingest uses
+                # INSERT OR IGNORE for event delivery.
+                return False
+            record.outbox.pop(0)
+            self._persist(record)
+        return True
+
+    async def _flush_all_outboxes(self) -> None:
+        for record in self.sessions.values():
+            await self._flush_record_outbox(record)
+
+    async def _outbox_loop(self) -> None:
+        while True:
+            async with self._lock:
+                await self._flush_all_outboxes()
+            await asyncio.sleep(2)
+
+    async def start_outbox_flusher(self) -> None:
+        if self._outbox_task is not None:
             return
+        async with self._lock:
+            # Reconcile session records loaded from a prior daemon instance.
+            # Existing pending events retain their original order; otherwise a
+            # fresh event makes the current local projection observable again.
+            for record in self.sessions.values():
+                if not record.outbox:
+                    self._enqueue_state(record, "relay-restarted")
+            await self._flush_all_outboxes()
+        self._outbox_task = asyncio.create_task(self._outbox_loop(), name="wh-pi-ingest-outbox")
+
+    async def stop_outbox_flusher(self) -> None:
+        if self._outbox_task is None:
+            return
+        self._outbox_task.cancel()
+        try:
+            await self._outbox_task
+        except asyncio.CancelledError:
+            pass
+        self._outbox_task = None
+
+    async def _upload_state(self, record: SessionRecord, event_type: str) -> None:
+        """Persist a transition first, then try ordered idempotent delivery."""
+        self._enqueue_state(record, event_type)
+        await self._flush_record_outbox(record)
 
     async def create(self, request: SessionCreate) -> SessionRecord:
         async with self._lock:
@@ -514,6 +595,7 @@ class RelayServer:
     async def start(self, timeout_seconds: float = 5.0) -> None:
         if self._task is not None:
             raise RuntimeError("Pi relay is already started")
+        await self.app.state.pi_relay.start_outbox_flusher()
         self._task = asyncio.create_task(self._server.serve(), name="wh-pi-relay")
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while not self._server.started:
@@ -536,3 +618,4 @@ class RelayServer:
             await self._task
         finally:
             self._task = None
+            await self.app.state.pi_relay.stop_outbox_flusher()

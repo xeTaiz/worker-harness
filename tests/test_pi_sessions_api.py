@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -190,6 +192,22 @@ class PiWorkerIngestTests(unittest.TestCase):
             self.assertIn("idle", types)
             self.assertIn("working", types)
 
+    def test_ingest_deduplicates_retried_event_ids(self):
+        sid = self._seed_child()
+        payload = {
+            "session_id": sid,
+            "state": "working",
+            "events": [{"id": "stable-event", "event_type": "working", "payload": {}}],
+        }
+        with TestClient(self.app) as client:
+            first = client.post(f"/pi/worker/archdome/sessions/{sid}/events", json=payload)
+            retry = client.post(f"/pi/worker/archdome/sessions/{sid}/events", json=payload)
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(first.json()["events_persisted"], 1)
+            self.assertEqual(retry.status_code, 200, retry.text)
+            self.assertEqual(retry.json()["events_persisted"], 0)
+        self.assertEqual(len(asyncio.run(self.db.list_pi_session_events(sid))), 1)
+
     def test_ingest_rejects_wrong_worker(self):
         sid = self._seed_child()
         with TestClient(self.app) as client:
@@ -207,6 +225,100 @@ class PiWorkerIngestTests(unittest.TestCase):
                 json={"session_id": "wrong", "state": "idle", "events": []},
             )
             self.assertEqual(resp.status_code, 422, resp.text)
+
+
+class PiSyncDelegationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+        self.tmp.close()
+        self.db = Database(self.tmp.name)
+        asyncio.run(self.db.connect())
+        asyncio.run(
+            self.db.upsert_worker(
+                WorkerRegistration(
+                    worker_id="archdome",
+                    name="archdome",
+                    worker_ip="100.64.0.89",
+                    pi_relay_port=27888,
+                    pi_relay_available=True,
+                    pi_relay_protocol_version=2,
+                )
+            )
+        )
+        self.app = create_app(self.db)
+
+    def tearDown(self) -> None:
+        asyncio.run(self.db.close())
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_sync_waits_for_settled_state(self):
+        _RelayClient.calls.clear()
+        holder: dict = {}
+
+        def run_client() -> None:
+            with patch("worker_harness.heartbeat.httpx.AsyncClient", _RelayClient), TestClient(self.app) as client:
+                holder["resp"] = client.post(
+                    "/api/v1/pi/delegations",
+                    json={"worker_id": "archdome", "task": "do x", "sync": True, "timeout_seconds": 30},
+                )
+
+        thread = threading.Thread(target=run_client)
+        thread.start()
+        time.sleep(1.5)
+
+        async def settle() -> None:
+            other = Database(self.tmp.name)
+            await other.connect()
+            sessions = await other.list_pi_sessions()
+            session = sessions[0]
+            session.state = PiSessionState.IDLE
+            await other.update_pi_session(session)
+            await other.close()
+
+        asyncio.run(settle())
+        thread.join(timeout=30)
+        resp = holder["resp"]
+        self.assertEqual(resp.status_code, 201, resp.text)
+        body = resp.json()
+        self.assertTrue(body["settled"])
+        self.assertEqual(body["state"], "idle")
+        self.assertEqual(body["session"]["id"], body["child_session_id"])
+        self.assertTrue(body["delegation"]["id"])
+
+    def test_sync_applies_timeout_gate_before_returning(self):
+        _RelayClient.calls.clear()
+        with patch("worker_harness.heartbeat.httpx.AsyncClient", _RelayClient), TestClient(self.app) as client:
+            started = time.time()
+            resp = client.post(
+                "/api/v1/pi/delegations",
+                json={"worker_id": "archdome", "task": "long task", "sync": True, "timeout_seconds": 2},
+            )
+            self.assertLess(time.time() - started, 15)
+            self.assertEqual(resp.status_code, 201, resp.text)
+            body = resp.json()
+            self.assertTrue(body["settled"])
+            self.assertEqual(body["state"], "stopped")
+            self.assertEqual(body["session"]["detail"], "delegation timed out")
+            self.assertTrue(any(url.endswith(":cancel") for _, url, _ in _RelayClient.calls))
+
+    def test_sync_reports_unknown_when_timeout_cancel_is_unacknowledged(self):
+        class _UnreachableCancelClient(_RelayClient):
+            async def request(self, method: str, url: str, json=None):
+                if url.endswith(":cancel"):
+                    raise RuntimeError("worker unreachable")
+                return await super().request(method, url, json)
+
+        _UnreachableCancelClient.calls.clear()
+        with patch("worker_harness.heartbeat.httpx.AsyncClient", _UnreachableCancelClient), TestClient(self.app) as client:
+            resp = client.post(
+                "/api/v1/pi/delegations",
+                json={"worker_id": "archdome", "task": "long task", "sync": True, "timeout_seconds": 2},
+            )
+            self.assertEqual(resp.status_code, 201, resp.text)
+            body = resp.json()
+            self.assertFalse(body["settled"])
+            self.assertEqual(body["state"], "termination_unknown")
+            self.assertEqual(body["session"]["detail"], "delegation timed out; worker unreachable")
 
 
 class PiDelegationTimeoutTests(unittest.TestCase):

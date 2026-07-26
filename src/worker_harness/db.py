@@ -370,14 +370,11 @@ class Database:
         persisted: list[PiSessionEvent] = []
         for event in payload.events:
             event_id = event.id or str(uuid4())
-            await self._db.execute(
+            cursor = await self._db.execute(
                 "INSERT OR IGNORE INTO pi_session_events (id, session_id, event_type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
                 (event_id, payload.session_id, event.event_type, json.dumps(event.payload), event.created_at or int(time.time())),
             )
-            row = await self._db.execute_fetchall(
-                "SELECT id FROM pi_session_events WHERE id=?", (event_id,)
-            )
-            if row:
+            if cursor.rowcount:
                 persisted.append(PiSessionEvent(
                     id=event_id, session_id=payload.session_id,
                     event_type=event.event_type, payload=event.payload,

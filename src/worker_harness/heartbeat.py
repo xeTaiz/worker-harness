@@ -99,6 +99,9 @@ class PiDelegationCreateRequest(BaseModel):
     # 0 disables the timeout gate (spec §8.1: duration is the only session-level
     # policy knob; unacknowledged expiry becomes termination_unknown).
     timeout_seconds: int = 0
+    # sync=true blocks until the child reaches a settled/terminal state or the
+    # wait cap elapses; it never fabricates completion (spec §8.1).
+    sync: bool = False
 
 
 class PiPromptRequest(BaseModel):
@@ -458,16 +461,69 @@ def create_app(db: Database) -> FastAPI:
         await db.insert_pi_session_event(PiSessionEvent(
             session_id=session.id, event_type=session.state.value, payload=remote, created_at=session.updated_at
         ))
+        if payload.sync:
+            # A zero duration disables the desired-state timeout, but a sync
+            # HTTP request still needs a bounded wait.  Its 10-minute cap is
+            # reported as unsettled rather than inventing a child result.
+            wait_cap = payload.timeout_seconds if payload.timeout_seconds > 0 else 600
+            settled = await _wait_for_pi_session(session.id, wait_cap)
+            # The periodic sweeper has a deliberately coarse cadence.  A sync
+            # request owns an exact duration promise, so apply the same timeout
+            # gate before returning when its requested deadline elapsed.
+            if not settled.settled and payload.timeout_seconds > 0:
+                await sweep_expired_pi_delegations(db, worker_relay_request)
+                settled = await _read_pi_wait_result(session.id)
+            delegation = await db.get_pi_delegation(delegation.id)
+            return {
+                "delegation_id": delegation.id,
+                "child_session_id": session.id,
+                "state": settled.session.state.value if settled.session else "unknown",
+                "settled": settled.settled,
+                "session": settled.session.model_dump(mode="json") if settled.session else None,
+                "delegation": delegation.model_dump(mode="json") if delegation else None,
+                "events": [event.model_dump(mode="json") for event in settled.events],
+                "status_url": f"/api/v1/pi/delegations/{delegation.id}",
+            }
         return {"delegation_id": delegation.id, "child_session_id": session.id, "state": session.state.value,
                 "status_url": f"/api/v1/pi/delegations/{delegation.id}"}
 
+    class _PiWaitResult:
+        def __init__(self, session, events, settled: bool):
+            self.session = session
+            self.events = events
+            self.settled = settled
+
+    async def _read_pi_wait_result(session_id: str) -> "_PiWaitResult":
+        session = await db.get_pi_session(session_id)
+        events = await db.list_pi_session_events(session_id)
+        # termination_unknown is a terminal projection but not a known child
+        # completion: surface it immediately without claiming a result.
+        settled = bool(session and session.state in {
+            PiSessionState.IDLE,
+            PiSessionState.STOPPED,
+            PiSessionState.FAILED,
+        })
+        return _PiWaitResult(session, events, settled=settled)
+
+    async def _wait_for_pi_session(session_id: str, wait_cap_seconds: int) -> "_PiWaitResult":
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(1, wait_cap_seconds)
+        while loop.time() < deadline:
+            result = await _read_pi_wait_result(session_id)
+            if result.settled or (
+                result.session and result.session.state == PiSessionState.TERMINATION_UNKNOWN
+            ):
+                return result
+            await asyncio.sleep(min(2, max(0.01, deadline - loop.time())))
+        return await _read_pi_wait_result(session_id)
+
     async def _pi_delegation_sweeper() -> None:
         while True:
-            await asyncio.sleep(30)
             try:
                 await sweep_expired_pi_delegations(db, worker_relay_request)
             except Exception:
                 log.exception("Pi delegation sweeper iteration failed")
+            await asyncio.sleep(30)
 
     app.state.pi_delegation_sweeper = _pi_delegation_sweeper
 
