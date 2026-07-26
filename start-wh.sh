@@ -236,7 +236,7 @@ exec_env_args=(
   --env WH_PROXY="${WH_PROXY:-socks5://127.0.0.1:1055}"
   --env WH_PI_INGEST_BASE_URL="${WH_PI_INGEST_BASE_URL:-}"
   --env WH_PI_RELAY_PORT="${WH_PI_RELAY_PORT:-27888}"
-  --env WH_PI_JOB_PORT="${WH_PI_JOB_PORT:-27889}"
+  --env WH_PI_JOB_SOCKET="${WH_PI_JOB_SOCKET:-}"
   --env WH_PI_COMMAND="${WH_PI_COMMAND:-}"
 )
 

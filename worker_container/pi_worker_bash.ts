@@ -2,6 +2,7 @@
 // Worker Harness job plane.  It deliberately registers no wh_ tools and keeps
 // all worker/orchestrator identity outside the child process.
 
+import { request as requestOverUnixSocket } from "node:http";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -16,29 +17,82 @@ type DelegatedJobResult = {
   output: string;
 };
 
-function childConfig(): { sessionId: string; jobUrl: string } {
+type ChildConfig = { sessionId: string; jobSocket: string };
+type UnixHttpResponse = { status: number; text: string };
+
+function childConfig(): ChildConfig {
   const sessionId = process.env.WH_PI_SESSION_ID?.trim();
-  const jobUrl = process.env.WH_PI_JOB_URL?.replace(/\/+$/, "");
-  if (!sessionId || !jobUrl) {
-    throw new Error("delegated bash is unavailable: worker job service was not configured");
+  const jobSocket = process.env.WH_PI_JOB_SOCKET?.trim();
+  if (!sessionId || !jobSocket) {
+    throw new Error("delegated bash is unavailable: worker job socket was not configured");
   }
-  return { sessionId, jobUrl };
+  return { sessionId, jobSocket };
+}
+
+/** Send one JSON request without opening any TCP listener or connection. */
+function postJson(socketPath: string, path: string, payload: unknown, signal?: AbortSignal): Promise<UnixHttpResponse> {
+  const body = JSON.stringify(payload);
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    let request: ReturnType<typeof requestOverUnixSocket> | undefined;
+    const cleanup = () => signal?.removeEventListener("abort", abort);
+    const resolveOnce = (value: UnixHttpResponse) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      resolve(value);
+    };
+    const rejectOnce = (error: Error) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      reject(error);
+    };
+    const abort = () => request?.destroy(new Error("delegated job request aborted"));
+
+    request = requestOverUnixSocket(
+      {
+        socketPath,
+        path,
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(Buffer.byteLength(body)),
+        },
+      },
+      (response) => {
+        let text = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk: string) => {
+          text += chunk;
+        });
+        response.once("end", () => resolveOnce({ status: response.statusCode ?? 0, text }));
+        response.once("error", rejectOnce);
+      },
+    );
+    request.once("error", rejectOnce);
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+    request.end(body);
+  });
 }
 
 async function postState(state: "working" | "idle", eventType: string): Promise<void> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 2_000);
   try {
-    const { sessionId, jobUrl } = childConfig();
-    const response = await fetch(`${jobUrl}/v1/sessions/${encodeURIComponent(sessionId)}/state`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      signal: controller.signal,
-      body: JSON.stringify({ state, event_type: eventType }),
-    });
+    const { sessionId, jobSocket } = childConfig();
+    const response = await postJson(
+      jobSocket,
+      `/v1/sessions/${encodeURIComponent(sessionId)}/state`,
+      { state, event_type: eventType },
+      controller.signal,
+    );
     // Lifecycle reporting must never break a model turn. The relay persists
     // state reports itself and will retry orchestrator delivery separately.
-    if (!response.ok) console.warn(`[pi-worker-bash] lifecycle report failed: ${response.status}`);
+    if (response.status < 200 || response.status >= 300) {
+      console.warn(`[pi-worker-bash] lifecycle report failed: ${response.status}`);
+    }
   } catch (error) {
     console.warn(`[pi-worker-bash] lifecycle report unavailable: ${String(error)}`);
   } finally {
@@ -67,30 +121,30 @@ export default function registerWorkerBash(pi: ExtensionAPI) {
     }),
     executionMode: "sequential",
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const { sessionId, jobUrl } = childConfig();
+      const { sessionId, jobSocket } = childConfig();
       const controller = new AbortController();
       const abort = () => controller.abort();
       if (signal?.aborted) abort();
       else signal?.addEventListener("abort", abort, { once: true });
       try {
-        const response = await fetch(`${jobUrl}/v1/sessions/${encodeURIComponent(sessionId)}/jobs`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          signal: controller.signal,
-          body: JSON.stringify({
+        const response = await postJson(
+          jobSocket,
+          `/v1/sessions/${encodeURIComponent(sessionId)}/jobs`,
+          {
             command: params.command,
             timeout: params.timeout,
             cwd: ctx.cwd,
-          }),
-        });
-        const raw = await response.text();
+          },
+          controller.signal,
+        );
+        const raw = response.text;
         let result: DelegatedJobResult | undefined;
         try {
           result = JSON.parse(raw) as DelegatedJobResult;
         } catch {
           // Use the raw service response below if it was not JSON.
         }
-        if (!response.ok || !result) {
+        if (response.status < 200 || response.status >= 300 || !result) {
           throw new Error(`delegated bash job failed to start (${response.status}): ${raw.slice(0, 2000)}`);
         }
         const output = result.output || "(no output)";

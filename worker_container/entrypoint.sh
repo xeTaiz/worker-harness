@@ -33,6 +33,7 @@ TS_SOCKET_DIR="${WH_DIR}/tailscale/run"
 TS_SOCKET="${TS_SOCKET_DIR}/tailscaled.sock"
 HARNESS_DIR="${WH_DIR}/harness"
 JOB_TMUX_TMPDIR="${HARNESS_DIR}/job-tmux"
+WH_PI_JOB_SOCKET="${WH_PI_JOB_SOCKET:-${HARNESS_DIR}/pi-job/socket}"
 WORKER_DAEMON_DIR="${WH_DIR}/worker-daemon"
 TMUX_TMPDIR="$JOB_TMUX_TMPDIR"
 SSH_HOME_DIR=""
@@ -157,7 +158,7 @@ done
 
 # ── 2. Harness directory ─────────────────────────────────────────────
 chmod 1777 "$HARNESS_DIR"
-# The job socket lives under the writable harness bind rather than the
+# Tmux job sockets live under the writable harness bind rather than the
 # overlay-shadowed ${WH_DIR}/tmux path. SSH and delegated jobs share it.
 chmod 1777 "$JOB_TMUX_TMPDIR"
 echo "[entrypoint] Harness directory ready at $HARNESS_DIR"
@@ -172,10 +173,10 @@ export WH_DIR
 export TS_SOCKET
 export WH_PI_INGEST_BASE_URL
 export WH_PI_RELAY_PORT
-export WH_PI_JOB_PORT
+export WH_PI_JOB_SOCKET
 export WH_PI_COMMAND
 
 unset TMUX TMUX_PANE
 
 echo "[entrypoint] Starting worker daemon..."
-exec env WH_PROXY="$DAEMON_WH_PROXY" WH_PI_INGEST_BASE_URL="$WH_PI_INGEST_BASE_URL" WH_PI_RELAY_PORT="$WH_PI_RELAY_PORT" WH_PI_JOB_PORT="${WH_PI_JOB_PORT:-27889}" WH_PI_COMMAND="$WH_PI_COMMAND" python3 /worker_daemon.py
+exec env WH_PROXY="$DAEMON_WH_PROXY" WH_PI_INGEST_BASE_URL="$WH_PI_INGEST_BASE_URL" WH_PI_RELAY_PORT="$WH_PI_RELAY_PORT" WH_PI_JOB_SOCKET="$WH_PI_JOB_SOCKET" WH_PI_COMMAND="$WH_PI_COMMAND" python3 /worker_daemon.py

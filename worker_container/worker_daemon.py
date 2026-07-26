@@ -46,9 +46,12 @@ JOB_TMUX_DIR: Path = HARNESS_DIR / "job-tmux"
 WORKER_ID_FILE: Path = WH_DIR / "worker-daemon" / "id"
 WH_PROXY: str = os.environ.get("WH_PROXY", "").strip()
 PI_RELAY_PORT: int = int(os.environ.get("WH_PI_RELAY_PORT", "27888"))
-# Private loopback-only child job/state service. It is intentionally distinct
-# from the Tailscale-published terminal relay port.
-PI_JOB_PORT: int = int(os.environ.get("WH_PI_JOB_PORT", "27889"))
+# Private child job/state service. This must remain a Unix-domain socket under
+# the worker's writable harness bind; Apptainer/userspace Tailscale can expose
+# host loopback TCP listeners to other Tailnet peers.
+PI_JOB_SOCKET: Path = Path(
+    os.environ.get("WH_PI_JOB_SOCKET") or (HARNESS_DIR / "pi-job" / "socket")
+).expanduser()
 PI_SESSIONS_DIR: Path = WH_DIR / "pi" / "sessions"
 PI_AGENT_CONFIG_DIR: Path = WH_DIR / "pi" / "current" / "agent-config"
 # Releases provide this path atomically. Operators may override it for a
@@ -438,14 +441,21 @@ async def main() -> None:
     if not 1 <= PI_RELAY_PORT <= 65535:
         log.error("WH_PI_RELAY_PORT must be in range 1..65535; got %s", PI_RELAY_PORT)
         sys.exit(1)
-    if not 1 <= PI_JOB_PORT <= 65535 or PI_JOB_PORT == PI_RELAY_PORT:
-        log.error("WH_PI_JOB_PORT must be a distinct port in range 1..65535; got %s", PI_JOB_PORT)
+    try:
+        pi_job_socket = PI_JOB_SOCKET.resolve()
+        relative_socket = pi_job_socket.relative_to(HARNESS_DIR.resolve())
+        if len(relative_socket.parts) < 2:
+            raise ValueError("socket must be inside a private harness subdirectory")
+        if len(os.fsencode(pi_job_socket)) >= 100:
+            raise ValueError("path is too long")
+    except ValueError as exc:
+        log.error("WH_PI_JOB_SOCKET must be a short path beneath %s: %s", HARNESS_DIR, exc)
         sys.exit(1)
 
     worker_id = get_worker_id()
     proxy_mode = "enabled" if WH_PROXY else "disabled"
     log.info(
-        "Worker daemon starting. ID=%s, name=%s, ssh_user=%s, wh_dir=%s, proxy=%s, orchestrator=%s:%s, pi_relay_port=%s, pi_job_port=%s",
+        "Worker daemon starting. ID=%s, name=%s, ssh_user=%s, wh_dir=%s, proxy=%s, orchestrator=%s:%s, pi_relay_port=%s, pi_job_socket=%s",
         worker_id,
         WORKER_NAME,
         SSH_USER,
@@ -454,7 +464,7 @@ async def main() -> None:
         ORCHESTRATOR_HOST,
         ORCHESTRATOR_PORT,
         PI_RELAY_PORT,
-        PI_JOB_PORT,
+        pi_job_socket,
     )
 
     try:
@@ -473,10 +483,10 @@ async def main() -> None:
         orchestrator_url=PI_INGEST_BASE_URL or None,
         worker_id=worker_id,
         proxy=WH_PROXY or None,
-        job_url=f"http://127.0.0.1:{PI_JOB_PORT}",
+        job_socket=str(pi_job_socket),
     )
     jobs = PiJobServer(
-        PI_JOB_PORT,
+        pi_job_socket,
         PiJobService(
             sessions=relay.state,
             sessions_root=PI_SESSIONS_DIR,

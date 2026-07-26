@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 WORKER_CONTAINER = Path(__file__).parents[1] / "worker_container"
@@ -93,6 +94,49 @@ class PiJobServiceTests(unittest.TestCase):
                 await service._tmux("kill-session", "-t", record.tmux_session)
         await service.stop()
         await relay.cancel("child")
+
+    def test_private_server_uses_mode_600_unix_socket_and_removes_it(self):
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as raw:
+                tmp = Path(raw)
+                relay, service = await self._make_service(tmp)
+                socket_path = tmp / "harness" / "pi-job" / "socket"
+                server = self.jobs.PiJobServer(socket_path, service)
+                try:
+                    await server.start()
+                    self.assertTrue(socket_path.is_socket())
+                    self.assertEqual(socket_path.stat().st_mode & 0o777, 0o600)
+                    transport = httpx.AsyncHTTPTransport(uds=str(socket_path))
+                    async with httpx.AsyncClient(transport=transport, base_url="http://worker") as client:
+                        response = await client.post(
+                            "/v1/sessions/child/state",
+                            json={"state": "idle", "event_type": "agent-settled"},
+                        )
+                    self.assertEqual(response.status_code, 200, response.text)
+                finally:
+                    await server.stop()
+                    await relay.cancel("child")
+                self.assertFalse(socket_path.exists())
+
+        asyncio.run(run())
+
+    def test_private_server_refuses_to_replace_non_socket_path(self):
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as raw:
+                tmp = Path(raw)
+                relay, service = await self._make_service(tmp)
+                socket_path = tmp / "harness" / "pi-job" / "socket"
+                socket_path.parent.mkdir(parents=True, exist_ok=True)
+                socket_path.write_text("do not replace", encoding="utf-8")
+                server = self.jobs.PiJobServer(socket_path, service)
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "non-socket"):
+                        await server.start()
+                finally:
+                    await service.stop()
+                    await relay.cancel("child")
+
+        asyncio.run(run())
 
     def test_private_service_runs_tmux_job_with_canonical_log_path(self):
         async def run() -> None:

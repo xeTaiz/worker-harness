@@ -132,20 +132,23 @@ class PiRelayTests(unittest.TestCase):
         async def run() -> None:
             with tempfile.TemporaryDirectory() as tmp:
                 marker = Path(tmp) / "child-env"
-                command = f"/bin/sh -c 'printf \"%s|%s\" \"$WH_PI_SESSION_ID\" \"$WH_PI_JOB_URL\" > {marker}; exec sleep 60'"
+                command = f"/bin/sh -c 'printf \"%s|%s\" \"$WH_PI_SESSION_ID\" \"$WH_PI_JOB_SOCKET\" > {marker}; exec sleep 60'"
                 state = self.relay.RelayState(
                     root=Path(tmp) / "sessions",
                     command=command,
                     default_cwd=Path(tmp),
                     tmux_tmpdir=Path(tmp) / "pi-tmux",
-                    job_url="http://127.0.0.1:27889",
+                    job_socket="/var/lib/worker-harness/harness/pi-job/socket",
                 )
                 await state.create(self.relay.SessionCreate(session_id="child"))
                 for _ in range(20):
                     if marker.exists():
                         break
                     await asyncio.sleep(0.05)
-                self.assertEqual(marker.read_text(encoding="utf-8"), "child|http://127.0.0.1:27889")
+                self.assertEqual(
+                    marker.read_text(encoding="utf-8"),
+                    "child|/var/lib/worker-harness/harness/pi-job/socket",
+                )
                 await state.cancel("child")
 
         asyncio.run(run())

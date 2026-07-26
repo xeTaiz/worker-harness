@@ -88,9 +88,9 @@ class RelayState:
     # In userspace-Tailscale mode, relay outbox uploads must use the daemon's
     # SOCKS proxy rather than bypassing its network namespace.
     proxy: str | None = None
-    # Private loopback job/state service URL injected into a delegated child.
-    # It is never published through Tailscale Serve.
-    job_url: str | None = None
+    # Private Unix-domain job/state service socket injected into a delegated
+    # child. It never binds a TCP port or reaches Tailscale Serve.
+    job_socket: str | None = None
     sessions: dict[str, SessionRecord] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _outbox_task: asyncio.Task[None] | None = field(default=None, init=False)
@@ -323,8 +323,8 @@ class RelayState:
                 f"WH_PI_SESSION_ID={shlex.quote(record.session_id)}",
                 "WH_PI_CHILD_PROFILE=worker-v1",
             ]
-            if self.job_url:
-                child_env.append(f"WH_PI_JOB_URL={shlex.quote(self.job_url)}")
+            if self.job_socket:
+                child_env.append(f"WH_PI_JOB_SOCKET={shlex.quote(self.job_socket)}")
             command = " ".join([*child_env, self.command])
             result = await self._tmux(
                 "new-session", "-d", "-s", record.tmux_session, "-c", record.cwd, command
@@ -510,7 +510,7 @@ def create_relay_app(
     orchestrator_url: str | None = None,
     worker_id: str | None = None,
     proxy: str | None = None,
-    job_url: str | None = None,
+    job_socket: str | None = None,
 ) -> FastAPI:
     """Create the loopback-only HTTP/WebSocket application."""
 
@@ -523,7 +523,7 @@ def create_relay_app(
         orchestrator_url=orchestrator_url,
         worker_id=worker_id,
         proxy=proxy,
-        job_url=job_url,
+        job_socket=job_socket,
     )
     app = FastAPI(title="Worker Harness Pi Relay", docs_url=None, redoc_url=None)
     app.state.pi_relay = relay_state
@@ -615,7 +615,7 @@ class RelayServer:
         orchestrator_url: str | None = None,
         worker_id: str | None = None,
         proxy: str | None = None,
-        job_url: str | None = None,
+        job_socket: str | None = None,
     ) -> None:
         if not 1 <= port <= 65535:
             raise ValueError("Pi relay port must be in range 1..65535")
@@ -630,7 +630,7 @@ class RelayServer:
             orchestrator_url=orchestrator_url,
             worker_id=worker_id,
             proxy=proxy,
-            job_url=job_url,
+            job_socket=job_socket,
         )
         self._server = _EmbeddedUvicornServer(
             uvicorn.Config(self.app, host="127.0.0.1", port=port, log_level="warning", access_log=False, lifespan="off")

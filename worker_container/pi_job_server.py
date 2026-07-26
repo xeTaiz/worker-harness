@@ -1,8 +1,9 @@
-"""Private loopback job service for delegated Pi ``bash`` calls.
+"""Private Unix-socket job service for delegated Pi ``bash`` calls.
 
 This service is deliberately separate from the Tailnet-published terminal relay.
-Only a child launched by the worker relay receives its loopback URL; requests are
-bound to the path session ID, which becomes the immutable job origin.
+It never binds a TCP port: only a child launched by the worker relay receives
+its Unix-domain socket path. Requests are bound to the path session ID, which
+becomes the immutable job origin.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -487,36 +489,69 @@ class _EmbeddedUvicornServer(uvicorn.Server):
 
 
 class PiJobServer:
-    """Lifecycle wrapper for the unadvertised loopback-only job API."""
+    """Lifecycle wrapper for the worker-private Unix-domain-socket job API."""
 
-    def __init__(self, port: int, service: PiJobService) -> None:
-        if not 1 <= port <= 65535:
-            raise ValueError("Pi job port must be in range 1..65535")
-        self.port = port
+    def __init__(self, socket_path: str | Path, service: PiJobService) -> None:
+        candidate = Path(socket_path).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError("Pi job socket path must be absolute")
+        self.socket_path = candidate.resolve()
+        harness_dir = service.harness_dir.expanduser().resolve()
+        try:
+            self.socket_path.relative_to(harness_dir)
+        except ValueError as exc:
+            raise ValueError(f"Pi job socket must be beneath {harness_dir}") from exc
+        if self.socket_path.parent == harness_dir:
+            raise ValueError("Pi job socket must use a private harness subdirectory")
+        # sockaddr_un is small on Linux. Fail before Uvicorn produces a vague
+        # bind error, while leaving room for the terminating NUL byte.
+        if len(os.fsencode(self.socket_path)) >= 100:
+            raise ValueError(f"Pi job socket path is too long: {self.socket_path}")
         self.service = service
         self.app = create_job_app(service)
-        self._server = _EmbeddedUvicornServer(
-            uvicorn.Config(self.app, host="127.0.0.1", port=port, log_level="warning", access_log=False, lifespan="off")
-        )
+        self._server: _EmbeddedUvicornServer | None = None
         self._task: asyncio.Task[None] | None = None
+
+    def _remove_stale_socket(self) -> None:
+        try:
+            mode = self.socket_path.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(mode):
+            raise RuntimeError(f"refusing to replace non-socket job path: {self.socket_path}")
+        self.socket_path.unlink()
 
     async def start(self, timeout_seconds: float = 5.0) -> None:
         if self._task is not None:
             raise RuntimeError("Pi job server is already started")
+        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        # Even before the socket's mode is tightened after bind, no other local
+        # uid can traverse this directory to connect to it.
+        self.socket_path.parent.chmod(0o700)
+        self._remove_stale_socket()
         await self.service.start()
-        self._task = asyncio.create_task(self._server.serve(), name="wh-pi-jobs")
-        deadline = asyncio.get_running_loop().time() + timeout_seconds
-        while not self._server.started:
-            if self._task.done():
-                await self._task
-                raise RuntimeError("Pi job server exited before it started")
-            if asyncio.get_running_loop().time() >= deadline:
-                await self.stop()
-                raise TimeoutError("Pi job server did not bind before startup timeout")
-            await asyncio.sleep(0.01)
+        self._server = _EmbeddedUvicornServer(
+            uvicorn.Config(self.app, uds=str(self.socket_path), log_level="warning", access_log=False, lifespan="off")
+        )
+        try:
+            self._task = asyncio.create_task(self._server.serve(), name="wh-pi-jobs")
+            deadline = asyncio.get_running_loop().time() + timeout_seconds
+            while not self._server.started:
+                if self._task.done():
+                    await self._task
+                    raise RuntimeError("Pi job server exited before it started")
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("Pi job server did not bind before startup timeout")
+                await asyncio.sleep(0.01)
+            # Delegated children run as this same worker user. Other local users
+            # must not be able to invoke a child-owned command endpoint.
+            self.socket_path.chmod(0o600)
+        except BaseException:
+            await self.stop()
+            raise
 
     async def stop(self, timeout_seconds: float = 5.0) -> None:
-        if self._task is not None:
+        if self._task is not None and self._server is not None:
             self._server.should_exit = True
             try:
                 await asyncio.wait_for(self._task, timeout=timeout_seconds)
@@ -525,4 +560,10 @@ class PiJobServer:
                 await self._task
             finally:
                 self._task = None
+                self._server = None
         await self.service.stop()
+        try:
+            if stat.S_ISSOCK(self.socket_path.lstat().st_mode):
+                self.socket_path.unlink()
+        except FileNotFoundError:
+            pass
