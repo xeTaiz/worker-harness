@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timezone
 
 from .db import Database
-from .models import Failure, Job, JobStatus, Worker
+from .models import Failure, Job, JobKind, JobStatus, Worker
 from .ssh import (
     async_ssh_run,
     ssh_get_exit_code,
@@ -85,7 +85,9 @@ class JobManager:
         Check if a running job has finished and update the DB accordingly.
         Called periodically or on demand.
         """
-        if job.status not in (JobStatus.RUNNING, JobStatus.PENDING):
+        # The worker-local relay is authoritative for delegated-child job
+        # state. SSH probing is retained only for legacy SSH-created jobs.
+        if job.kind != JobKind.SSH or job.status not in (JobStatus.RUNNING, JobStatus.PENDING):
             return job
 
         is_running = await ssh_tmux_running(worker, job.id)

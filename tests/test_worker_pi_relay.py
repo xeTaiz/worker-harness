@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import json
 import os
 import subprocess
 import sqlite3
@@ -35,6 +34,38 @@ def load_module(name: str, path: Path):
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+class _OfflineIngestClient:
+    def __init__(self, **_kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def post(self, *_args, **_kwargs):
+        raise RuntimeError("offline")
+
+
+class _CapturingIngestClient:
+    payloads: list[dict] = []
+    init_kwargs: list[dict] = []
+
+    def __init__(self, **kwargs):
+        self.init_kwargs.append(kwargs)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def post(self, _url, *, json):
+        self.payloads.append(json)
+        return SimpleNamespace(raise_for_status=lambda: None)
 
 
 class PiRelayTests(unittest.TestCase):
@@ -97,6 +128,28 @@ class PiRelayTests(unittest.TestCase):
                         websocket.receive_text()
                     self.assertEqual(closed.exception.code, 4404)
 
+    def test_relay_injects_only_trusted_child_job_identity(self):
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                marker = Path(tmp) / "child-env"
+                command = f"/bin/sh -c 'printf \"%s|%s\" \"$WH_PI_SESSION_ID\" \"$WH_PI_JOB_URL\" > {marker}; exec sleep 60'"
+                state = self.relay.RelayState(
+                    root=Path(tmp) / "sessions",
+                    command=command,
+                    default_cwd=Path(tmp),
+                    tmux_tmpdir=Path(tmp) / "pi-tmux",
+                    job_url="http://127.0.0.1:27889",
+                )
+                await state.create(self.relay.SessionCreate(session_id="child"))
+                for _ in range(20):
+                    if marker.exists():
+                        break
+                    await asyncio.sleep(0.05)
+                self.assertEqual(marker.read_text(encoding="utf-8"), "child|http://127.0.0.1:27889")
+                await state.cancel("child")
+
+        asyncio.run(run())
+
     def test_relay_server_rejects_invalid_port(self):
         with self.assertRaisesRegex(ValueError, "1..65535"):
             self.relay.RelayServer(0)
@@ -122,6 +175,27 @@ class PiRelayTests(unittest.TestCase):
                 self.assertEqual(record.state, "failed")
                 self.assertTrue(record.detail)
 
+    def test_background_observer_reports_unattended_tmux_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self.relay.RelayState(root=Path(tmp), command="/bin/sh", default_cwd=Path(tmp))
+            record = self.relay.SessionRecord(
+                session_id="child",
+                cwd=tmp,
+                tmux_session="wh_pi_child",
+                state="working",
+                created_at=10,
+                updated_at=10,
+            )
+            state.sessions[record.session_id] = record
+            state._persist(record)
+            tmux_mock = AsyncMock(return_value=SimpleNamespace(returncode=1, stdout="", stderr="gone"))
+            upload_mock = AsyncMock()
+            with patch.object(state, "_tmux", new=tmux_mock), patch.object(state, "_upload_state", new=upload_mock):
+                asyncio.run(state._observe_sessions())
+            self.assertEqual(record.state, "stopped")
+            self.assertEqual(record.detail, "tmux session exited")
+            self.assertEqual(upload_mock.await_args.args[1], "tmux-session-exited")
+
     def test_failed_ingest_is_persisted_and_replayed_in_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = self.relay.RelayState(
@@ -130,6 +204,7 @@ class PiRelayTests(unittest.TestCase):
                 default_cwd=Path(tmp),
                 orchestrator_url="http://orchestrator:12888",
                 worker_id="wkr",
+                proxy="socks5://127.0.0.1:1055",
             )
             record = self.relay.SessionRecord(
                 session_id="child",
@@ -143,7 +218,7 @@ class PiRelayTests(unittest.TestCase):
             state.sessions[record.session_id] = record
             state._persist(record)
 
-            with patch("urllib.request.urlopen", side_effect=OSError("offline")):
+            with patch.object(self.relay.httpx, "AsyncClient", _OfflineIngestClient):
                 asyncio.run(state._upload_state(record, "create-working"))
             self.assertEqual(len(record.outbox), 1)
             event_id = record.outbox[0].id
@@ -156,20 +231,18 @@ class PiRelayTests(unittest.TestCase):
                 default_cwd=Path(tmp),
                 orchestrator_url="http://orchestrator:12888",
                 worker_id="wkr",
+                proxy="socks5://127.0.0.1:1055",
             )
-            sent: list[dict] = []
-
-            def success(request, **_kwargs):
-                sent.append(json.loads(request.data.decode()))
-                return SimpleNamespace(read=lambda: b"{}")
-
-            with patch("urllib.request.urlopen", side_effect=success):
+            _CapturingIngestClient.payloads.clear()
+            _CapturingIngestClient.init_kwargs.clear()
+            with patch.object(self.relay.httpx, "AsyncClient", _CapturingIngestClient):
                 asyncio.run(reloaded._flush_all_outboxes())
             replayed = reloaded.sessions["child"]
             self.assertEqual(replayed.outbox, [])
-            self.assertEqual(len(sent), 1)
-            self.assertEqual(sent[0]["events"][0]["id"], event_id)
-            self.assertEqual(sent[0]["events"][0]["event_type"], "create-working")
+            self.assertEqual(len(_CapturingIngestClient.payloads), 1)
+            self.assertEqual(_CapturingIngestClient.payloads[0]["events"][0]["id"], event_id)
+            self.assertEqual(_CapturingIngestClient.payloads[0]["events"][0]["event_type"], "create-working")
+            self.assertEqual(_CapturingIngestClient.init_kwargs[0]["proxy"], "socks5://127.0.0.1:1055")
 
 
 class PiRelayPublicationTests(unittest.TestCase):
@@ -245,13 +318,20 @@ class PiRelayPublicationTests(unittest.TestCase):
                 async def __aexit__(self, *args): return False
             class Relay:
                 is_running = True
+                state = object()
                 def __init__(self, port, **kwargs): pass
+                async def start(self): pass
+                async def stop(self): pass
+            class Jobs:
+                def __init__(self, *args, **kwargs): pass
                 async def start(self): pass
                 async def stop(self): pass
 
             daemon.ORCHESTRATOR_HOST = "orchestrator"
             daemon.HEARTBEAT_INTERVAL = 60
             daemon.RelayServer = Relay
+            daemon.PiJobServer = Jobs
+            daemon.PiJobService = lambda **kwargs: object()
             daemon.build_http_client = lambda: Client()
             daemon.get_worker_id = lambda: "worker"
             daemon.get_tailscale_identity = lambda: ("100.64.0.1", "worker")

@@ -13,11 +13,14 @@ mkdir -p "$output_root"
 bun="$source_bun/bin/bun"
 global_modules="$source_bun/install/global/node_modules"
 pi_cli="$global_modules/@earendil-works/pi-coding-agent/dist/cli.js"
+worker_extension="$(CDPATH= cd -- "$(dirname -- "$0")/../worker_container" && pwd)/pi_worker_bash.ts"
 [[ -x "$bun" ]] || { echo "missing Bun binary: $bun" >&2; exit 1; }
 [[ -f "$pi_cli" ]] || { echo "missing Pi CLI: $pi_cli" >&2; exit 1; }
+[[ -f "$worker_extension" ]] || { echo "missing worker bash extension: $worker_extension" >&2; exit 1; }
 
 rm -rf "$release_dir"
-mkdir -p "$release_dir/bin" "$release_dir/runtime"
+mkdir -p "$release_dir/bin" "$release_dir/runtime" "$release_dir/extensions"
+install -m 0644 "$worker_extension" "$release_dir/extensions/pi-worker-bash.ts"
 install -m 0755 "$bun" "$release_dir/runtime/bun"
 cp -a "$global_modules" "$release_dir/runtime/node_modules"
 
@@ -31,12 +34,15 @@ chmod 0755 "$release_dir/bin/pi"
 
 # Delegated children are started in an isolated tool profile. In particular,
 # auto-discovered host extensions (wh_ tools, vault, planners, subagents) are
-# never inherited by a worker child.
+# never inherited. The sole explicit extension replaces the builtin `bash`
+# implementation with the worker-private durable job executor.
 cat >"$release_dir/bin/pi-worker" <<'EOF'
 #!/usr/bin/env sh
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-exec "$root/bin/pi" --no-extensions --no-skills --tools read,write,edit,bash,grep,find,ls "$@"
+exec "$root/bin/pi" --no-extensions --no-skills \
+  --extension "$root/extensions/pi-worker-bash.ts" \
+  --tools read,write,edit,bash,grep,find,ls "$@"
 EOF
 chmod 0755 "$release_dir/bin/pi-worker"
 

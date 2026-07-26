@@ -28,6 +28,7 @@ from time import time
 from typing import Literal
 from uuid import uuid4
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket
 from pydantic import BaseModel, Field
@@ -84,6 +85,12 @@ class RelayState:
     # transitions and events so the orchestrator's projection stays truthful.
     orchestrator_url: str | None = None
     worker_id: str | None = None
+    # In userspace-Tailscale mode, relay outbox uploads must use the daemon's
+    # SOCKS proxy rather than bypassing its network namespace.
+    proxy: str | None = None
+    # Private loopback job/state service URL injected into a delegated child.
+    # It is never published through Tailscale Serve.
+    job_url: str | None = None
     sessions: dict[str, SessionRecord] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _outbox_task: asyncio.Task[None] | None = field(default=None, init=False)
@@ -196,38 +203,29 @@ class RelayState:
         """Deliver one session's FIFO outbox without losing failed reports."""
         if not self.orchestrator_url or not self.worker_id:
             return False
-        import urllib.request
-
         url = (
             f"{self.orchestrator_url.rstrip('/')}/pi/worker/{self.worker_id}"
             f"/sessions/{record.session_id}/events"
         )
         while record.outbox:
             pending = record.outbox[0]
-            body = json.dumps(
-                {
-                    "session_id": record.session_id,
-                    "state": pending.state,
-                    "detail": pending.detail,
-                    "events": [
-                        {
-                            "id": pending.id,
-                            "event_type": pending.event_type,
-                            "payload": pending.payload,
-                            "created_at": pending.created_at,
-                        }
-                    ],
-                }
-            ).encode()
-
-            def _send() -> None:
-                req = urllib.request.Request(
-                    url, data=body, headers={"content-type": "application/json"}, method="POST"
-                )
-                urllib.request.urlopen(req, timeout=5).read()
-
+            payload = {
+                "session_id": record.session_id,
+                "state": pending.state,
+                "detail": pending.detail,
+                "events": [
+                    {
+                        "id": pending.id,
+                        "event_type": pending.event_type,
+                        "payload": pending.payload,
+                        "created_at": pending.created_at,
+                    }
+                ],
+            }
             try:
-                await asyncio.to_thread(_send)
+                async with httpx.AsyncClient(proxy=self.proxy or None, timeout=5.0) as client:
+                    response = await client.post(url, json=payload)
+                    response.raise_for_status()
             except Exception:
                 # Keep the current item (and later items) on disk.  Retrying
                 # the same event id is safe because orchestrator ingest uses
@@ -237,14 +235,24 @@ class RelayState:
             self._persist(record)
         return True
 
+    async def _observe_sessions(self) -> None:
+        # A daemon-local poll closes the gap between an unattended tmux exit
+        # and the next operator request.  `_refresh` persists and queues the
+        # resulting stopped transition exactly once.
+        for record in list(self.sessions.values()):
+            await self._refresh(record)
+
     async def _flush_all_outboxes(self) -> None:
-        for record in self.sessions.values():
+        for record in list(self.sessions.values()):
             await self._flush_record_outbox(record)
 
     async def _outbox_loop(self) -> None:
         while True:
             async with self._lock:
-                await self._flush_all_outboxes()
+                await self._observe_sessions()
+            # Network retries happen outside the session lock so lifecycle and
+            # command requests keep progressing during an ingest outage.
+            await self._flush_all_outboxes()
             await asyncio.sleep(2)
 
     async def start_outbox_flusher(self) -> None:
@@ -257,7 +265,7 @@ class RelayState:
             for record in self.sessions.values():
                 if not record.outbox:
                     self._enqueue_state(record, "relay-restarted")
-            await self._flush_all_outboxes()
+        await self._flush_all_outboxes()
         self._outbox_task = asyncio.create_task(self._outbox_loop(), name="wh-pi-ingest-outbox")
 
     async def stop_outbox_flusher(self) -> None:
@@ -271,9 +279,8 @@ class RelayState:
         self._outbox_task = None
 
     async def _upload_state(self, record: SessionRecord, event_type: str) -> None:
-        """Persist a transition first, then try ordered idempotent delivery."""
+        """Persist a transition; the background outbox performs delivery."""
         self._enqueue_state(record, event_type)
-        await self._flush_record_outbox(record)
 
     async def create(self, request: SessionCreate) -> SessionRecord:
         async with self._lock:
@@ -311,7 +318,14 @@ class RelayState:
             # This is an operator-controlled command from worker configuration,
             # never a request field. A requested task is written after launch
             # through normal terminal input.
-            command = f"HOME={shlex.quote(str(session_home))} {self.command}"
+            child_env = [
+                f"HOME={shlex.quote(str(session_home))}",
+                f"WH_PI_SESSION_ID={shlex.quote(record.session_id)}",
+                "WH_PI_CHILD_PROFILE=worker-v1",
+            ]
+            if self.job_url:
+                child_env.append(f"WH_PI_JOB_URL={shlex.quote(self.job_url)}")
+            command = " ".join([*child_env, self.command])
             result = await self._tmux(
                 "new-session", "-d", "-s", record.tmux_session, "-c", record.cwd, command
             )
@@ -363,6 +377,33 @@ class RelayState:
             record.updated_at = int(time())
             self._persist(record)
             await self._upload_state(record, f"prompt-{record.state}")
+            return record
+
+    async def set_reported_state(
+        self,
+        session_id: str,
+        state: Literal["working", "idle"],
+        *,
+        detail: str = "",
+        event_type: str = "bridge-state",
+    ) -> SessionRecord:
+        """Apply a lifecycle report from the private child bridge.
+
+        The bridge can only describe active-turn state; terminal state remains
+        owned by tmux exit/cancel so a child cannot fabricate completion.
+        """
+        async with self._lock:
+            record = self.sessions.get(session_id)
+            if not record:
+                raise KeyError(session_id)
+            await self._refresh(record)
+            if record.state in {"stopped", "failed"}:
+                raise RuntimeError(f"session is {record.state}")
+            record.state = state
+            record.detail = detail or ("agent settled" if state == "idle" else "agent working")
+            record.updated_at = int(time())
+            self._persist(record)
+            await self._upload_state(record, event_type)
             return record
 
     async def cancel(self, session_id: str) -> SessionRecord:
@@ -468,6 +509,8 @@ def create_relay_app(
     agent_config: Path | None = None,
     orchestrator_url: str | None = None,
     worker_id: str | None = None,
+    proxy: str | None = None,
+    job_url: str | None = None,
 ) -> FastAPI:
     """Create the loopback-only HTTP/WebSocket application."""
 
@@ -479,6 +522,8 @@ def create_relay_app(
         agent_config=agent_config,
         orchestrator_url=orchestrator_url,
         worker_id=worker_id,
+        proxy=proxy,
+        job_url=job_url,
     )
     app = FastAPI(title="Worker Harness Pi Relay", docs_url=None, redoc_url=None)
     app.state.pi_relay = relay_state
@@ -569,6 +614,8 @@ class RelayServer:
         agent_config: Path | None = None,
         orchestrator_url: str | None = None,
         worker_id: str | None = None,
+        proxy: str | None = None,
+        job_url: str | None = None,
     ) -> None:
         if not 1 <= port <= 65535:
             raise ValueError("Pi relay port must be in range 1..65535")
@@ -582,6 +629,8 @@ class RelayServer:
             agent_config=agent_config,
             orchestrator_url=orchestrator_url,
             worker_id=worker_id,
+            proxy=proxy,
+            job_url=job_url,
         )
         self._server = _EmbeddedUvicornServer(
             uvicorn.Config(self.app, host="127.0.0.1", port=port, log_level="warning", access_log=False, lifespan="off")
@@ -591,6 +640,10 @@ class RelayServer:
     @property
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done() and self._server.started
+
+    @property
+    def state(self) -> RelayState:
+        return self.app.state.pi_relay
 
     async def start(self, timeout_seconds: float = 5.0) -> None:
         if self._task is not None:

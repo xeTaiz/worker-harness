@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import aiosqlite
 import json
 import time
@@ -33,6 +34,9 @@ class Database:
         self.path = Path(path).expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db: aiosqlite.Connection | None = None
+        # Registration-port job reports can be retried concurrently; serialize
+        # their conditional UPSERTs on this process's single SQLite writer.
+        self._worker_job_report_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self._db = await aiosqlite.connect(str(self.path))
@@ -520,45 +524,51 @@ class Database:
         return count
 
     async def upsert_reported_worker_job(self, worker_id: str, report: WorkerJobReport) -> tuple[Job, bool]:
-        """Apply a worker-owned delegated-job report exactly once per revision."""
-        session = await self.get_pi_session(report.origin_session_id)
-        if not session or session.worker_id != worker_id:
-            raise ValueError("origin session not found for worker")
-        existing = await self.get_job(report.id)
-        if existing:
-            if existing.worker_id != worker_id or existing.origin_session_id != report.origin_session_id:
+        """Apply a worker-owned delegated-job report exactly once per revision.
+
+        The conditional UPSERT prevents a retry race from inserting duplicates
+        or letting an older report overwrite a newer worker projection.
+        """
+        async with self._worker_job_report_lock:
+            session = await self.get_pi_session(report.origin_session_id)
+            if not session or session.worker_id != worker_id:
+                raise ValueError("origin session not found for worker")
+            cursor = await self._db.execute(
+                """INSERT INTO jobs
+                   (id, worker_id, tmux_session, command, status, exit_code, pty_enabled,
+                    kind, origin_session_id, report_revision, started_at, finished_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     tmux_session=excluded.tmux_session,
+                     command=excluded.command,
+                     status=excluded.status,
+                     exit_code=excluded.exit_code,
+                     pty_enabled=excluded.pty_enabled,
+                     report_revision=excluded.report_revision,
+                     started_at=excluded.started_at,
+                     finished_at=excluded.finished_at
+                   WHERE jobs.worker_id=excluded.worker_id
+                     AND jobs.origin_session_id=excluded.origin_session_id
+                     AND jobs.kind='delegated'
+                     AND jobs.report_revision < excluded.report_revision""",
+                (
+                    report.id, worker_id, report.tmux_session, report.command,
+                    report.status.value, report.exit_code, int(report.pty_enabled), JobKind.DELEGATED.value,
+                    report.origin_session_id, report.report_revision, report.started_at, report.finished_at,
+                ),
+            )
+            changed = bool(cursor.rowcount)
+            row = await self._db.execute_fetchall("SELECT * FROM jobs WHERE id=?", (report.id,))
+            if not row:
+                # Defensive: a failed insert must never be presented as an ack.
+                await self._db.rollback()
+                raise RuntimeError("worker job report was not persisted")
+            job = self._row_to_job(row[0])
+            if job.worker_id != worker_id or job.origin_session_id != report.origin_session_id:
+                await self._db.rollback()
                 raise ValueError("job identity does not belong to worker origin session")
-            if report.report_revision <= existing.report_revision:
-                return existing, False
-            job = existing.model_copy(update={
-                "tmux_session": report.tmux_session,
-                "command": report.command,
-                "status": report.status,
-                "exit_code": report.exit_code,
-                "pty_enabled": report.pty_enabled,
-                "kind": JobKind.DELEGATED,
-                "report_revision": report.report_revision,
-                "started_at": report.started_at,
-                "finished_at": report.finished_at,
-            })
-            await self.update_job(job)
-            return job, True
-        job = Job(
-            id=report.id,
-            worker_id=worker_id,
-            tmux_session=report.tmux_session,
-            command=report.command,
-            status=report.status,
-            exit_code=report.exit_code,
-            pty_enabled=report.pty_enabled,
-            kind=JobKind.DELEGATED,
-            origin_session_id=report.origin_session_id,
-            report_revision=report.report_revision,
-            started_at=report.started_at,
-            finished_at=report.finished_at,
-        )
-        await self.insert_job(job)
-        return job, True
+            await self._db.commit()
+            return job, changed
 
     def _row_to_job(self, row: aiosqlite.Row) -> Job:
         return Job(

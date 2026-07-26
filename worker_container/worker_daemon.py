@@ -31,6 +31,7 @@ import httpx
 MODULE_DIR = Path(__file__).resolve().parent
 if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
+from pi_job_server import PiJobServer, PiJobService
 from pi_relay import PROTOCOL_VERSION, RelayServer
 
 # ── Configuration from env ──────────────────────────────────────────
@@ -44,6 +45,9 @@ HARNESS_DIR: Path = WH_DIR / "harness"
 WORKER_ID_FILE: Path = WH_DIR / "worker-daemon" / "id"
 WH_PROXY: str = os.environ.get("WH_PROXY", "").strip()
 PI_RELAY_PORT: int = int(os.environ.get("WH_PI_RELAY_PORT", "27888"))
+# Private loopback-only child job/state service. It is intentionally distinct
+# from the Tailscale-published terminal relay port.
+PI_JOB_PORT: int = int(os.environ.get("WH_PI_JOB_PORT", "27889"))
 PI_SESSIONS_DIR: Path = WH_DIR / "pi" / "sessions"
 PI_AGENT_CONFIG_DIR: Path = WH_DIR / "pi" / "current" / "agent-config"
 # Releases provide this path atomically. Operators may override it for a
@@ -54,7 +58,9 @@ PI_COMMAND: str = os.environ.get("WH_PI_COMMAND") or str(WH_DIR / "pi" / "curren
 # Optional orchestrator ingest target. The worker relays state transitions
 # here so the durable projection stays truthful. Workers do not authenticate;
 # Tailnet membership is the trust boundary (spec §7.2).
-PI_INGEST_BASE_URL: str = os.environ.get("WH_PI_INGEST_BASE_URL", "").strip()
+PI_INGEST_BASE_URL: str = os.environ.get("WH_PI_INGEST_BASE_URL", "").strip() or (
+    f"http://{ORCHESTRATOR_HOST}:{ORCHESTRATOR_PORT}" if ORCHESTRATOR_HOST else ""
+)
 def _detect_ssh_user() -> str:
     for key in (
         "SSH_USER",
@@ -174,11 +180,14 @@ def get_system_info() -> dict[str, Any]:
 
 
 def get_active_jobs() -> list[dict[str, Any]]:
-    """Query tmux for active worker-harness sessions."""
+    """Query job-plane tmux only; Pi relay sessions use a separate socket."""
     try:
+        env = os.environ.copy()
+        env["TMUX_TMPDIR"] = str(WH_DIR / "tmux")
         out = subprocess.check_output(
             ["tmux", "list-sessions", "-F", "#{session_name} #{session_created}"],
             stderr=subprocess.DEVNULL,
+            env=env,
         ).decode()
         jobs = []
         for line in out.strip().splitlines():
@@ -186,7 +195,9 @@ def get_active_jobs() -> list[dict[str, Any]]:
             if not parts:
                 continue
             session_name = parts[0]
-            if session_name.startswith("wh_"):
+            # wh_pi_* belongs to the separate delegated-Pi terminal relay,
+            # not the observable bare-job plane.
+            if session_name.startswith("wh_") and not session_name.startswith("wh_pi_"):
                 job_id = session_name[3:]  # strip "wh_" prefix
                 jobs.append({
                     "job_id": job_id,
@@ -426,11 +437,14 @@ async def main() -> None:
     if not 1 <= PI_RELAY_PORT <= 65535:
         log.error("WH_PI_RELAY_PORT must be in range 1..65535; got %s", PI_RELAY_PORT)
         sys.exit(1)
+    if not 1 <= PI_JOB_PORT <= 65535 or PI_JOB_PORT == PI_RELAY_PORT:
+        log.error("WH_PI_JOB_PORT must be a distinct port in range 1..65535; got %s", PI_JOB_PORT)
+        sys.exit(1)
 
     worker_id = get_worker_id()
     proxy_mode = "enabled" if WH_PROXY else "disabled"
     log.info(
-        "Worker daemon starting. ID=%s, name=%s, ssh_user=%s, wh_dir=%s, proxy=%s, orchestrator=%s:%s, pi_relay_port=%s",
+        "Worker daemon starting. ID=%s, name=%s, ssh_user=%s, wh_dir=%s, proxy=%s, orchestrator=%s:%s, pi_relay_port=%s, pi_job_port=%s",
         worker_id,
         WORKER_NAME,
         SSH_USER,
@@ -439,6 +453,7 @@ async def main() -> None:
         ORCHESTRATOR_HOST,
         ORCHESTRATOR_PORT,
         PI_RELAY_PORT,
+        PI_JOB_PORT,
     )
 
     try:
@@ -456,6 +471,20 @@ async def main() -> None:
         agent_config=PI_AGENT_CONFIG_DIR,
         orchestrator_url=PI_INGEST_BASE_URL or None,
         worker_id=worker_id,
+        proxy=WH_PROXY or None,
+        job_url=f"http://127.0.0.1:{PI_JOB_PORT}",
+    )
+    jobs = PiJobServer(
+        PI_JOB_PORT,
+        PiJobService(
+            sessions=relay.state,
+            sessions_root=PI_SESSIONS_DIR,
+            harness_dir=HARNESS_DIR,
+            tmux_tmpdir=WH_DIR / "tmux",
+            orchestrator_url=PI_INGEST_BASE_URL or None,
+            worker_id=worker_id,
+            proxy=WH_PROXY or None,
+        ),
     )
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -467,8 +496,10 @@ async def main() -> None:
             signal.signal(signal_number, lambda *_: stop_event.set())
 
     try:
-        # Bind before publishing so Serve never exposes a dead target.
+        # Bind both loopback services before publishing only the terminal
+        # relay. The job service intentionally remains private to the worker.
         await relay.start()
+        await jobs.start()
         if not publish_pi_relay(PI_RELAY_PORT):
             log.error("Pi relay remains loopback-only; heartbeat will advertise it as unavailable")
 
@@ -507,6 +538,7 @@ async def main() -> None:
         # This removes only the reserved relay port, not data-export or other
         # independent Serve rules that may coexist on the worker.
         unpublish_pi_relay(PI_RELAY_PORT)
+        await jobs.stop()
         await relay.stop()
 
 

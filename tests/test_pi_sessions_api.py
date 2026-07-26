@@ -8,13 +8,20 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
 from worker_harness.db import Database
 from worker_harness.heartbeat import create_app, create_registration_app, sweep_expired_pi_delegations
-from worker_harness.models import PiDelegation, PiSession, PiSessionState, PiSessionType, WorkerRegistration
+from worker_harness.models import (
+    PiDelegation,
+    PiSession,
+    PiSessionState,
+    PiSessionType,
+    WorkerJobReport,
+    WorkerRegistration,
+)
 
 
 class _Response:
@@ -245,6 +252,54 @@ class PiWorkerIngestTests(unittest.TestCase):
             self.assertEqual(listed.status_code, 200, listed.text)
             self.assertEqual([item["id"] for item in listed.json()], ["delegated-job-1"])
             self.assertEqual(listed.json()[0]["origin_session_id"], sid)
+
+    def test_delegated_job_listing_skips_generic_ssh_refresh(self):
+        sid = self._seed_child()
+        asyncio.run(self.db.upsert_reported_worker_job(
+            "archdome",
+            WorkerJobReport(
+                id="reported-running-job",
+                origin_session_id=sid,
+                tmux_session="wh_reported_running_job",
+                command="sleep 60",
+                status="running",
+                started_at=10,
+                report_revision=1,
+            ),
+        ))
+        refresh = AsyncMock()
+        with patch("worker_harness.heartbeat.JobManager.refresh_job_status", new=refresh), TestClient(create_app(self.db)) as client:
+            response = client.get("/api/v1/jobs", params={"origin_session_id": sid})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()[0]["status"], "running")
+        refresh.assert_not_awaited()
+
+    def test_concurrent_worker_job_reports_preserve_highest_revision(self):
+        sid = self._seed_child()
+
+        async def report(revision: int, status: str, finished_at: int = 0):
+            return await self.db.upsert_reported_worker_job(
+                "archdome",
+                WorkerJobReport(
+                    id="concurrent-job",
+                    origin_session_id=sid,
+                    tmux_session="wh_concurrent_job",
+                    command="true",
+                    status=status,
+                    exit_code=0 if status == "done" else None,
+                    started_at=10,
+                    finished_at=finished_at,
+                    report_revision=revision,
+                ),
+            )
+
+        async def submit_both():
+            await asyncio.gather(report(1, "running"), report(2, "done", 12))
+
+        asyncio.run(submit_both())
+        job = asyncio.run(self.db.get_job("concurrent-job"))
+        self.assertEqual(job.report_revision, 2)
+        self.assertEqual(job.status.value, "done")
 
     def test_worker_job_report_rejects_foreign_origin_session(self):
         sid = self._seed_child()

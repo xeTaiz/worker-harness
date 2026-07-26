@@ -12,6 +12,7 @@ From: nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
     worker_container/requirements.txt /requirements.txt
     worker_container/worker_daemon.py /worker_daemon.py
     worker_container/pi_relay.py /pi_relay.py
+    worker_container/pi_job_server.py /pi_job_server.py
     worker_container/entrypoint.sh /entrypoint.sh
     worker_container/wh-data-export /wh-data-export
     worker_container/wh-data-import /wh-data-import

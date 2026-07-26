@@ -32,6 +32,7 @@ from .job import JobManager
 from .lanes import LaneTimeout, WorkerLanes
 from .metrics import Metrics, set_global_metrics
 from .models import (
+    JobKind,
     JobStatus,
     PiDelegation,
     PiIngestPayload,
@@ -755,7 +756,9 @@ def create_app(db: Database) -> FastAPI:
 
         refreshed = []
         for job in jobs:
-            if job.status in (JobStatus.RUNNING, JobStatus.PENDING):
+            # Delegated jobs are reported/reconciled by their worker-local
+            # relay. A transient SSH read must not overwrite that projection.
+            if job.kind == JobKind.SSH and job.status in (JobStatus.RUNNING, JobStatus.PENDING):
                 worker = workers.get(job.worker_id or "")
                 if worker:
                     job = await jm.refresh_job_status(worker, job)
