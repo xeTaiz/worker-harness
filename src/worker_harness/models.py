@@ -25,6 +25,11 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
+class JobKind(str, Enum):
+    SSH = "ssh"
+    DELEGATED = "delegated"
+
+
 class PiSessionType(str, Enum):
     INTERACTIVE = "interactive"
     DELEGATED = "delegated"
@@ -238,8 +243,32 @@ class Job(BaseModel):
     status: JobStatus = JobStatus.PENDING
     exit_code: int | None = None
     pty_enabled: bool = True
+    # SSH-created jobs keep the legacy default.  A delegated Pi child reports
+    # a linked job with its relay session as the immutable origin.
+    kind: JobKind = JobKind.SSH
+    origin_session_id: str | None = None
+    report_revision: int = 0
     started_at: int = 0
     finished_at: int = 0
+
+
+class WorkerJobReport(BaseModel):
+    """A revisioned delegated-job projection reported by a worker relay."""
+
+    id: str = Field(min_length=1, max_length=128)
+    origin_session_id: str = Field(min_length=1, max_length=128)
+    tmux_session: str = Field(min_length=1, max_length=128)
+    command: str = Field(min_length=1, max_length=100_000)
+    status: JobStatus
+    exit_code: int | None = None
+    pty_enabled: bool = True
+    started_at: int = 0
+    finished_at: int = 0
+    report_revision: int = Field(ge=1)
+
+
+class WorkerJobReportBatch(BaseModel):
+    jobs: list[WorkerJobReport] = Field(default_factory=list, max_length=100)
 
 
 # ── Port Forward ──────────────────────────────────────────────────────

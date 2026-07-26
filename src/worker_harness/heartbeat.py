@@ -40,6 +40,7 @@ from .models import (
     PiSessionState,
     PiSessionType,
     PortForward,
+    WorkerJobReportBatch,
     WorkerRegistration,
     WorkerStatus,
 )
@@ -238,6 +239,20 @@ def create_registration_app(db: Database) -> FastAPI:
             "events_persisted": len(persisted),
             "state": payload.state.value if payload.state else None,
         }
+
+    @app.post("/pi/worker/{worker_id}/jobs")
+    async def worker_pi_jobs(worker_id: str, payload: WorkerJobReportBatch):
+        worker = await db.get_worker(worker_id)
+        if not worker:
+            raise HTTPException(status_code=404, detail="worker not found")
+        applied = 0
+        try:
+            for report in payload.jobs:
+                _job, changed = await db.upsert_reported_worker_job(worker_id, report)
+                applied += int(changed)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"jobs_received": len(payload.jobs), "jobs_applied": applied}
 
     return app
 
@@ -722,6 +737,7 @@ def create_app(db: Database) -> FastAPI:
     async def jobs_list(
         worker_id: str | None = None,
         status_value: str | None = Query(None, alias="status"),
+        origin_session_id: str | None = None,
     ):
         job_status = None
         if status_value:
@@ -730,7 +746,11 @@ def create_app(db: Database) -> FastAPI:
             except ValueError:
                 raise HTTPException(status_code=400, detail=f"Invalid status: {status_value}")
 
-        jobs = await db.list_jobs(worker_id=worker_id, status=job_status)
+        jobs = await db.list_jobs(
+            worker_id=worker_id,
+            status=job_status,
+            origin_session_id=origin_session_id,
+        )
         workers = {w.id: w for w in await db.list_workers()}
 
         refreshed = []

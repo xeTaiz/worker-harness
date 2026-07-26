@@ -208,6 +208,59 @@ class PiWorkerIngestTests(unittest.TestCase):
             self.assertEqual(retry.json()["events_persisted"], 0)
         self.assertEqual(len(asyncio.run(self.db.list_pi_session_events(sid))), 1)
 
+    def test_worker_job_reports_link_to_origin_session_and_ignore_replay(self):
+        sid = self._seed_child()
+        report = {
+            "id": "delegated-job-1",
+            "origin_session_id": sid,
+            "tmux_session": "wh_delegated_job_1",
+            "command": "printf hello",
+            "status": "running",
+            "pty_enabled": True,
+            "started_at": 10,
+            "finished_at": 0,
+            "report_revision": 1,
+        }
+        with TestClient(self.app) as client:
+            first = client.post("/pi/worker/archdome/jobs", json={"jobs": [report]})
+            replay = client.post("/pi/worker/archdome/jobs", json={"jobs": [report]})
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(first.json()["jobs_applied"], 1)
+            self.assertEqual(replay.status_code, 200, replay.text)
+            self.assertEqual(replay.json()["jobs_applied"], 0)
+
+            report.update({"status": "done", "exit_code": 0, "finished_at": 12, "report_revision": 2})
+            completed = client.post("/pi/worker/archdome/jobs", json={"jobs": [report]})
+            self.assertEqual(completed.status_code, 200, completed.text)
+            self.assertEqual(completed.json()["jobs_applied"], 1)
+
+        job = asyncio.run(self.db.get_job("delegated-job-1"))
+        self.assertEqual(job.origin_session_id, sid)
+        self.assertEqual(job.kind.value, "delegated")
+        self.assertEqual(job.status.value, "done")
+        self.assertEqual(job.report_revision, 2)
+
+        with TestClient(create_app(self.db)) as client:
+            listed = client.get("/api/v1/jobs", params={"origin_session_id": sid})
+            self.assertEqual(listed.status_code, 200, listed.text)
+            self.assertEqual([item["id"] for item in listed.json()], ["delegated-job-1"])
+            self.assertEqual(listed.json()[0]["origin_session_id"], sid)
+
+    def test_worker_job_report_rejects_foreign_origin_session(self):
+        sid = self._seed_child()
+        report = {
+            "id": "foreign-job",
+            "origin_session_id": sid,
+            "tmux_session": "wh_foreign_job",
+            "command": "true",
+            "status": "running",
+            "started_at": 10,
+            "report_revision": 1,
+        }
+        with TestClient(self.app) as client:
+            response = client.post("/pi/worker/kwworker/jobs", json={"jobs": [report]})
+            self.assertEqual(response.status_code, 404, response.text)
+
     def test_ingest_rejects_wrong_worker(self):
         sid = self._seed_child()
         with TestClient(self.app) as client:

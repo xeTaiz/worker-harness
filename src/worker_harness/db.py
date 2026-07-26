@@ -11,6 +11,7 @@ from pathlib import Path
 from .models import (
     Failure,
     Job,
+    JobKind,
     JobStatus,
     PiDelegation,
     PiSession,
@@ -19,6 +20,7 @@ from .models import (
     PiSessionType,
     PortForward,
     Worker,
+    WorkerJobReport,
     WorkerRegistration,
     WorkerStatus,
 )
@@ -128,10 +130,24 @@ class Database:
                 status TEXT DEFAULT 'pending',
                 exit_code INTEGER,
                 pty_enabled INTEGER DEFAULT 1,
+                kind TEXT NOT NULL DEFAULT 'ssh',
+                origin_session_id TEXT,
+                report_revision INTEGER NOT NULL DEFAULT 0,
                 started_at INTEGER DEFAULT 0,
                 finished_at INTEGER DEFAULT 0
             )
         """)
+        cursor = await self._db.execute("PRAGMA table_info(jobs)")
+        job_cols = {row[1] for row in await cursor.fetchall()}
+        if "kind" not in job_cols:
+            await self._db.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'ssh'")
+        if "origin_session_id" not in job_cols:
+            await self._db.execute("ALTER TABLE jobs ADD COLUMN origin_session_id TEXT")
+        if "report_revision" not in job_cols:
+            await self._db.execute("ALTER TABLE jobs ADD COLUMN report_revision INTEGER NOT NULL DEFAULT 0")
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_origin_session_id ON jobs(origin_session_id)"
+        )
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS port_forwards (
                 id TEXT PRIMARY KEY,
@@ -439,12 +455,13 @@ class Database:
     async def insert_job(self, job: Job) -> None:
         await self._db.execute(
             """INSERT INTO jobs (id, worker_id, tmux_session, command, status,
-                                 exit_code, pty_enabled, started_at, finished_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                 exit_code, pty_enabled, kind, origin_session_id,
+                                 report_revision, started_at, finished_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 job.id, job.worker_id, job.tmux_session, job.command,
-                job.status.value, job.exit_code, int(job.pty_enabled),
-                job.started_at, job.finished_at,
+                job.status.value, job.exit_code, int(job.pty_enabled), job.kind.value,
+                job.origin_session_id, job.report_revision, job.started_at, job.finished_at,
             ),
         )
         await self._db.commit()
@@ -452,12 +469,14 @@ class Database:
     async def update_job(self, job: Job) -> None:
         await self._db.execute(
             """UPDATE jobs SET worker_id=?, tmux_session=?, command=?, status=?,
-                                 exit_code=?, pty_enabled=?, started_at=?, finished_at=?
+                                 exit_code=?, pty_enabled=?, kind=?, origin_session_id=?,
+                                 report_revision=?, started_at=?, finished_at=?
                WHERE id=?""",
             (
                 job.worker_id, job.tmux_session, job.command,
-                job.status.value, job.exit_code, int(job.pty_enabled),
-                job.started_at, job.finished_at, job.id,
+                job.status.value, job.exit_code, int(job.pty_enabled), job.kind.value,
+                job.origin_session_id, job.report_revision, job.started_at, job.finished_at,
+                job.id,
             ),
         )
         await self._db.commit()
@@ -473,6 +492,7 @@ class Database:
         self,
         worker_id: str | None = None,
         status: JobStatus | None = None,
+        origin_session_id: str | None = None,
     ) -> list[Job]:
         query = "SELECT * FROM jobs WHERE 1=1"
         params: list = []
@@ -482,6 +502,9 @@ class Database:
         if status:
             query += " AND status = ?"
             params.append(status.value)
+        if origin_session_id:
+            query += " AND origin_session_id = ?"
+            params.append(origin_session_id)
         query += " ORDER BY started_at DESC"
         rows = await self._db.execute_fetchall(query, params)
         return [self._row_to_job(r) for r in rows]
@@ -496,6 +519,47 @@ class Database:
         await cursor.close()
         return count
 
+    async def upsert_reported_worker_job(self, worker_id: str, report: WorkerJobReport) -> tuple[Job, bool]:
+        """Apply a worker-owned delegated-job report exactly once per revision."""
+        session = await self.get_pi_session(report.origin_session_id)
+        if not session or session.worker_id != worker_id:
+            raise ValueError("origin session not found for worker")
+        existing = await self.get_job(report.id)
+        if existing:
+            if existing.worker_id != worker_id or existing.origin_session_id != report.origin_session_id:
+                raise ValueError("job identity does not belong to worker origin session")
+            if report.report_revision <= existing.report_revision:
+                return existing, False
+            job = existing.model_copy(update={
+                "tmux_session": report.tmux_session,
+                "command": report.command,
+                "status": report.status,
+                "exit_code": report.exit_code,
+                "pty_enabled": report.pty_enabled,
+                "kind": JobKind.DELEGATED,
+                "report_revision": report.report_revision,
+                "started_at": report.started_at,
+                "finished_at": report.finished_at,
+            })
+            await self.update_job(job)
+            return job, True
+        job = Job(
+            id=report.id,
+            worker_id=worker_id,
+            tmux_session=report.tmux_session,
+            command=report.command,
+            status=report.status,
+            exit_code=report.exit_code,
+            pty_enabled=report.pty_enabled,
+            kind=JobKind.DELEGATED,
+            origin_session_id=report.origin_session_id,
+            report_revision=report.report_revision,
+            started_at=report.started_at,
+            finished_at=report.finished_at,
+        )
+        await self.insert_job(job)
+        return job, True
+
     def _row_to_job(self, row: aiosqlite.Row) -> Job:
         return Job(
             id=row["id"],
@@ -505,6 +569,9 @@ class Database:
             status=JobStatus(row["status"]),
             exit_code=row["exit_code"],
             pty_enabled=bool(row["pty_enabled"]),
+            kind=JobKind(row["kind"]) if "kind" in row.keys() else JobKind.SSH,
+            origin_session_id=row["origin_session_id"] if "origin_session_id" in row.keys() else None,
+            report_revision=row["report_revision"] if "report_revision" in row.keys() else 0,
             started_at=row["started_at"],
             finished_at=row["finished_at"],
         )
