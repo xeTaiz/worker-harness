@@ -531,7 +531,9 @@ class Database:
         """
         async with self._worker_job_report_lock:
             session = await self.get_pi_session(report.origin_session_id)
-            if not session or session.worker_id != worker_id:
+            if not session:
+                raise KeyError(report.origin_session_id)
+            if session.worker_id != worker_id:
                 raise ValueError("origin session not found for worker")
             cursor = await self._db.execute(
                 """INSERT INTO jobs

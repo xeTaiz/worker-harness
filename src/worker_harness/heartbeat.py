@@ -229,12 +229,16 @@ def create_registration_app(db: Database) -> FastAPI:
         if not worker:
             raise HTTPException(status_code=404, detail="worker not found")
         session = await db.get_pi_session(session_id)
-        if not session or session.worker_id != worker_id:
+        if not session:
+            raise HTTPException(status_code=410, detail="session projection is gone")
+        if session.worker_id != worker_id:
             raise HTTPException(status_code=404, detail="session not found for worker")
         try:
             persisted = await db.apply_pi_ingest(worker_id, payload)
         except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            # The row can disappear between the ownership check and the
+            # transaction. Tell the durable worker outbox not to retry forever.
+            raise HTTPException(status_code=410, detail="session projection is gone") from exc
         return {
             "session_id": session_id,
             "events_persisted": len(persisted),
@@ -251,6 +255,8 @@ def create_registration_app(db: Database) -> FastAPI:
             for report in payload.jobs:
                 _job, changed = await db.upsert_reported_worker_job(worker_id, report)
                 applied += int(changed)
+        except KeyError as exc:
+            raise HTTPException(status_code=410, detail="origin session projection is gone") from exc
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"jobs_received": len(payload.jobs), "jobs_applied": applied}

@@ -48,10 +48,10 @@ passwd_file="${compat_dir}/passwd"
 group_file="${compat_dir}/group"
 launch_mode="${WH_LAUNCH_MODE:-instance}"
 instance_name="${WH_INSTANCE_NAME:-wh-${ssh_user}}"
-# Fakeroot is disabled by default — it creates a user namespace that breaks
-# Tailscale SSH (setuid to an unmapped host uid fails with EINVAL).
-# Only enable if you explicitly need root inside the container and can't
-# use --overlay for apt installs instead.
+# Fakeroot remains opt-in because it changes the container's UID/GID mapping.
+# It is required on rootless Apptainer installations where inner tailscaled
+# otherwise lacks CAP_SETGID for its SSH credential switch. SUID-capable
+# installations generally do not need it. Validate host mappings before use.
 fakeroot_flag=""
 if [ -n "${WH_FAKEROOT:-}" ]; then
   case "${WH_FAKEROOT}" in

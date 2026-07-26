@@ -43,6 +43,20 @@ class _OfflineClient:
         raise RuntimeError("offline")
 
 
+class _GoneClient:
+    def __init__(self, **_kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def post(self, url, **_kwargs):
+        return httpx.Response(410, request=httpx.Request("POST", url))
+
+
 class _CapturingClient:
     sent: list[dict] = []
 
@@ -252,6 +266,39 @@ class PiJobServiceTests(unittest.TestCase):
                     self.assertEqual(
                         [item["jobs"][0]["report_revision"] for item in _CapturingClient.sent], [1, 2]
                     )
+                finally:
+                    await self._cleanup(relay, service, locals().get("record", None).id if "record" in locals() else None)
+
+        asyncio.run(run())
+
+    def test_gone_origin_durably_abandons_job_reports(self):
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as raw:
+                tmp = Path(raw)
+                relay, service = await self._make_service(tmp, ingest=True)
+                try:
+                    with patch.object(self.jobs.httpx, "AsyncClient", _OfflineClient):
+                        record, _ = await service.run(
+                            "child", self.jobs.DelegatedBashRequest(command="true", cwd=str(tmp))
+                        )
+                    self.assertTrue(record.outbox)
+                    with patch.object(self.jobs.httpx, "AsyncClient", _GoneClient):
+                        self.assertTrue(await service._flush_record_outbox(record))
+                    self.assertTrue(record.abandoned)
+                    self.assertEqual(record.outbox, [])
+
+                    reloaded = self.jobs.PiJobService(
+                        sessions=relay,
+                        sessions_root=tmp / "pi" / "sessions",
+                        harness_dir=tmp / "harness",
+                        tmux_tmpdir=tmp / "tmux",
+                        orchestrator_url="http://orchestrator:12888",
+                        worker_id="worker",
+                    )
+                    persisted = reloaded.jobs[record.id]
+                    self.assertTrue(persisted.abandoned)
+                    reloaded._enqueue_report(persisted)
+                    self.assertEqual(persisted.outbox, [])
                 finally:
                     await self._cleanup(relay, service, locals().get("record", None).id if "record" in locals() else None)
 

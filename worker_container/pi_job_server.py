@@ -77,6 +77,9 @@ class LocalJobRecord(BaseModel):
     # requested timeout.
     deadline_at: float = 0.0
     outbox: list[JobReport] = Field(default_factory=list)
+    # Persist a control-plane 410 so daemon restart reconciliation does not
+    # retry reports for an origin session that has been permanently removed.
+    abandoned: bool = False
 
 
 @dataclass
@@ -197,10 +200,14 @@ class PiJobService:
         )
 
     def _enqueue_report(self, record: LocalJobRecord) -> None:
+        if record.abandoned:
+            return
         record.outbox.append(self._report(record))
         self._persist(record)
 
     async def _flush_record_outbox(self, record: LocalJobRecord) -> bool:
+        if record.abandoned:
+            return True
         if not self.orchestrator_url or not self.worker_id:
             return False
         url = f"{self.orchestrator_url.rstrip('/')}/pi/worker/{self.worker_id}/jobs"
@@ -210,6 +217,13 @@ class PiJobService:
                 async with httpx.AsyncClient(proxy=self.proxy or None, timeout=5.0) as client:
                     response = await client.post(url, json={"jobs": [pending.model_dump(mode="json")]})
                     response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 410:
+                    record.abandoned = True
+                    record.outbox.clear()
+                    self._persist(record)
+                    return True
+                return False
             except Exception:
                 # Do not drop the report.  Its revision and origin are stable,
                 # so an eventual retry is safe for the orchestrator upsert.
@@ -241,7 +255,7 @@ class PiJobService:
             for record in self.jobs.values():
                 # Reconciliation after daemon restart: preserve unacknowledged
                 # reports; otherwise re-advertise the current projection.
-                if not record.outbox:
+                if not record.abandoned and not record.outbox:
                     self._enqueue_report(record)
                 if record.status in {"pending", "running"}:
                     self._ensure_monitor(record.id)

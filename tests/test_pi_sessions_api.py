@@ -334,6 +334,27 @@ class PiWorkerIngestTests(unittest.TestCase):
             )
             self.assertEqual(resp.status_code, 422, resp.text)
 
+    def test_ingest_marks_missing_session_projection_gone(self):
+        with TestClient(self.app) as client:
+            event_response = client.post(
+                "/pi/worker/archdome/sessions/missing/events",
+                json={"session_id": "missing", "state": "idle", "events": []},
+            )
+            job_response = client.post(
+                "/pi/worker/archdome/jobs",
+                json={"jobs": [{
+                    "id": "missing-origin-job",
+                    "origin_session_id": "missing",
+                    "tmux_session": "wh_missing_origin_job",
+                    "command": "true",
+                    "status": "running",
+                    "started_at": 10,
+                    "report_revision": 1,
+                }]},
+            )
+        self.assertEqual(event_response.status_code, 410, event_response.text)
+        self.assertEqual(job_response.status_code, 410, job_response.text)
+
 
 class PiSyncDelegationTests(unittest.TestCase):
     def setUp(self) -> None:

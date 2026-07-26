@@ -70,6 +70,10 @@ class SessionRecord(BaseModel):
     # Persisted alongside the session record so a worker restart or lost HTTP
     # response cannot erase an unacknowledged orchestrator transition.
     outbox: list[PendingIngest] = Field(default_factory=list)
+    # A 410 from ingest means the orchestrator has permanently discarded this
+    # projection. Persist that decision so restart reconciliation cannot
+    # recreate an outbox that will never be accepted.
+    abandoned: bool = False
 
 
 @dataclass
@@ -188,6 +192,8 @@ class RelayState:
 
     def _enqueue_state(self, record: SessionRecord, event_type: str) -> None:
         """Append an immutable state snapshot before attempting delivery."""
+        if record.abandoned:
+            return
         record.outbox.append(
             PendingIngest(
                 event_type=event_type,
@@ -201,6 +207,8 @@ class RelayState:
 
     async def _flush_record_outbox(self, record: SessionRecord) -> bool:
         """Deliver one session's FIFO outbox without losing failed reports."""
+        if record.abandoned:
+            return True
         if not self.orchestrator_url or not self.worker_id:
             return False
         url = (
@@ -226,6 +234,16 @@ class RelayState:
                 async with httpx.AsyncClient(proxy=self.proxy or None, timeout=5.0) as client:
                     response = await client.post(url, json=payload)
                     response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 410:
+                    # The control plane explicitly says this projection is
+                    # gone. Retrying would head-of-line block this durable FIFO
+                    # forever, so persist abandonment and stop accumulating.
+                    record.abandoned = True
+                    record.outbox.clear()
+                    self._persist(record)
+                    return True
+                return False
             except Exception:
                 # Keep the current item (and later items) on disk.  Retrying
                 # the same event id is safe because orchestrator ingest uses
@@ -263,7 +281,7 @@ class RelayState:
             # Existing pending events retain their original order; otherwise a
             # fresh event makes the current local projection observable again.
             for record in self.sessions.values():
-                if not record.outbox:
+                if not record.abandoned and not record.outbox:
                     self._enqueue_state(record, "relay-restarted")
         await self._flush_all_outboxes()
         self._outbox_task = asyncio.create_task(self._outbox_loop(), name="wh-pi-ingest-outbox")

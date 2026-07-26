@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -48,6 +49,20 @@ class _OfflineIngestClient:
 
     async def post(self, *_args, **_kwargs):
         raise RuntimeError("offline")
+
+
+class _GoneIngestClient:
+    def __init__(self, **_kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def post(self, url, **_kwargs):
+        return httpx.Response(410, request=httpx.Request("POST", url))
 
 
 class _CapturingIngestClient:
@@ -196,8 +211,36 @@ class PiRelayTests(unittest.TestCase):
             with patch.object(state, "_tmux", new=tmux_mock), patch.object(state, "_upload_state", new=upload_mock):
                 asyncio.run(state._observe_sessions())
             self.assertEqual(record.state, "stopped")
+            self.assertNotEqual(record.state, "idle")
             self.assertEqual(record.detail, "tmux session exited")
             self.assertEqual(upload_mock.await_args.args[1], "tmux-session-exited")
+
+    def test_gone_ingest_durably_abandons_outbox(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self.relay.RelayState(
+                root=Path(tmp), command="/bin/sh", default_cwd=Path(tmp),
+                orchestrator_url="http://orchestrator:12888", worker_id="wkr",
+            )
+            record = self.relay.SessionRecord(
+                session_id="gone-child", cwd=tmp, tmux_session="wh_pi_gone_child",
+                state="stopped", created_at=10, updated_at=11,
+            )
+            state.sessions[record.session_id] = record
+            state._enqueue_state(record, "tmux-session-exited")
+
+            with patch.object(self.relay.httpx, "AsyncClient", _GoneIngestClient):
+                self.assertTrue(asyncio.run(state._flush_record_outbox(record)))
+            self.assertTrue(record.abandoned)
+            self.assertEqual(record.outbox, [])
+
+            reloaded = self.relay.RelayState(
+                root=Path(tmp), command="/bin/sh", default_cwd=Path(tmp),
+                orchestrator_url="http://orchestrator:12888", worker_id="wkr",
+            )
+            persisted = reloaded.sessions[record.session_id]
+            self.assertTrue(persisted.abandoned)
+            reloaded._enqueue_state(persisted, "relay-restarted")
+            self.assertEqual(persisted.outbox, [])
 
     def test_failed_ingest_is_persisted_and_replayed_in_order(self):
         with tempfile.TemporaryDirectory() as tmp:
