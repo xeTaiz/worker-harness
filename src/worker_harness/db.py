@@ -8,14 +8,18 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from .models import (
     Failure,
     Job,
     JobKind,
     JobStatus,
+    PiBridgeEventBatch,
+    PiBridgeRegister,
     PiDelegation,
     PiSession,
+    PiSessionCommand,
     PiSessionEvent,
     PiSessionState,
     PiSessionType,
@@ -37,6 +41,7 @@ class Database:
         # Registration-port job reports can be retried concurrently; serialize
         # their conditional UPSERTs on this process's single SQLite writer.
         self._worker_job_report_lock = asyncio.Lock()
+        self._pi_bridge_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self._db = await aiosqlite.connect(str(self.path))
@@ -184,10 +189,24 @@ class Database:
                 cwd TEXT DEFAULT '',
                 tmux_session TEXT DEFAULT '',
                 detail TEXT DEFAULT '',
+                name TEXT DEFAULT '',
+                host TEXT DEFAULT '',
+                bridge_incarnation TEXT,
+                last_seen INTEGER DEFAULT 0,
                 created_at INTEGER DEFAULT 0,
                 updated_at INTEGER DEFAULT 0
             )
         """)
+        cursor = await self._db.execute("PRAGMA table_info(pi_sessions)")
+        pi_session_cols = {row[1] for row in await cursor.fetchall()}
+        for column, declaration in {
+            "name": "TEXT DEFAULT ''",
+            "host": "TEXT DEFAULT ''",
+            "bridge_incarnation": "TEXT",
+            "last_seen": "INTEGER DEFAULT 0",
+        }.items():
+            if column not in pi_session_cols:
+                await self._db.execute(f"ALTER TABLE pi_sessions ADD COLUMN {column} {declaration}")
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS pi_session_events (
                 id TEXT PRIMARY KEY,
@@ -197,6 +216,22 @@ class Database:
                 created_at INTEGER DEFAULT 0
             )
         """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS pi_session_commands (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES pi_sessions(id),
+                kind TEXT NOT NULL DEFAULT 'prompt',
+                message TEXT NOT NULL,
+                deliver_as TEXT NOT NULL DEFAULT 'followUp',
+                created_at INTEGER DEFAULT 0,
+                claimed_at INTEGER DEFAULT 0,
+                claimed_by TEXT DEFAULT '',
+                delivered_at INTEGER DEFAULT 0
+            )
+        """)
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pi_commands_pending ON pi_session_commands(session_id, delivered_at, created_at)"
+        )
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS pi_delegations (
                 id TEXT PRIMARY KEY,
@@ -330,16 +365,22 @@ class Database:
             id=row["id"], worker_id=row["worker_id"], parent_session_id=row["parent_session_id"],
             session_type=PiSessionType(row["session_type"]), state=PiSessionState(row["state"]),
             task=row["task"], cwd=row["cwd"], tmux_session=row["tmux_session"], detail=row["detail"],
+            name=row["name"] if "name" in row.keys() else "",
+            host=row["host"] if "host" in row.keys() else "",
+            bridge_incarnation=row["bridge_incarnation"] if "bridge_incarnation" in row.keys() else None,
+            last_seen=row["last_seen"] if "last_seen" in row.keys() else 0,
             created_at=row["created_at"], updated_at=row["updated_at"],
         )
 
     async def insert_pi_session(self, session: PiSession) -> None:
         await self._db.execute(
             """INSERT INTO pi_sessions
-               (id, worker_id, parent_session_id, session_type, state, task, cwd, tmux_session, detail, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, worker_id, parent_session_id, session_type, state, task, cwd, tmux_session, detail,
+                name, host, bridge_incarnation, last_seen, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (session.id, session.worker_id, session.parent_session_id, session.session_type.value,
              session.state.value, session.task, session.cwd, session.tmux_session, session.detail,
+             session.name, session.host, session.bridge_incarnation, session.last_seen,
              session.created_at, session.updated_at),
         )
         await self._db.commit()
@@ -347,9 +388,10 @@ class Database:
     async def update_pi_session(self, session: PiSession) -> None:
         await self._db.execute(
             """UPDATE pi_sessions SET worker_id=?, parent_session_id=?, session_type=?, state=?, task=?, cwd=?,
-               tmux_session=?, detail=?, updated_at=? WHERE id=?""",
+               tmux_session=?, detail=?, name=?, host=?, bridge_incarnation=?, last_seen=?, updated_at=? WHERE id=?""",
             (session.worker_id, session.parent_session_id, session.session_type.value, session.state.value,
-             session.task, session.cwd, session.tmux_session, session.detail, session.updated_at, session.id),
+             session.task, session.cwd, session.tmux_session, session.detail, session.name, session.host,
+             session.bridge_incarnation, session.last_seen, session.updated_at, session.id),
         )
         await self._db.commit()
 
@@ -367,6 +409,167 @@ class Database:
             rows = await self._db.execute_fetchall("SELECT * FROM pi_sessions ORDER BY updated_at DESC")
         return [self._row_to_pi_session(row) for row in rows]
 
+    async def register_interactive_pi_session(self, payload: PiBridgeRegister, now: int | None = None) -> PiSession:
+        """Create or replace one plain-Pi bridge incarnation."""
+        now = now if now is not None else int(time.time())
+        async with self._pi_bridge_lock:
+            existing = await self.get_pi_session(payload.session_id)
+            if existing and existing.session_type != PiSessionType.INTERACTIVE:
+                raise ValueError("session id belongs to a non-interactive session")
+            created_at = existing.created_at if existing else now
+            await self._db.execute(
+                """INSERT INTO pi_sessions
+                   (id, worker_id, parent_session_id, session_type, state, task, cwd, tmux_session,
+                    detail, name, host, bridge_incarnation, last_seen, created_at, updated_at)
+                   VALUES (?, NULL, NULL, ?, ?, '', ?, '', '', ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     worker_id=NULL, parent_session_id=NULL, session_type=excluded.session_type,
+                     state=excluded.state, cwd=excluded.cwd, detail='', name=excluded.name,
+                     host=excluded.host, bridge_incarnation=excluded.bridge_incarnation,
+                     last_seen=excluded.last_seen, updated_at=excluded.updated_at""",
+                (
+                    payload.session_id, PiSessionType.INTERACTIVE.value, PiSessionState.IDLE.value,
+                    payload.cwd, payload.name, payload.host, payload.incarnation,
+                    now, created_at, now,
+                ),
+            )
+            # A replacement bridge may reclaim commands whose response was
+            # never acknowledged by the old incarnation.
+            await self._db.execute(
+                """UPDATE pi_session_commands SET claimed_at=0, claimed_by=''
+                   WHERE session_id=? AND delivered_at=0 AND claimed_by!=?""",
+                (payload.session_id, payload.incarnation),
+            )
+            await self._db.commit()
+            session = await self.get_pi_session(payload.session_id)
+            assert session is not None
+            return session
+
+    async def apply_interactive_pi_events(
+        self, session_id: str, payload: PiBridgeEventBatch, now: int | None = None,
+    ) -> tuple[PiSession, list[PiSessionEvent]]:
+        """Apply idempotent events only from the active bridge incarnation."""
+        now = now if now is not None else int(time.time())
+        async with self._pi_bridge_lock:
+            session = await self.get_pi_session(session_id)
+            if not session or session.session_type != PiSessionType.INTERACTIVE:
+                raise KeyError(session_id)
+            if session.bridge_incarnation != payload.incarnation:
+                raise PermissionError("stale bridge incarnation")
+            persisted: list[PiSessionEvent] = []
+            for event in payload.events:
+                event_id = event.id or str(uuid4())
+                created_at = event.created_at or now
+                cursor = await self._db.execute(
+                    """INSERT OR IGNORE INTO pi_session_events
+                       (id, session_id, event_type, payload, created_at) VALUES (?, ?, ?, ?, ?)""",
+                    (event_id, session_id, event.event_type, json.dumps(event.payload), created_at),
+                )
+                if cursor.rowcount:
+                    persisted.append(PiSessionEvent(
+                        id=event_id, session_id=session_id, event_type=event.event_type,
+                        payload=event.payload, created_at=created_at,
+                    ))
+            if payload.state is not None:
+                session.state = payload.state
+            session.detail = payload.detail
+            session.last_seen = now
+            session.updated_at = now
+            await self._db.execute(
+                "UPDATE pi_sessions SET state=?, detail=?, last_seen=?, updated_at=? WHERE id=?",
+                (session.state.value, session.detail, now, now, session_id),
+            )
+            await self._db.commit()
+            return session, persisted
+
+    async def enqueue_pi_session_command(self, command: PiSessionCommand) -> None:
+        await self._db.execute(
+            """INSERT INTO pi_session_commands
+               (id, session_id, kind, message, deliver_as, created_at, claimed_at, claimed_by, delivered_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                command.id, command.session_id, command.kind, command.message, command.deliver_as,
+                command.created_at, command.claimed_at, command.claimed_by, command.delivered_at,
+            ),
+        )
+        await self._db.commit()
+
+    @staticmethod
+    def _row_to_pi_command(row: aiosqlite.Row) -> PiSessionCommand:
+        return PiSessionCommand(
+            id=row["id"], session_id=row["session_id"], kind=row["kind"], message=row["message"],
+            deliver_as=row["deliver_as"], created_at=row["created_at"], claimed_at=row["claimed_at"],
+            claimed_by=row["claimed_by"], delivered_at=row["delivered_at"],
+        )
+
+    async def claim_pi_session_commands(
+        self, session_id: str, incarnation: str, now: int | None = None, lease_seconds: int = 30,
+    ) -> list[PiSessionCommand]:
+        now = now if now is not None else int(time.time())
+        async with self._pi_bridge_lock:
+            session = await self.get_pi_session(session_id)
+            if not session or session.session_type != PiSessionType.INTERACTIVE:
+                raise KeyError(session_id)
+            if session.bridge_incarnation != incarnation:
+                raise PermissionError("stale bridge incarnation")
+            cutoff = now - lease_seconds
+            await self._db.execute(
+                """UPDATE pi_session_commands SET claimed_at=?, claimed_by=?
+                   WHERE session_id=? AND delivered_at=0
+                     AND (claimed_by='' OR claimed_by=? OR claimed_at<=?)""",
+                (now, incarnation, session_id, incarnation, cutoff),
+            )
+            rows = await self._db.execute_fetchall(
+                """SELECT * FROM pi_session_commands
+                   WHERE session_id=? AND delivered_at=0 AND claimed_by=? ORDER BY created_at, rowid""",
+                (session_id, incarnation),
+            )
+            await self._db.commit()
+            return [self._row_to_pi_command(row) for row in rows]
+
+    async def ack_pi_session_command(
+        self, session_id: str, command_id: str, incarnation: str, now: int | None = None,
+    ) -> bool:
+        now = now if now is not None else int(time.time())
+        async with self._pi_bridge_lock:
+            session = await self.get_pi_session(session_id)
+            if not session or session.session_type != PiSessionType.INTERACTIVE:
+                raise KeyError(session_id)
+            if session.bridge_incarnation != incarnation:
+                raise PermissionError("stale bridge incarnation")
+            cursor = await self._db.execute(
+                """UPDATE pi_session_commands SET delivered_at=?
+                   WHERE id=? AND session_id=? AND claimed_by=? AND delivered_at=0""",
+                (now, command_id, session_id, incarnation),
+            )
+            await self._db.commit()
+            return bool(cursor.rowcount)
+
+    async def sweep_stale_interactive_pi_sessions(self, cutoff_ts: int, now: int | None = None) -> list[str]:
+        now = now if now is not None else int(time.time())
+        async with self._pi_bridge_lock:
+            rows = await self._db.execute_fetchall(
+                """SELECT id FROM pi_sessions WHERE session_type=? AND last_seen<?
+                   AND state NOT IN (?, ?)""",
+                (
+                    PiSessionType.INTERACTIVE.value, cutoff_ts,
+                    PiSessionState.STOPPED.value, PiSessionState.FAILED.value,
+                ),
+            )
+            session_ids = [row["id"] for row in rows]
+            for session_id in session_ids:
+                await self._db.execute(
+                    "UPDATE pi_sessions SET state=?, detail=?, updated_at=? WHERE id=?",
+                    (PiSessionState.STOPPED.value, "bridge heartbeat expired", now, session_id),
+                )
+                await self._db.execute(
+                    """INSERT INTO pi_session_events (id, session_id, event_type, payload, created_at)
+                       VALUES (?, ?, 'bridge-stale', '{}', ?)""",
+                    (str(uuid4()), session_id, now),
+                )
+            await self._db.commit()
+            return session_ids
+
     async def insert_pi_session_event(self, event: PiSessionEvent) -> None:
         await self._db.execute(
             "INSERT OR IGNORE INTO pi_session_events (id, session_id, event_type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -383,7 +586,7 @@ class Database:
         replay tolerant. Returns the events actually persisted.
         """
         from uuid import uuid4
-        async with self._db.execute("SELECT id FROM pi_sessions WHERE id=?", (payload.session_id,)) as cursor:
+        async with self._db.execute("SELECT id, state FROM pi_sessions WHERE id=?", (payload.session_id,)) as cursor:
             row = await cursor.fetchone()
         if not row:
             raise KeyError(payload.session_id)
@@ -401,10 +604,23 @@ class Database:
                     created_at=event.created_at or int(time.time()),
                 ))
         if payload.state is not None:
-            await self._db.execute(
-                "UPDATE pi_sessions SET state=?, detail=?, updated_at=? WHERE id=?",
-                (payload.state.value, payload.detail, int(time.time()), payload.session_id),
+            current = PiSessionState(row["state"])
+            # A delayed worker outbox must not resurrect a session after an
+            # orchestrator timeout/cancel made its projection terminal. A
+            # later observed terminal state may refine termination_unknown.
+            may_update = current not in {
+                PiSessionState.STOPPED,
+                PiSessionState.FAILED,
+                PiSessionState.TERMINATION_UNKNOWN,
+            } or (
+                current == PiSessionState.TERMINATION_UNKNOWN
+                and payload.state in {PiSessionState.STOPPED, PiSessionState.FAILED}
             )
+            if may_update:
+                await self._db.execute(
+                    "UPDATE pi_sessions SET state=?, detail=?, updated_at=? WHERE id=?",
+                    (payload.state.value, payload.detail, int(time.time()), payload.session_id),
+                )
         await self._db.commit()
         return persisted
 

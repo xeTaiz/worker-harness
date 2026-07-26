@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from worker_harness.db import Database
 from worker_harness.heartbeat import create_app, create_registration_app, sweep_expired_pi_delegations
 from worker_harness.models import (
+    PiBridgeRegister,
     PiDelegation,
     PiSession,
     PiSessionState,
@@ -89,6 +90,91 @@ class PiSessionsApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         asyncio.run(self.db.close())
         Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_interactive_bridge_register_events_prompt_and_ack(self):
+        session_id = "plain-pi-session"
+        first_incarnation = "incarnation-1"
+        with TestClient(self.app) as client:
+            registered = client.post("/api/v1/pi/bridge/register", json={
+                "session_id": session_id,
+                "incarnation": first_incarnation,
+                "cwd": "/home/dome/project",
+                "name": "project-agent",
+                "host": "archdome",
+            })
+            self.assertEqual(registered.status_code, 200, registered.text)
+            self.assertEqual(registered.json()["session_type"], "interactive")
+            self.assertEqual(registered.json()["state"], "idle")
+
+            event_payload = {
+                "incarnation": first_incarnation,
+                "state": "working",
+                "events": [{"id": "interactive-start", "event_type": "agent-start"}],
+            }
+            first = client.post(f"/api/v1/pi/bridge/{session_id}/events", json=event_payload)
+            replay = client.post(f"/api/v1/pi/bridge/{session_id}/events", json=event_payload)
+            self.assertEqual(first.json()["events_persisted"], 1)
+            self.assertEqual(replay.json()["events_persisted"], 0)
+
+            prompted = client.post(
+                f"/api/v1/pi/sessions/{session_id}:prompt",
+                json={"message": "continue here", "deliver_as": "steer"},
+            )
+            self.assertEqual(prompted.status_code, 200, prompted.text)
+            command_id = prompted.json()["command_id"]
+            commands = client.get(
+                f"/api/v1/pi/bridge/{session_id}/commands",
+                params={"incarnation": first_incarnation, "wait_seconds": 0},
+            )
+            self.assertEqual(commands.status_code, 200, commands.text)
+            self.assertEqual(commands.json()[0]["id"], command_id)
+            self.assertEqual(commands.json()[0]["deliver_as"], "steer")
+            ack = client.post(
+                f"/api/v1/pi/bridge/{session_id}/commands/{command_id}:ack",
+                json={"incarnation": first_incarnation},
+            )
+            self.assertEqual(ack.status_code, 200, ack.text)
+            empty = client.get(
+                f"/api/v1/pi/bridge/{session_id}/commands",
+                params={"incarnation": first_incarnation, "wait_seconds": 0},
+            )
+            self.assertEqual(empty.json(), [])
+
+        session = asyncio.run(self.db.get_pi_session(session_id))
+        self.assertEqual(session.state, PiSessionState.WORKING)
+        events = asyncio.run(self.db.list_pi_session_events(session_id))
+        self.assertEqual(
+            [event.event_type for event in events],
+            ["bridge-registered", "agent-start", "prompt-queued"],
+        )
+
+    def test_interactive_bridge_new_incarnation_rejects_stale_client(self):
+        session_id = "reload-session"
+        with TestClient(self.app) as client:
+            for incarnation in ("old", "new"):
+                response = client.post("/api/v1/pi/bridge/register", json={
+                    "session_id": session_id, "incarnation": incarnation,
+                })
+                self.assertEqual(response.status_code, 200, response.text)
+            stale_event = client.post(f"/api/v1/pi/bridge/{session_id}/events", json={
+                "incarnation": "old", "state": "idle", "events": [],
+            })
+            stale_poll = client.get(
+                f"/api/v1/pi/bridge/{session_id}/commands",
+                params={"incarnation": "old", "wait_seconds": 0},
+            )
+        self.assertEqual(stale_event.status_code, 409, stale_event.text)
+        self.assertEqual(stale_poll.status_code, 409, stale_poll.text)
+
+    def test_stale_interactive_bridge_is_reaped(self):
+        asyncio.run(self.db.register_interactive_pi_session(
+            PiBridgeRegister(session_id="stale-session", incarnation="inc"), now=100,
+        ))
+        reaped = asyncio.run(self.db.sweep_stale_interactive_pi_sessions(101, now=200))
+        self.assertEqual(reaped, ["stale-session"])
+        session = asyncio.run(self.db.get_pi_session("stale-session"))
+        self.assertEqual(session.state, PiSessionState.STOPPED)
+        self.assertEqual(session.detail, "bridge heartbeat expired")
 
     def test_delegate_prompt_cancel_and_event_history(self):
         _RelayClient.calls.clear()
@@ -198,6 +284,31 @@ class PiWorkerIngestTests(unittest.TestCase):
             types = [e.event_type for e in events]
             self.assertIn("idle", types)
             self.assertIn("working", types)
+
+    def test_late_ingest_cannot_resurrect_terminal_projection(self):
+        sid = self._seed_child()
+        session = asyncio.run(self.db.get_pi_session(sid))
+        session.state = PiSessionState.TERMINATION_UNKNOWN
+        session.detail = "timeout unacknowledged"
+        asyncio.run(self.db.update_pi_session(session))
+        with TestClient(self.app) as client:
+            stale = client.post(
+                f"/pi/worker/archdome/sessions/{sid}/events",
+                json={
+                    "session_id": sid,
+                    "state": "working",
+                    "detail": "delayed working report",
+                    "events": [{"id": "late-working", "event_type": "working"}],
+                },
+            )
+            self.assertEqual(stale.status_code, 200, stale.text)
+        unchanged = asyncio.run(self.db.get_pi_session(sid))
+        self.assertEqual(unchanged.state, PiSessionState.TERMINATION_UNKNOWN)
+        self.assertEqual(unchanged.detail, "timeout unacknowledged")
+        self.assertEqual(
+            [event.id for event in asyncio.run(self.db.list_pi_session_events(sid))],
+            ["late-working"],
+        )
 
     def test_ingest_deduplicates_retried_event_ids(self):
         sid = self._seed_child()

@@ -8,7 +8,7 @@ import logging
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, TypeVar
+from typing import Awaitable, Callable, Literal, TypeVar
 from uuid import uuid4
 
 import httpx
@@ -34,9 +34,12 @@ from .metrics import Metrics, set_global_metrics
 from .models import (
     JobKind,
     JobStatus,
+    PiBridgeEventBatch,
+    PiBridgeRegister,
     PiDelegation,
     PiIngestPayload,
     PiSession,
+    PiSessionCommand,
     PiSessionEvent,
     PiSessionState,
     PiSessionType,
@@ -108,6 +111,11 @@ class PiDelegationCreateRequest(BaseModel):
 
 class PiPromptRequest(BaseModel):
     message: str
+    deliver_as: Literal["steer", "followUp"] = "followUp"
+
+
+class PiCommandAck(BaseModel):
+    incarnation: str
 
 
 # Timeout gate (spec §8.1): an expired delegation is cancelled through the
@@ -396,6 +404,65 @@ def create_app(db: Database) -> FastAPI:
         await invalidate_workers_cache()
         return {"removed": removed, "minutes": minutes}
 
+    @app.post("/api/v1/pi/bridge/register")
+    async def pi_bridge_register(payload: PiBridgeRegister):
+        now = int(datetime.now(timezone.utc).timestamp())
+        try:
+            session = await db.register_interactive_pi_session(payload, now=now)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await db.insert_pi_session_event(PiSessionEvent(
+            session_id=session.id,
+            event_type="bridge-registered",
+            payload={"incarnation": payload.incarnation, "host": payload.host},
+            created_at=now,
+        ))
+        return session.model_dump(mode="json")
+
+    @app.post("/api/v1/pi/bridge/{session_id}/events")
+    async def pi_bridge_events(session_id: str, payload: PiBridgeEventBatch):
+        try:
+            session, persisted = await db.apply_interactive_pi_events(session_id, payload)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="interactive Pi session not found") from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "session_id": session.id,
+            "state": session.state.value,
+            "events_persisted": len(persisted),
+        }
+
+    @app.get("/api/v1/pi/bridge/{session_id}/commands")
+    async def pi_bridge_commands(
+        session_id: str,
+        incarnation: str,
+        wait_seconds: float = Query(20.0, ge=0.0, le=30.0),
+    ):
+        deadline = asyncio.get_running_loop().time() + wait_seconds
+        while True:
+            try:
+                commands = await db.claim_pi_session_commands(session_id, incarnation)
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail="interactive Pi session not found") from exc
+            except PermissionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if commands or asyncio.get_running_loop().time() >= deadline:
+                return [command.model_dump(mode="json") for command in commands]
+            await asyncio.sleep(min(0.5, max(0.01, deadline - asyncio.get_running_loop().time())))
+
+    @app.post("/api/v1/pi/bridge/{session_id}/commands/{command_id}:ack")
+    async def pi_bridge_command_ack(session_id: str, command_id: str, payload: PiCommandAck):
+        try:
+            acknowledged = await db.ack_pi_session_command(session_id, command_id, payload.incarnation)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="interactive Pi session not found") from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not acknowledged:
+            raise HTTPException(status_code=404, detail="pending command not found")
+        return {"acknowledged": True, "command_id": command_id}
+
     @app.get("/api/v1/pi/sessions")
     async def pi_sessions_list(worker_id: str | None = None):
         return [session.model_dump(mode="json") for session in await db.list_pi_sessions(worker_id)]
@@ -543,8 +610,10 @@ def create_app(db: Database) -> FastAPI:
         while True:
             try:
                 await sweep_expired_pi_delegations(db, worker_relay_request)
+                now = int(datetime.now(timezone.utc).timestamp())
+                await db.sweep_stale_interactive_pi_sessions(now - 90, now=now)
             except Exception:
-                log.exception("Pi delegation sweeper iteration failed")
+                log.exception("Pi session sweeper iteration failed")
             await asyncio.sleep(30)
 
     app.state.pi_delegation_sweeper = _pi_delegation_sweeper
@@ -559,7 +628,27 @@ def create_app(db: Database) -> FastAPI:
     @app.post("/api/v1/pi/sessions/{session_id}:prompt")
     async def pi_session_prompt(session_id: str, payload: PiPromptRequest):
         session = await db.get_pi_session(session_id)
-        if not session or not session.worker_id:
+        if not session:
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        now = int(datetime.now(timezone.utc).timestamp())
+        if session.session_type == PiSessionType.INTERACTIVE:
+            if not session.bridge_incarnation or session.state in {PiSessionState.STOPPED, PiSessionState.FAILED}:
+                raise HTTPException(status_code=409, detail="interactive Pi bridge is not active")
+            command = PiSessionCommand(
+                session_id=session.id,
+                message=payload.message,
+                deliver_as=payload.deliver_as,
+                created_at=now,
+            )
+            await db.enqueue_pi_session_command(command)
+            await db.insert_pi_session_event(PiSessionEvent(
+                session_id=session.id,
+                event_type="prompt-queued",
+                payload={"command_id": command.id, "deliver_as": payload.deliver_as},
+                created_at=now,
+            ))
+            return {**session.model_dump(mode="json"), "command_id": command.id}
+        if not session.worker_id:
             raise HTTPException(status_code=404, detail="Pi session not found")
         worker = await db.get_worker(session.worker_id)
         if not worker:

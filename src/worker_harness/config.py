@@ -24,6 +24,8 @@ class HeartbeatConfig(BaseModel):
 class ControlConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 12889
+    # Operator clients may override this with the Tailnet control URL.
+    url: str = "http://127.0.0.1:12889"
 
 
 class LoggingConfig(BaseModel):
@@ -54,6 +56,7 @@ class Config(BaseModel):
             control=ControlConfig(
                 host=os.environ.get("WH_CONTROL_HOST", "0.0.0.0"),
                 port=int(os.environ.get("WH_CONTROL_PORT", "12889")),
+                url=os.environ.get("WH_ORCHESTRATOR_URL", "http://127.0.0.1:12889").rstrip("/"),
             ),
             logging=LoggingConfig(
                 level=os.environ.get("WH_LOG_LEVEL", "INFO"),

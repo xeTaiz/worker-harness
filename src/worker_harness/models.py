@@ -191,6 +191,11 @@ class PiSession(BaseModel):
     cwd: str = ""
     tmux_session: str = ""
     detail: str = ""
+    # Interactive bridge metadata. Delegated sessions leave these empty.
+    name: str = ""
+    host: str = ""
+    bridge_incarnation: str | None = None
+    last_seen: int = 0
     created_at: int = 0
     updated_at: int = 0
 
@@ -219,6 +224,35 @@ class PiIngestPayload(BaseModel):
     state: PiSessionState | None = None
     detail: str = ""
     events: list[PiIngestEvent] = Field(default_factory=list)
+
+
+class PiBridgeRegister(BaseModel):
+    """Registration from an ordinary non-worker Pi extension."""
+
+    session_id: str = Field(min_length=1, max_length=128)
+    incarnation: str = Field(min_length=1, max_length=128)
+    cwd: str = Field(default="", max_length=4096)
+    name: str = Field(default="", max_length=256)
+    host: str = Field(default="", max_length=256)
+
+
+class PiBridgeEventBatch(BaseModel):
+    incarnation: str = Field(min_length=1, max_length=128)
+    state: PiSessionState | None = None
+    detail: str = Field(default="", max_length=4096)
+    events: list[PiIngestEvent] = Field(default_factory=list)
+
+
+class PiSessionCommand(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    session_id: str
+    kind: str = "prompt"
+    message: str
+    deliver_as: str = "followUp"
+    created_at: int = 0
+    claimed_at: int = 0
+    claimed_by: str = ""
+    delivered_at: int = 0
 
 
 class PiDelegation(BaseModel):
