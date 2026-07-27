@@ -1,5 +1,9 @@
-const CACHE = "wh-pi-shell-v6";
-const SHELL = ["/", "/index.html", "/app.css", "/app.js", "/manifest.webmanifest", "/icon.svg", "/icon-maskable.svg"];
+const CACHE = "wh-pi-shell-v7";
+const SHELL = [
+  "/", "/index.html", "/app.css", "/app.js", "/manifest.webmanifest", "/icon.svg", "/icon-maskable.svg",
+  "/vendor/marked/marked.umd.js", "/vendor/dompurify/purify.min.js",
+  "/vendor/katex/katex.min.js", "/vendor/katex/auto-render.min.js", "/vendor/katex/katex.min.css",
+];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting()));

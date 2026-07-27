@@ -101,6 +101,8 @@ class PiSessionsApiTests(unittest.TestCase):
             page = client.get("/")
             manifest = client.get("/manifest.webmanifest")
             script = client.get("/app.js")
+            marked = client.get("/vendor/marked/marked.umd.js")
+            katex_css = client.get("/vendor/katex/katex.min.css")
         self.assertEqual(page.status_code, 200)
         self.assertIn("Pi sessions", page.text)
         self.assertEqual(manifest.status_code, 200)
@@ -108,6 +110,10 @@ class PiSessionsApiTests(unittest.TestCase):
         self.assertIn("EventSource", script.text)
         self.assertIn("new WebSocket", script.text)
         self.assertIn("attach-info", script.text)
+        self.assertIn("DOMPurify", script.text)
+        self.assertIn("renderMathInElement", script.text)
+        self.assertEqual(marked.status_code, 200)
+        self.assertEqual(katex_css.status_code, 200)
 
     def test_interactive_bridge_register_events_prompt_and_ack(self):
         session_id = "plain-pi-session"

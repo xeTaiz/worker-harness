@@ -678,6 +678,84 @@ function messageText(item) {
   return [...item.chunks.entries()].sort((a, b) => a[0] - b[0]).map((entry) => entry[1]).join("");
 }
 
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const input = document.createElement("textarea");
+  input.value = text;
+  input.setAttribute("readonly", "");
+  input.style.position = "fixed";
+  input.style.opacity = "0";
+  document.body.append(input);
+  input.select();
+  const copied = document.execCommand("copy");
+  input.remove();
+  if (!copied) throw new Error("Copy is unavailable in this browser");
+}
+
+function renderMarkdown(target, source) {
+  const markedApi = globalThis.marked;
+  const purifier = globalThis.DOMPurify;
+  if (!markedApi?.parse || !purifier?.sanitize) {
+    target.textContent = source;
+    return;
+  }
+  try {
+    const parsed = markedApi.parse(source, { gfm: true, breaks: true });
+    target.innerHTML = purifier.sanitize(parsed, {
+      USE_PROFILES: { html: true },
+      FORBID_TAGS: ["style", "img", "form", "input", "textarea", "select", "button", "iframe", "object", "embed"],
+    });
+    for (const link of target.querySelectorAll("a[href]")) {
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+    }
+    if (typeof globalThis.renderMathInElement === "function") {
+      globalThis.renderMathInElement(target, {
+        delimiters: [
+          { left: "$$", right: "$$", display: true },
+          { left: "\\[", right: "\\]", display: true },
+          { left: "\\(", right: "\\)", display: false },
+          { left: "$", right: "$", display: false },
+        ],
+        ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code", "option"],
+        throwOnError: false,
+        trust: false,
+        strict: "ignore",
+        maxExpand: 1000,
+      });
+    }
+    for (const pre of target.querySelectorAll("pre")) {
+      const code = pre.querySelector(":scope > code");
+      if (!code) continue;
+      const language = [...code.classList]
+        .find((name) => name.startsWith("language-"))
+        ?.slice("language-".length) || "code";
+      const wrapper = node("div", "markdown-code-block");
+      const toolbar = node("div", "markdown-code-toolbar");
+      const copy = node("button", "markdown-copy", "Copy");
+      copy.type = "button";
+      copy.setAttribute("aria-label", `Copy ${language} code`);
+      copy.addEventListener("click", async () => {
+        try {
+          await copyText(code.textContent || "");
+          copy.textContent = "Copied";
+        } catch {
+          copy.textContent = "Copy failed";
+        }
+        setTimeout(() => { copy.textContent = "Copy"; }, 1500);
+      });
+      toolbar.append(node("span", "markdown-code-language", language), copy);
+      pre.replaceWith(wrapper);
+      wrapper.append(toolbar, pre);
+    }
+  } catch {
+    target.textContent = source;
+  }
+}
+
 function safeJson(value) {
   try {
     const text = JSON.stringify(value, null, 2);
@@ -725,7 +803,9 @@ function renderTranscript() {
         ));
       } else {
         bubble.append(node("div", "message-role", item.role || "assistant"));
-        bubble.append(node("p", "message-text", text || "…"));
+        const body = node("div", "message-text markdown-body");
+        renderMarkdown(body, text || "…");
+        bubble.append(body);
       }
       const metaBits = [item.model, item.done ? item.stopReason : "streaming"].filter(Boolean);
       if (item.errorMessage) metaBits.push(item.errorMessage);
