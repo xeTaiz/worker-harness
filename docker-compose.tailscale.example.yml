@@ -17,6 +17,10 @@ services:
       WH_DB_PATH: /data/db.sqlite
     volumes:
       - orchestrator-db:/data
+      # Preserve the Tailnet node identity/IP across image replacement. Without
+      # this mount, every recreated container enrolls as a new orchestrator and
+      # clients may temporarily cache its previous MagicDNS address.
+      - orchestrator-tailscale:/var/lib/tailscale
     cap_add:
       - NET_ADMIN
     devices:
@@ -44,3 +48,4 @@ services:
 
 volumes:
   orchestrator-db:
+  orchestrator-tailscale:

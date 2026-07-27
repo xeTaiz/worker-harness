@@ -47,6 +47,8 @@ docker run -d \
   --restart unless-stopped \
   --cap-add NET_ADMIN \
   --device /dev/net/tun:/dev/net/tun \
+  -v worker-harness-orchestrator-tailscale:/var/lib/tailscale \
+  -v worker-harness-orchestrator-data:/root/.config/worker-harness \
   -e TS_AUTHKEY='<ORCH_TS_AUTHKEY>' \
   worker-harness/orchestrator:latest
 ```
@@ -59,9 +61,18 @@ podman run -d \
   --restart unless-stopped \
   --cap-add NET_ADMIN \
   --device /dev/net/tun:/dev/net/tun \
+  -v worker-harness-orchestrator-tailscale:/var/lib/tailscale \
+  -v worker-harness-orchestrator-data:/root/.config/worker-harness \
   -e TS_AUTHKEY='<ORCH_TS_AUTHKEY>' \
   worker-harness/orchestrator:latest
 ```
+
+Both orchestrator volumes are required for replacement-safe deployments. The
+Tailscale volume preserves the node identity, IP, and stable MagicDNS routing;
+the data volume preserves the SQLite worker/session/event registry. Omitting
+them creates a fresh Tailnet node and database whenever the container is
+recreated, causing transient browser DNS failures and requiring live bridges
+and workers to repopulate the registry.
 
 Run worker (required envs: `TS_AUTHKEY`, `ORCHESTRATOR_HOST`):
 
