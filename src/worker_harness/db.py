@@ -250,12 +250,19 @@ class Database:
                 kind TEXT NOT NULL DEFAULT 'prompt',
                 message TEXT NOT NULL,
                 deliver_as TEXT NOT NULL DEFAULT 'followUp',
+                payload TEXT NOT NULL DEFAULT '{}',
                 created_at INTEGER DEFAULT 0,
                 claimed_at INTEGER DEFAULT 0,
                 claimed_by TEXT DEFAULT '',
                 delivered_at INTEGER DEFAULT 0
             )
         """)
+        cursor = await self._db.execute("PRAGMA table_info(pi_session_commands)")
+        pi_command_cols = {row[1] for row in await cursor.fetchall()}
+        if "payload" not in pi_command_cols:
+            await self._db.execute(
+                "ALTER TABLE pi_session_commands ADD COLUMN payload TEXT NOT NULL DEFAULT '{}'"
+            )
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_pi_commands_pending ON pi_session_commands(session_id, delivered_at, created_at)"
         )
@@ -512,11 +519,12 @@ class Database:
     async def enqueue_pi_session_command(self, command: PiSessionCommand) -> None:
         await self._db.execute(
             """INSERT INTO pi_session_commands
-               (id, session_id, kind, message, deliver_as, created_at, claimed_at, claimed_by, delivered_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, session_id, kind, message, deliver_as, payload, created_at, claimed_at, claimed_by, delivered_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 command.id, command.session_id, command.kind, command.message, command.deliver_as,
-                command.created_at, command.claimed_at, command.claimed_by, command.delivered_at,
+                json.dumps(command.payload), command.created_at, command.claimed_at,
+                command.claimed_by, command.delivered_at,
             ),
         )
         await self._db.commit()
@@ -525,7 +533,8 @@ class Database:
     def _row_to_pi_command(row: aiosqlite.Row) -> PiSessionCommand:
         return PiSessionCommand(
             id=row["id"], session_id=row["session_id"], kind=row["kind"], message=row["message"],
-            deliver_as=row["deliver_as"], created_at=row["created_at"], claimed_at=row["claimed_at"],
+            deliver_as=row["deliver_as"], payload=json.loads(row["payload"] or "{}"),
+            created_at=row["created_at"], claimed_at=row["claimed_at"],
             claimed_by=row["claimed_by"], delivered_at=row["delivered_at"],
         )
 

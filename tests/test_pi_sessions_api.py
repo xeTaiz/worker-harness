@@ -162,14 +162,29 @@ class PiSessionsApiTests(unittest.TestCase):
             )
             self.assertEqual([event["sequence"] for event in replayed.json()], [2, 3])
 
+            configured = client.post(
+                f"/api/v1/pi/sessions/{session_id}:configure",
+                json={"provider": "openai-codex", "model": "gpt-5.6-luna", "thinking_level": "high"},
+            )
+            self.assertEqual(configured.status_code, 200, configured.text)
+            control_commands = client.get(
+                f"/api/v1/pi/bridge/{session_id}/commands",
+                params={"incarnation": first_incarnation, "wait_seconds": 0},
+            ).json()
+            self.assertEqual(control_commands[0]["kind"], "configure")
+            self.assertEqual(control_commands[0]["message"], "")
+            self.assertEqual(control_commands[0]["payload"], {
+                "provider": "openai-codex", "model": "gpt-5.6-luna", "thinking_level": "high",
+            })
+
         session = asyncio.run(self.db.get_pi_session(session_id))
         self.assertEqual(session.state, PiSessionState.WORKING)
         events = asyncio.run(self.db.list_pi_session_events(session_id))
         self.assertEqual(
             [event.event_type for event in events],
-            ["bridge-registered", "agent-start", "prompt-queued"],
+            ["bridge-registered", "agent-start", "prompt-queued", "configure-queued"],
         )
-        self.assertEqual([event.sequence for event in events], [1, 2, 3])
+        self.assertEqual([event.sequence for event in events], [1, 2, 3, 4])
 
     def test_pi_session_sse_replays_from_durable_cursor(self):
         session_id = "stream-session"
@@ -248,6 +263,11 @@ class PiSessionsApiTests(unittest.TestCase):
             prompted = client.post(f"/api/v1/pi/sessions/{child}:prompt", json={"message": "continue"})
             self.assertEqual(prompted.status_code, 200)
             self.assertEqual(prompted.json()["state"], "working")
+
+            unsupported = client.post(
+                f"/api/v1/pi/sessions/{child}:configure", json={"thinking_level": "low"},
+            )
+            self.assertEqual(unsupported.status_code, 409, unsupported.text)
 
             cancelled = client.post(f"/api/v1/pi/sessions/{child}:cancel")
             self.assertEqual(cancelled.status_code, 200)

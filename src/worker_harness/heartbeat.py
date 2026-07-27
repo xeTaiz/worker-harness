@@ -117,6 +117,12 @@ class PiPromptRequest(BaseModel):
     deliver_as: Literal["steer", "followUp"] = "followUp"
 
 
+class PiConfigureRequest(BaseModel):
+    provider: str | None = None
+    model: str | None = None
+    thinking_level: Literal["off", "minimal", "low", "medium", "high", "xhigh", "max"] | None = None
+
+
 class PiCommandAck(BaseModel):
     incarnation: str
 
@@ -716,6 +722,45 @@ def create_app(db: Database) -> FastAPI:
             session_id=session.id, event_type="prompt", payload={"message": payload.message}, created_at=session.updated_at
         ))
         return session.model_dump(mode="json")
+
+    @app.post("/api/v1/pi/sessions/{session_id}:configure")
+    async def pi_session_configure(session_id: str, payload: PiConfigureRequest):
+        session = await db.get_pi_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        if session.session_type != PiSessionType.INTERACTIVE:
+            raise HTTPException(status_code=409, detail="model controls require an interactive Pi bridge")
+        if not session.bridge_incarnation or session.state in {PiSessionState.STOPPED, PiSessionState.FAILED}:
+            raise HTTPException(status_code=409, detail="interactive Pi bridge is not active")
+        if bool(payload.provider) != bool(payload.model):
+            raise HTTPException(status_code=422, detail="provider and model must be set together")
+        if not payload.provider and not payload.thinking_level:
+            raise HTTPException(status_code=422, detail="model or thinking_level is required")
+        for value, label in ((payload.provider, "provider"), (payload.model, "model")):
+            if value and (len(value) > 256 or not value.strip()):
+                raise HTTPException(status_code=422, detail=f"invalid {label}")
+        now = int(datetime.now(timezone.utc).timestamp())
+        command_payload = {
+            **(
+                {"provider": payload.provider.strip(), "model": payload.model.strip()}
+                if payload.provider and payload.model else {}
+            ),
+            **({"thinking_level": payload.thinking_level} if payload.thinking_level else {}),
+        }
+        command = PiSessionCommand(
+            session_id=session.id,
+            kind="configure",
+            payload=command_payload,
+            created_at=now,
+        )
+        await db.enqueue_pi_session_command(command)
+        await db.insert_pi_session_event(PiSessionEvent(
+            session_id=session.id,
+            event_type="configure-queued",
+            payload={"command_id": command.id, **command_payload},
+            created_at=now,
+        ))
+        return {"command_id": command.id, "queued": True}
 
     @app.post("/api/v1/pi/sessions/{session_id}:cancel")
     async def pi_session_cancel(session_id: str):

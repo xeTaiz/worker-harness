@@ -5,6 +5,10 @@ const sessionList = $("#session-list");
 const emptyState = $("#empty-state");
 const transcript = $("#transcript");
 const meta = $("#session-meta");
+const sessionControls = $("#session-controls");
+const modelControl = $("#model-control");
+const thinkingControl = $("#thinking-control");
+const controlStatus = $("#control-status");
 const backButton = $("#back");
 const refreshButton = $("#refresh");
 const title = $("#page-title");
@@ -25,6 +29,8 @@ const state = {
   source: null,
   timeline: [],
   items: new Map(),
+  expanded: new Set(),
+  settings: null,
   followLatest: true,
   installPrompt: null,
 };
@@ -142,6 +148,28 @@ function renderSessionHeader() {
   for (const value of [state.selected.host, state.selected.cwd, state.selected.worker_id && `worker ${state.selected.worker_id.slice(0, 8)}`].filter(Boolean)) {
     meta.append(node("span", "meta-chip", value));
   }
+  renderSessionControls();
+}
+
+function renderSessionControls() {
+  const available = state.selected?.session_type === "interactive" && state.settings;
+  sessionControls.classList.toggle("hidden", !available);
+  if (!available) return;
+  const selectedValue = `${state.settings.provider}::${state.settings.model}`;
+  modelControl.replaceChildren();
+  for (const model of state.settings.available_models || []) {
+    const option = node("option", "", model.name || `${model.provider}/${model.id}`);
+    option.value = `${model.provider}::${model.id}`;
+    option.selected = option.value === selectedValue;
+    modelControl.append(option);
+  }
+  if (![...modelControl.options].some((option) => option.value === selectedValue) && state.settings.model) {
+    const current = node("option", "", `${state.settings.provider}/${state.settings.model}`);
+    current.value = selectedValue;
+    current.selected = true;
+    modelControl.prepend(current);
+  }
+  thinkingControl.value = state.settings.thinking_level || "off";
 }
 
 async function openSession(id) {
@@ -154,6 +182,10 @@ async function openSession(id) {
   state.cursor = 0;
   state.timeline = [];
   state.items.clear();
+  state.expanded.clear();
+  state.settings = null;
+  sessionControls.classList.add("hidden");
+  controlStatus.textContent = "";
   state.followLatest = true;
   setConnection("connecting");
   try {
@@ -234,11 +266,31 @@ function applyEvent(event) {
     item.role = message.role || item.role;
     item.timestamp = message.timestamp || item.timestamp;
     item.content = Array.isArray(message.content) ? message.content : [];
+    item.toolName = message.toolName;
     item.provider = message.provider;
     item.model = message.model;
     item.stopReason = message.stopReason;
     item.errorMessage = message.errorMessage;
     item.done = true;
+    return;
+  }
+  if (event.event_type === "session-settings") {
+    state.settings = {
+      provider: String(payload.provider || ""),
+      model: String(payload.model || ""),
+      thinking_level: String(payload.thinking_level || "off"),
+      available_models: Array.isArray(payload.available_models) ? payload.available_models : [],
+    };
+    renderSessionControls();
+    controlStatus.textContent = "";
+    modelControl.disabled = false;
+    thinkingControl.disabled = false;
+    return;
+  }
+  if (event.event_type === "control-error") {
+    controlStatus.textContent = String(payload.detail || "Control change failed");
+    modelControl.disabled = false;
+    thinkingControl.disabled = false;
     return;
   }
   if (event.event_type === "tool-start" || event.event_type === "tool-end") {
@@ -265,10 +317,7 @@ function messageText(item) {
   if (item.done) {
     return item.content.map((block) => {
       if (block?.type === "text") return String(block.text || "");
-      if (block?.type === "toolCall") {
-        const args = block.arguments === undefined ? "" : `\n${safeJson(block.arguments)}`;
-        return `↳ ${block.name || "tool"}${args}`;
-      }
+      if (block?.type === "toolCall") return `↳ ${block.name || "tool"}`;
       if (block?.type === "image") return `[image${block.mimeType ? `: ${block.mimeType}` : ""}]`;
       return "";
     }).filter(Boolean).join("\n\n");
@@ -281,6 +330,24 @@ function safeJson(value) {
     const text = JSON.stringify(value, null, 2);
     return text.length > 8000 ? `${text.slice(0, 8000)}\n…` : text;
   } catch { return String(value); }
+}
+
+function previewText(value, limit = 140) {
+  const compact = String(value || "").replace(/\s+/g, " ").trim();
+  return compact.length > limit ? `${compact.slice(0, limit)}…` : compact || "No output";
+}
+
+function compactDetails(id, label, preview, fullText) {
+  const details = node("details", "compact-details");
+  details.open = state.expanded.has(id);
+  details.addEventListener("toggle", () => {
+    if (details.open) state.expanded.add(id);
+    else state.expanded.delete(id);
+  });
+  const summary = node("summary");
+  summary.append(node("strong", "", label), node("span", "compact-preview", preview));
+  details.append(summary, node("pre", "compact-full", fullText));
+  return details;
 }
 
 function renderTranscript() {
@@ -296,8 +363,17 @@ function renderTranscript() {
       const text = messageText(item);
       if (!text && item.done) continue;
       const bubble = node("div", `message ${item.role || "assistant"}`);
-      bubble.append(node("div", "message-role", item.role === "toolResult" ? "tool result" : item.role || "assistant"));
-      bubble.append(node("p", "message-text", text || "…"));
+      if (item.role === "toolResult") {
+        bubble.append(compactDetails(
+          item.id,
+          `${item.toolName || "tool"} response`,
+          previewText(text),
+          text || "No output",
+        ));
+      } else {
+        bubble.append(node("div", "message-role", item.role || "assistant"));
+        bubble.append(node("p", "message-text", text || "…"));
+      }
       const metaBits = [item.model, item.done ? item.stopReason : "streaming"].filter(Boolean);
       if (item.errorMessage) metaBits.push(item.errorMessage);
       if (metaBits.length) bubble.append(node("div", "message-meta", metaBits.join(" · ")));
@@ -305,10 +381,13 @@ function renderTranscript() {
     } else if (item.kind === "tool") {
       const card = node("div", `tool-card ${item.error ? "error" : ""}`);
       card.append(node("span", "", item.done ? (item.error ? "×" : "✓") : "◌"));
-      const details = node("div");
-      details.append(node("strong", "", item.name));
-      if (item.args !== undefined) details.append(node("div", "message-meta", safeJson(item.args)));
-      card.append(details);
+      const args = item.args === undefined ? "No arguments" : safeJson(item.args);
+      card.append(compactDetails(
+        item.id,
+        item.name,
+        item.args === undefined ? (item.done ? "completed" : "running") : previewText(args),
+        args,
+      ));
       wrapper.append(card);
     } else {
       const label = item.detail ? `${item.type} · ${item.detail}` : item.type;
@@ -342,6 +421,36 @@ function route() {
   if (match) openSession(decodeURIComponent(match[1]));
   else closeDetail();
 }
+
+async function queueConfiguration(payload) {
+  if (!state.selected) return;
+  modelControl.disabled = true;
+  thinkingControl.disabled = true;
+  controlStatus.textContent = "Applying…";
+  try {
+    await api(`/api/v1/pi/sessions/${encodeURIComponent(state.selected.id)}:configure`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    controlStatus.textContent = "Queued";
+  } catch (error) {
+    controlStatus.textContent = `Failed: ${error.message}`;
+    modelControl.disabled = false;
+    thinkingControl.disabled = false;
+  }
+}
+
+modelControl.addEventListener("change", () => {
+  const separator = modelControl.value.indexOf("::");
+  if (separator < 1) return;
+  void queueConfiguration({
+    provider: modelControl.value.slice(0, separator),
+    model: modelControl.value.slice(separator + 2),
+  });
+});
+thinkingControl.addEventListener("change", () => {
+  void queueConfiguration({ thinking_level: thinkingControl.value });
+});
 
 composer.addEventListener("submit", async (event) => {
   event.preventDefault();

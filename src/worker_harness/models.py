@@ -249,8 +249,9 @@ class PiSessionCommand(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     session_id: str
     kind: str = "prompt"
-    message: str
+    message: str = ""
     deliver_as: str = "followUp"
+    payload: dict[str, Any] = Field(default_factory=dict)
     created_at: int = 0
     claimed_at: int = 0
     claimed_by: str = ""

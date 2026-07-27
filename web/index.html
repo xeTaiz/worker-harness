@@ -43,6 +43,25 @@
 
     <main id="session-detail-view" class="view detail-view hidden">
       <section id="session-meta" class="session-meta"></section>
+      <section id="session-controls" class="session-controls hidden" aria-label="Session controls">
+        <label>
+          <span>Model</span>
+          <select id="model-control" aria-label="Model"></select>
+        </label>
+        <label>
+          <span>Thinking</span>
+          <select id="thinking-control" aria-label="Thinking level">
+            <option value="off">Off</option>
+            <option value="minimal">Minimal</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="xhigh">Extra high</option>
+            <option value="max">Max</option>
+          </select>
+        </label>
+        <span id="control-status" class="control-status" role="status"></span>
+      </section>
       <section id="transcript" class="transcript" aria-live="polite" aria-label="Session transcript"></section>
       <button id="jump-latest" class="jump-latest hidden">↓ Latest</button>
       <form id="composer" class="composer">
