@@ -337,9 +337,15 @@ def create_app(db: Database) -> FastAPI:
 
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next):
-        # Worker heartbeat registration and /health are infrastructure traffic,
-        # not agent traffic. Rate-limit only the orchestration API.
-        if request.url.path.startswith("/api/v1/"):
+        # Bridge registration, lifecycle uploads, transcript batches, and
+        # command long-polls are infrastructure traffic. Several Pi sessions
+        # legitimately share one Tailnet source IP, and one streaming turn can
+        # upload more than the operator API's 60 req/min budget. Bridge routes
+        # validate the active session incarnation instead of consuming the
+        # peer-IP agent bucket; expensive operator routes remain rate-limited.
+        path = request.url.path
+        is_pi_bridge = path.startswith("/api/v1/pi/bridge/")
+        if path.startswith("/api/v1/") and not is_pi_bridge:
             peer_ip = request.client.host if request.client else "unknown"
             agent = resolve_agent_name(dict(request.headers), peer_ip)
             try:

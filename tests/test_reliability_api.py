@@ -54,6 +54,17 @@ class ReliabilityApiTests(unittest.TestCase):
             self.assertEqual(limited.status_code, 429)
             self.assertIn("Retry-After", limited.headers)
 
+            # Pi bridge traffic is incarnation-scoped infrastructure, not an
+            # operator/agent request. It must not share the source-IP bucket:
+            # transcript batching alone can exceed 60 requests per minute.
+            for _ in range(20):
+                bridge = client.get(
+                    "/api/v1/pi/bridge/missing/commands",
+                    params={"incarnation": "inc", "wait_seconds": 0},
+                    headers=limited_headers,
+                )
+                self.assertEqual(bridge.status_code, 404, bridge.text)
+
             stats = client.get("/api/v1/_stats", headers={"X-Agent-Name": "operator"})
             self.assertEqual(stats.status_code, 200)
             body = stats.json()
