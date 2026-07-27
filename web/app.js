@@ -6,6 +6,16 @@ const emptyState = $("#empty-state");
 const transcript = $("#transcript");
 const meta = $("#session-meta");
 const sessionControls = $("#session-controls");
+const sessionModes = $("#session-modes");
+const transcriptMode = $("#transcript-mode");
+const terminalMode = $("#terminal-mode");
+const terminalPanel = $("#terminal-panel");
+const terminalOutput = $("#terminal-output");
+const terminalStatus = $("#terminal-status");
+const terminalReconnect = $("#terminal-reconnect");
+const terminalDisconnect = $("#terminal-disconnect");
+const terminalComposer = $("#terminal-composer");
+const terminalInput = $("#terminal-input");
 const modelControl = $("#model-control");
 const thinkingControl = $("#thinking-control");
 const controlStatus = $("#control-status");
@@ -35,6 +45,12 @@ const state = {
   items: new Map(),
   expanded: new Set(),
   settings: null,
+  attachInfo: null,
+  terminalSocket: null,
+  terminalBuffer: "",
+  terminalDecoder: new TextDecoder(),
+  viewMode: "transcript",
+  navigation: 0,
   showHistory: false,
   followLatest: true,
   installPrompt: null,
@@ -216,6 +232,129 @@ function cycleSession(direction) {
   if (target) location.hash = `session/${encodeURIComponent(target.id)}`;
 }
 
+async function loadAttachInfo(sessionId) {
+  let info;
+  try {
+    info = await api(`/api/v1/pi/sessions/${encodeURIComponent(sessionId)}/attach-info`);
+  } catch (error) {
+    info = { attachable: false, reason: error.message };
+  }
+  if (state.selected?.id !== sessionId) return;
+  state.attachInfo = info;
+  const attachable = Boolean(state.attachInfo?.attachable);
+  sessionModes.classList.toggle("hidden", !attachable);
+  terminalMode.title = attachable ? "Attach directly to the worker terminal" : String(state.attachInfo?.reason || "Unavailable");
+}
+
+function setSessionMode(mode) {
+  const terminal = mode === "terminal" && state.attachInfo?.attachable;
+  state.viewMode = terminal ? "terminal" : "transcript";
+  transcript.classList.toggle("hidden", terminal);
+  terminalPanel.classList.toggle("hidden", !terminal);
+  composer.classList.toggle("hidden", terminal);
+  jumpLatest.classList.toggle("hidden", terminal || state.followLatest);
+  transcriptMode.classList.toggle("active", !terminal);
+  transcriptMode.setAttribute("aria-pressed", String(!terminal));
+  terminalMode.classList.toggle("active", terminal);
+  terminalMode.setAttribute("aria-pressed", String(terminal));
+  if (terminal) {
+    connectTerminal();
+    requestAnimationFrame(() => terminalOutput.focus());
+  }
+}
+
+function cleanTerminalText(text) {
+  return text
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b[()][0-2A-Z]/g, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+}
+
+function appendTerminalOutput(text) {
+  state.terminalBuffer += cleanTerminalText(text);
+  if (state.terminalBuffer.length > 200_000) {
+    state.terminalBuffer = `[older terminal output trimmed]\n${state.terminalBuffer.slice(-180_000)}`;
+  }
+  terminalOutput.textContent = state.terminalBuffer;
+  terminalOutput.scrollTop = terminalOutput.scrollHeight;
+}
+
+function disconnectTerminal(reason = "Disconnected") {
+  const socket = state.terminalSocket;
+  state.terminalSocket = null;
+  if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, "client disconnect");
+  terminalStatus.textContent = reason;
+  terminalStatus.className = "";
+}
+
+function resizeTerminal() {
+  const socket = state.terminalSocket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  const rows = Math.min(1000, Math.max(8, Math.floor(terminalOutput.clientHeight / 18)));
+  const cols = Math.min(1000, Math.max(20, Math.floor(terminalOutput.clientWidth / 8)));
+  socket.send(JSON.stringify({ type: "resize", rows, cols }));
+}
+
+function connectTerminal() {
+  if (!state.attachInfo?.attachable || !state.attachInfo.websocket_url) return;
+  if (state.terminalSocket && state.terminalSocket.readyState <= WebSocket.OPEN) return;
+  disconnectTerminal("Connecting…");
+  state.terminalDecoder = new TextDecoder();
+  terminalStatus.className = "connecting";
+  const socket = new WebSocket(state.attachInfo.websocket_url);
+  socket.binaryType = "arraybuffer";
+  state.terminalSocket = socket;
+  socket.addEventListener("open", () => {
+    if (state.terminalSocket !== socket) return;
+    terminalStatus.textContent = "Connected · direct worker relay";
+    terminalStatus.className = "online";
+    resizeTerminal();
+  });
+  socket.addEventListener("message", async (event) => {
+    if (state.terminalSocket !== socket) return;
+    if (typeof event.data === "string") {
+      try {
+        const payload = JSON.parse(event.data);
+        if (payload.type === "status") {
+          terminalStatus.textContent = `${payload.state || "connected"} · terminal ${payload.terminal || "ready"}`;
+          terminalStatus.className = "online";
+        } else if (payload.type === "error") {
+          appendTerminalOutput(`\n[relay error: ${payload.detail || payload.message || "unknown error"}]\n`);
+        }
+      } catch {
+        appendTerminalOutput(event.data);
+      }
+      return;
+    }
+    const bytes = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+    appendTerminalOutput(state.terminalDecoder.decode(bytes, { stream: true }));
+  });
+  socket.addEventListener("close", (event) => {
+    if (state.terminalSocket !== socket) return;
+    state.terminalSocket = null;
+    terminalStatus.textContent = event.code === 1000 ? "Disconnected" : `Disconnected · code ${event.code}`;
+    terminalStatus.className = "";
+  });
+  socket.addEventListener("error", () => {
+    if (state.terminalSocket !== socket) return;
+    terminalStatus.textContent = "Connection failed";
+    terminalStatus.className = "error";
+  });
+}
+
+function sendTerminalInput(data) {
+  const socket = state.terminalSocket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    terminalStatus.textContent = "Not connected";
+    terminalStatus.className = "error";
+    return false;
+  }
+  socket.send(JSON.stringify({ type: "input", data }));
+  return true;
+}
+
 function renderSessionControls() {
   const available = state.selected?.session_type === "interactive" && state.settings;
   sessionControls.classList.toggle("hidden", !available);
@@ -238,6 +377,7 @@ function renderSessionControls() {
 }
 
 async function openSession(id) {
+  const navigation = ++state.navigation;
   closeStream();
   listView.classList.add("hidden");
   detailView.classList.remove("hidden");
@@ -251,28 +391,41 @@ async function openSession(id) {
   state.items.clear();
   state.expanded.clear();
   state.settings = null;
+  state.attachInfo = null;
+  state.terminalBuffer = "";
+  terminalOutput.textContent = "";
+  disconnectTerminal();
+  sessionModes.classList.add("hidden");
+  setSessionMode("transcript");
   sessionControls.classList.add("hidden");
   controlStatus.textContent = "";
   state.followLatest = true;
   setConnection("connecting");
   try {
     state.selected = state.sessions.find((session) => session.id === id) || await api(`/api/v1/pi/sessions/${encodeURIComponent(id)}`);
+    if (state.navigation !== navigation) return;
     renderSessionHeader();
-    await replayEvents(id);
+    const attachInfo = loadAttachInfo(id);
+    if (!await replayEvents(id, navigation)) return;
+    await attachInfo;
+    if (state.navigation !== navigation) return;
     renderTranscript();
     connectStream(id);
   } catch (error) {
+    if (state.navigation !== navigation) return;
     transcript.replaceChildren(node("div", "empty-transcript", `Unable to open session: ${error.message}`));
     setConnection("offline");
   }
 }
 
-async function replayEvents(id) {
-  while (true) {
+async function replayEvents(id, navigation) {
+  while (state.navigation === navigation) {
     const events = await api(`/api/v1/pi/sessions/${encodeURIComponent(id)}/events?after=${state.cursor}&limit=500`);
+    if (state.navigation !== navigation) return false;
     for (const event of events) applyEvent(event);
-    if (events.length < 500) return;
+    if (events.length < 500) return true;
   }
+  return false;
 }
 
 function connectStream(id) {
@@ -282,6 +435,7 @@ function connectStream(id) {
   source.addEventListener("open", () => setConnection("online"));
   source.addEventListener("error", () => setConnection("connecting"));
   source.addEventListener("pi-event", (incoming) => {
+    if (state.selected?.id !== id) return;
     try {
       const event = JSON.parse(incoming.data);
       if (event.sequence <= state.cursor) return;
@@ -471,8 +625,13 @@ function renderTranscript() {
 }
 
 function closeDetail() {
+  state.navigation += 1;
   closeStream();
+  disconnectTerminal();
   state.selected = null;
+  state.attachInfo = null;
+  sessionModes.classList.add("hidden");
+  setSessionMode("transcript");
   detailView.classList.add("hidden");
   listView.classList.remove("hidden");
   backButton.classList.add("hidden");
@@ -573,6 +732,40 @@ sessionPicker.addEventListener("change", () => {
 });
 previousSession.addEventListener("click", () => cycleSession(-1));
 nextSession.addEventListener("click", () => cycleSession(1));
+transcriptMode.addEventListener("click", () => setSessionMode("transcript"));
+terminalMode.addEventListener("click", () => setSessionMode("terminal"));
+terminalReconnect.addEventListener("click", connectTerminal);
+terminalDisconnect.addEventListener("click", () => disconnectTerminal());
+terminalComposer.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const value = terminalInput.value;
+  if (!value || !sendTerminalInput(`${value}\r`)) return;
+  terminalInput.value = "";
+});
+for (const button of document.querySelectorAll("[data-terminal-key]")) {
+  button.addEventListener("click", () => {
+    try { sendTerminalInput(JSON.parse(`"${button.dataset.terminalKey}"`)); } catch { /* invalid key mapping */ }
+    terminalOutput.focus();
+  });
+}
+if ("ResizeObserver" in window) new ResizeObserver(resizeTerminal).observe(terminalOutput);
+terminalOutput.addEventListener("keydown", (event) => {
+  let data = "";
+  if (event.ctrlKey && !event.altKey && !event.metaKey && event.key.length === 1) {
+    const code = event.key.toUpperCase().charCodeAt(0);
+    if (code >= 64 && code <= 95) data = String.fromCharCode(code - 64);
+  } else if (!event.ctrlKey && !event.altKey && !event.metaKey) {
+    const keys = {
+      Enter: "\r", Backspace: "\x7f", Tab: "\t", Escape: "\x1b",
+      ArrowUp: "\x1b[A", ArrowDown: "\x1b[B", ArrowRight: "\x1b[C", ArrowLeft: "\x1b[D",
+      Home: "\x1b[H", End: "\x1b[F", Delete: "\x1b[3~",
+    };
+    data = keys[event.key] || (event.key.length === 1 ? event.key : "");
+  }
+  if (!data) return;
+  event.preventDefault();
+  sendTerminalInput(data);
+});
 refreshButton.addEventListener("click", () => loadSessions());
 window.addEventListener("hashchange", route);
 window.addEventListener("beforeinstallprompt", (event) => {

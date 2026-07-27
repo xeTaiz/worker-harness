@@ -106,6 +106,8 @@ class PiSessionsApiTests(unittest.TestCase):
         self.assertEqual(manifest.status_code, 200)
         self.assertEqual(manifest.json()["display"], "standalone")
         self.assertIn("EventSource", script.text)
+        self.assertIn("new WebSocket", script.text)
+        self.assertIn("attach-info", script.text)
 
     def test_interactive_bridge_register_events_prompt_and_ack(self):
         session_id = "plain-pi-session"
@@ -248,6 +250,33 @@ class PiSessionsApiTests(unittest.TestCase):
         ])
         self.assertEqual(message_events[1]["payload"]["message"]["content"][0]["text"], "question")
         self.assertEqual(message_events[3]["payload"]["message"]["content"][0]["text"], "answer")
+
+    def test_attach_info_exposes_only_delegated_worker_relays(self):
+        asyncio.run(self.db.insert_pi_session(PiSession(
+            id="attach-child",
+            worker_id="archdome",
+            session_type=PiSessionType.DELEGATED,
+            state=PiSessionState.IDLE,
+        )))
+        asyncio.run(self.db.register_interactive_pi_session(PiBridgeRegister(
+            session_id="interactive-no-terminal",
+            incarnation="interactive-incarnation",
+        )))
+        with TestClient(self.app) as client:
+            delegated = client.get("/api/v1/pi/sessions/attach-child/attach-info")
+            interactive = client.get("/api/v1/pi/sessions/interactive-no-terminal/attach-info")
+
+        self.assertEqual(delegated.status_code, 200, delegated.text)
+        self.assertEqual(delegated.json(), {
+            "session_id": "attach-child",
+            "attachable": True,
+            "transport": "direct-worker-websocket",
+            "protocol_version": 2,
+            "websocket_url": "ws://100.64.0.89:27888/v1/sessions/attach-child/attach",
+        })
+        self.assertEqual(interactive.status_code, 200, interactive.text)
+        self.assertFalse(interactive.json()["attachable"])
+        self.assertIn("interactive", interactive.json()["reason"])
 
     def test_pi_session_sse_replays_from_durable_cursor(self):
         session_id = "stream-session"

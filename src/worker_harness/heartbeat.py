@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, Literal, TypeVar
+from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
@@ -512,6 +513,49 @@ def create_app(db: Database) -> FastAPI:
         if not session:
             raise HTTPException(status_code=404, detail="Pi session not found")
         return session.model_dump(mode="json")
+
+    @app.get("/api/v1/pi/sessions/{session_id}/attach-info")
+    async def pi_session_attach_info(session_id: str):
+        session = await db.get_pi_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        if session.session_type != PiSessionType.DELEGATED or not session.worker_id:
+            return {
+                "session_id": session.id,
+                "attachable": False,
+                "reason": "Raw terminal attachment is not available for interactive sessions yet",
+            }
+        if session.state not in {PiSessionState.WORKING, PiSessionState.IDLE}:
+            return {
+                "session_id": session.id,
+                "attachable": False,
+                "reason": f"Session is {session.state.value}",
+            }
+        worker = await db.get_worker(session.worker_id)
+        if not worker:
+            return {"session_id": session.id, "attachable": False, "reason": "Worker not found"}
+        if worker.status != WorkerStatus.ONLINE:
+            return {
+                "session_id": session.id,
+                "attachable": False,
+                "reason": f"Worker is {worker.status.value}",
+            }
+        if not worker.pi_relay_available or not worker.pi_relay_port:
+            return {
+                "session_id": session.id,
+                "attachable": False,
+                "reason": "Worker does not advertise a Pi relay",
+            }
+        return {
+            "session_id": session.id,
+            "attachable": True,
+            "transport": "direct-worker-websocket",
+            "protocol_version": worker.pi_relay_protocol_version,
+            "websocket_url": (
+                f"ws://{worker.worker_ip}:{worker.pi_relay_port}"
+                f"/v1/sessions/{quote(session.id, safe='')}/attach"
+            ),
+        }
 
     @app.get("/api/v1/pi/sessions/{session_id}/events")
     async def pi_session_events(

@@ -51,6 +51,10 @@
 
     <main id="session-detail-view" class="view detail-view hidden">
       <section id="session-meta" class="session-meta"></section>
+      <nav id="session-modes" class="session-modes hidden" aria-label="Session view">
+        <button id="transcript-mode" type="button" class="active" aria-pressed="true">Transcript</button>
+        <button id="terminal-mode" type="button" aria-pressed="false">Terminal preview</button>
+      </nav>
       <section id="session-controls" class="session-controls hidden" aria-label="Session controls">
         <label>
           <span>Model</span>
@@ -71,6 +75,25 @@
         <span id="control-status" class="control-status" role="status"></span>
       </section>
       <section id="transcript" class="transcript" aria-live="polite" aria-label="Session transcript"></section>
+      <section id="terminal-panel" class="terminal-panel hidden" aria-label="Raw terminal attachment">
+        <div class="terminal-toolbar">
+          <span id="terminal-status" role="status">Disconnected</span>
+          <button id="terminal-reconnect" type="button">Reconnect</button>
+          <button id="terminal-disconnect" type="button">Disconnect</button>
+        </div>
+        <pre id="terminal-output" tabindex="0" aria-label="Terminal output"></pre>
+        <div class="terminal-keys" aria-label="Terminal keys">
+          <button type="button" data-terminal-key="\u0003">Ctrl-C</button>
+          <button type="button" data-terminal-key="\u001b">Esc</button>
+          <button type="button" data-terminal-key="\t">Tab</button>
+          <button type="button" data-terminal-key="\u001b[A">↑</button>
+          <button type="button" data-terminal-key="\u001b[B">↓</button>
+        </div>
+        <form id="terminal-composer" class="terminal-composer">
+          <textarea id="terminal-input" rows="1" placeholder="Type a terminal command…" aria-label="Terminal input"></textarea>
+          <button type="submit" aria-label="Send terminal input">↵</button>
+        </form>
+      </section>
       <button id="jump-latest" class="jump-latest hidden">↓ Latest</button>
       <form id="composer" class="composer">
         <div class="composer-controls">

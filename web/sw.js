@@ -1,4 +1,4 @@
-const CACHE = "wh-pi-shell-v4";
+const CACHE = "wh-pi-shell-v5";
 const SHELL = ["/", "/index.html", "/app.css", "/app.js", "/manifest.webmanifest", "/icon.svg", "/icon-maskable.svg"];
 
 self.addEventListener("install", (event) => {

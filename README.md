@@ -20,7 +20,12 @@ Required ACL directions:
 and the operator control plane are deliberately separate services. The mobile
 Pi-session webapp is served from the control service root, for example
 `http://<orchestrator-tailnet-name>:12889/`, and uses the same Tailnet trust
-boundary—there is no separate browser credential.
+boundary—there is no separate browser credential. Working/idle delegated
+sessions also expose an initial **Terminal preview** tab that connects directly
+to the worker's Tailnet-published relay on port `27888`; ordinary interactive
+sessions do not have a raw terminal transport yet. This preview is the first
+attach-client slice and does not yet implement writer leases or gateway fallback,
+so avoid attaching multiple writing clients to the same session.
 
 Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 
