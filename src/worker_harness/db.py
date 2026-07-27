@@ -474,6 +474,31 @@ class Database:
                    WHERE session_id=? AND delivered_at=0 AND claimed_by!=?""",
                 (payload.session_id, payload.incarnation),
             )
+            # Registration snapshots contain at most one completed user /
+            # assistant exchange. Match by message identity as well as event ID
+            # so a reload does not duplicate messages already captured live.
+            for event in payload.initial_events:
+                if event.event_type not in {"message-start", "message-end"}:
+                    continue
+                message_id = event.payload.get("message_id")
+                if not isinstance(message_id, str) or not message_id:
+                    continue
+                duplicate = await self._db.execute(
+                    """SELECT 1 FROM pi_session_events
+                       WHERE session_id=? AND event_type=?
+                         AND json_extract(payload, '$.message_id')=? LIMIT 1""",
+                    (payload.session_id, event.event_type, message_id),
+                )
+                if await duplicate.fetchone():
+                    continue
+                await self._db.execute(
+                    """INSERT OR IGNORE INTO pi_session_events
+                       (id, session_id, event_type, payload, created_at) VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        event.id or str(uuid4()), payload.session_id, event.event_type,
+                        json.dumps(event.payload), event.created_at or now,
+                    ),
+                )
             await self._db.commit()
             session = await self.get_pi_session(payload.session_id)
             assert session is not None

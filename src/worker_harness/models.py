@@ -236,6 +236,10 @@ class PiBridgeRegister(BaseModel):
     cwd: str = Field(default="", max_length=4096)
     name: str = Field(default="", max_length=256)
     host: str = Field(default="", max_length=256)
+    # A newly attached bridge may include the latest completed exchange so the
+    # durable transcript is useful immediately. The database accepts only
+    # message start/end events from this bounded registration snapshot.
+    initial_events: list[PiIngestEvent] = Field(default_factory=list, max_length=4)
 
 
 class PiBridgeEventBatch(BaseModel):

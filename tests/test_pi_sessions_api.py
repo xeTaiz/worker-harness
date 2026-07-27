@@ -186,6 +186,69 @@ class PiSessionsApiTests(unittest.TestCase):
         )
         self.assertEqual([event.sequence for event in events], [1, 2, 3, 4])
 
+    def test_interactive_registration_backfills_latest_exchange_once(self):
+        session_id = "history-session"
+        initial_events = [
+            {
+                "id": "history-user-start",
+                "event_type": "message-start",
+                "payload": {"message_id": "user:100:message", "role": "user", "timestamp": 100},
+                "created_at": 1,
+            },
+            {
+                "id": "history-user-end",
+                "event_type": "message-end",
+                "payload": {
+                    "message_id": "user:100:message",
+                    "message": {"role": "user", "timestamp": 100, "content": [{"type": "text", "text": "question"}]},
+                },
+                "created_at": 1,
+            },
+            {
+                "id": "history-assistant-start",
+                "event_type": "message-start",
+                "payload": {"message_id": "assistant:200:message", "role": "assistant", "timestamp": 200},
+                "created_at": 2,
+            },
+            {
+                "id": "history-assistant-end",
+                "event_type": "message-end",
+                "payload": {
+                    "message_id": "assistant:200:message",
+                    "message": {"role": "assistant", "timestamp": 200, "content": [{"type": "text", "text": "answer"}]},
+                },
+                "created_at": 2,
+            },
+        ]
+        with TestClient(self.app) as client:
+            first = client.post("/api/v1/pi/bridge/register", json={
+                "session_id": session_id,
+                "incarnation": "history-incarnation-1",
+                "initial_events": initial_events,
+            })
+            self.assertEqual(first.status_code, 200, first.text)
+
+            # A replacement incarnation may assign different event IDs, but
+            # stable message IDs still prevent duplicate transcript bubbles.
+            replacement_events = [
+                {**event, "id": f"replacement-{index}"}
+                for index, event in enumerate(initial_events)
+            ]
+            second = client.post("/api/v1/pi/bridge/register", json={
+                "session_id": session_id,
+                "incarnation": "history-incarnation-2",
+                "initial_events": replacement_events,
+            })
+            self.assertEqual(second.status_code, 200, second.text)
+            replayed = client.get(f"/api/v1/pi/sessions/{session_id}/events").json()
+
+        message_events = [event for event in replayed if event["event_type"].startswith("message-")]
+        self.assertEqual([event["event_type"] for event in message_events], [
+            "message-start", "message-end", "message-start", "message-end",
+        ])
+        self.assertEqual(message_events[1]["payload"]["message"]["content"][0]["text"], "question")
+        self.assertEqual(message_events[3]["payload"]["message"]["content"][0]["text"], "answer")
+
     def test_pi_session_sse_replays_from_durable_cursor(self):
         session_id = "stream-session"
         asyncio.run(self.db.register_interactive_pi_session(
