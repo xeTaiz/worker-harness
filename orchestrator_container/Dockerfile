@@ -28,4 +28,7 @@ RUN pip install --no-cache-dir .
 COPY orchestrator_container/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=12 \
+    CMD curl -fsS "http://127.0.0.1:${WH_CONTROL_PORT:-12889}/health" || exit 1
+
 ENTRYPOINT ["/entrypoint.sh"]
