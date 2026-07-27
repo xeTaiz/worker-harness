@@ -192,6 +192,10 @@ class Database:
                 name TEXT DEFAULT '',
                 host TEXT DEFAULT '',
                 bridge_incarnation TEXT,
+                terminal_attachable INTEGER DEFAULT 0,
+                terminal_host TEXT DEFAULT '',
+                terminal_port INTEGER DEFAULT 0,
+                terminal_protocol_version INTEGER DEFAULT 0,
                 last_seen INTEGER DEFAULT 0,
                 created_at INTEGER DEFAULT 0,
                 updated_at INTEGER DEFAULT 0
@@ -203,6 +207,10 @@ class Database:
             "name": "TEXT DEFAULT ''",
             "host": "TEXT DEFAULT ''",
             "bridge_incarnation": "TEXT",
+            "terminal_attachable": "INTEGER DEFAULT 0",
+            "terminal_host": "TEXT DEFAULT ''",
+            "terminal_port": "INTEGER DEFAULT 0",
+            "terminal_protocol_version": "INTEGER DEFAULT 0",
             "last_seen": "INTEGER DEFAULT 0",
         }.items():
             if column not in pi_session_cols:
@@ -402,6 +410,12 @@ class Database:
             name=row["name"] if "name" in row.keys() else "",
             host=row["host"] if "host" in row.keys() else "",
             bridge_incarnation=row["bridge_incarnation"] if "bridge_incarnation" in row.keys() else None,
+            terminal_attachable=bool(row["terminal_attachable"]) if "terminal_attachable" in row.keys() else False,
+            terminal_host=row["terminal_host"] if "terminal_host" in row.keys() else "",
+            terminal_port=row["terminal_port"] if "terminal_port" in row.keys() else 0,
+            terminal_protocol_version=(
+                row["terminal_protocol_version"] if "terminal_protocol_version" in row.keys() else 0
+            ),
             last_seen=row["last_seen"] if "last_seen" in row.keys() else 0,
             created_at=row["created_at"], updated_at=row["updated_at"],
         )
@@ -410,22 +424,27 @@ class Database:
         await self._db.execute(
             """INSERT INTO pi_sessions
                (id, worker_id, parent_session_id, session_type, state, task, cwd, tmux_session, detail,
-                name, host, bridge_incarnation, last_seen, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                name, host, bridge_incarnation, terminal_attachable, terminal_host, terminal_port,
+                terminal_protocol_version, last_seen, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (session.id, session.worker_id, session.parent_session_id, session.session_type.value,
              session.state.value, session.task, session.cwd, session.tmux_session, session.detail,
-             session.name, session.host, session.bridge_incarnation, session.last_seen,
-             session.created_at, session.updated_at),
+             session.name, session.host, session.bridge_incarnation, int(session.terminal_attachable),
+             session.terminal_host, session.terminal_port, session.terminal_protocol_version,
+             session.last_seen, session.created_at, session.updated_at),
         )
         await self._db.commit()
 
     async def update_pi_session(self, session: PiSession) -> None:
         await self._db.execute(
             """UPDATE pi_sessions SET worker_id=?, parent_session_id=?, session_type=?, state=?, task=?, cwd=?,
-               tmux_session=?, detail=?, name=?, host=?, bridge_incarnation=?, last_seen=?, updated_at=? WHERE id=?""",
+               tmux_session=?, detail=?, name=?, host=?, bridge_incarnation=?, terminal_attachable=?,
+               terminal_host=?, terminal_port=?, terminal_protocol_version=?, last_seen=?, updated_at=? WHERE id=?""",
             (session.worker_id, session.parent_session_id, session.session_type.value, session.state.value,
              session.task, session.cwd, session.tmux_session, session.detail, session.name, session.host,
-             session.bridge_incarnation, session.last_seen, session.updated_at, session.id),
+             session.bridge_incarnation, int(session.terminal_attachable), session.terminal_host,
+             session.terminal_port, session.terminal_protocol_version, session.last_seen,
+             session.updated_at, session.id),
         )
         await self._db.commit()
 
@@ -454,17 +473,22 @@ class Database:
             await self._db.execute(
                 """INSERT INTO pi_sessions
                    (id, worker_id, parent_session_id, session_type, state, task, cwd, tmux_session,
-                    detail, name, host, bridge_incarnation, last_seen, created_at, updated_at)
-                   VALUES (?, NULL, NULL, ?, ?, '', ?, '', '', ?, ?, ?, ?, ?, ?)
+                    detail, name, host, bridge_incarnation, terminal_attachable, terminal_host,
+                    terminal_port, terminal_protocol_version, last_seen, created_at, updated_at)
+                   VALUES (?, NULL, NULL, ?, ?, '', ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                      worker_id=NULL, parent_session_id=NULL, session_type=excluded.session_type,
                      state=excluded.state, cwd=excluded.cwd, detail='', name=excluded.name,
                      host=excluded.host, bridge_incarnation=excluded.bridge_incarnation,
+                     terminal_attachable=excluded.terminal_attachable,
+                     terminal_host=excluded.terminal_host, terminal_port=excluded.terminal_port,
+                     terminal_protocol_version=excluded.terminal_protocol_version,
                      last_seen=excluded.last_seen, updated_at=excluded.updated_at""",
                 (
                     payload.session_id, PiSessionType.INTERACTIVE.value, PiSessionState.IDLE.value,
                     payload.cwd, payload.name, payload.host, payload.incarnation,
-                    now, created_at, now,
+                    int(payload.terminal_attachable), payload.terminal_host, payload.terminal_port,
+                    payload.terminal_protocol_version, now, created_at, now,
                 ),
             )
             # A replacement bridge may reclaim commands whose response was

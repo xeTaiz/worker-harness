@@ -519,18 +519,31 @@ def create_app(db: Database) -> FastAPI:
         session = await db.get_pi_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Pi session not found")
-        if session.session_type != PiSessionType.DELEGATED or not session.worker_id:
-            return {
-                "session_id": session.id,
-                "attachable": False,
-                "reason": "Raw terminal attachment is not available for interactive sessions yet",
-            }
         if session.state not in {PiSessionState.WORKING, PiSessionState.IDLE}:
             return {
                 "session_id": session.id,
                 "attachable": False,
                 "reason": f"Session is {session.state.value}",
             }
+        if session.session_type == PiSessionType.INTERACTIVE:
+            if not session.terminal_attachable or not session.terminal_host or not session.terminal_port:
+                return {
+                    "session_id": session.id,
+                    "attachable": False,
+                    "reason": "Interactive session is not running inside tmux or its host relay is unavailable",
+                }
+            return {
+                "session_id": session.id,
+                "attachable": True,
+                "transport": "direct-interactive-websocket",
+                "protocol_version": session.terminal_protocol_version,
+                "websocket_url": (
+                    f"ws://{session.terminal_host}:{session.terminal_port}"
+                    f"/v1/sessions/{quote(session.id, safe='')}/attach"
+                ),
+            }
+        if session.session_type != PiSessionType.DELEGATED or not session.worker_id:
+            return {"session_id": session.id, "attachable": False, "reason": "Session has no terminal transport"}
         worker = await db.get_worker(session.worker_id)
         if not worker:
             return {"session_id": session.id, "attachable": False, "reason": "Worker not found"}

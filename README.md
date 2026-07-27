@@ -21,11 +21,20 @@ and the operator control plane are deliberately separate services. The mobile
 Pi-session webapp is served from the control service root, for example
 `http://<orchestrator-tailnet-name>:12889/`, and uses the same Tailnet trust
 boundary—there is no separate browser credential. Working/idle delegated
-sessions also expose an initial **Terminal preview** tab that connects directly
-to the worker's Tailnet-published relay on port `27888`; ordinary interactive
-sessions do not have a raw terminal transport yet. This preview is the first
-attach-client slice and does not yet implement writer leases or gateway fallback,
-so avoid attaching multiple writing clients to the same session.
+sessions expose a **Terminal preview** tab through the worker relay on port
+`27888`. Ordinary interactive Pi sessions launched inside tmux expose the same
+tab through an auto-started host relay on the host's Tailnet port `27888`; random
+terminals and Zellij are reported non-attachable for now. The host relay binds
+only to loopback and uses Tailscale Serve, so grant the local operator permission
+once on each interactive host:
+
+```bash
+sudo tailscale set --operator="$(id -un)"
+```
+
+The host relay enforces one attached writer. Delegated relays do not yet share a
+durable orchestrator lease, and gateway fallback is still future work, so avoid
+attaching multiple writing clients to a delegated session.
 
 Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 

@@ -195,6 +195,10 @@ class PiSession(BaseModel):
     name: str = ""
     host: str = ""
     bridge_incarnation: str | None = None
+    terminal_attachable: bool = False
+    terminal_host: str = ""
+    terminal_port: int = 0
+    terminal_protocol_version: int = 0
     last_seen: int = 0
     created_at: int = 0
     updated_at: int = 0
@@ -236,6 +240,10 @@ class PiBridgeRegister(BaseModel):
     cwd: str = Field(default="", max_length=4096)
     name: str = Field(default="", max_length=256)
     host: str = Field(default="", max_length=256)
+    terminal_attachable: bool = False
+    terminal_host: str = Field(default="", max_length=256, pattern=r"^[A-Za-z0-9.-]*$")
+    terminal_port: int = Field(default=0, ge=0, le=65535)
+    terminal_protocol_version: int = Field(default=0, ge=0, le=100)
     # A newly attached bridge may include the latest completed exchange so the
     # durable transcript is useful immediately. The database accepts only
     # message start/end events from this bounded registration snapshot.

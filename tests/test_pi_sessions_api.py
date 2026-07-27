@@ -257,7 +257,7 @@ class PiSessionsApiTests(unittest.TestCase):
         self.assertEqual(message_events[1]["payload"]["message"]["content"][0]["text"], "question")
         self.assertEqual(message_events[3]["payload"]["message"]["content"][0]["text"], "answer")
 
-    def test_attach_info_exposes_only_delegated_worker_relays(self):
+    def test_attach_info_exposes_delegated_and_interactive_relays(self):
         asyncio.run(self.db.insert_pi_session(PiSession(
             id="attach-child",
             worker_id="archdome",
@@ -265,12 +265,21 @@ class PiSessionsApiTests(unittest.TestCase):
             state=PiSessionState.IDLE,
         )))
         asyncio.run(self.db.register_interactive_pi_session(PiBridgeRegister(
-            session_id="interactive-no-terminal",
+            session_id="interactive-terminal",
             incarnation="interactive-incarnation",
+            terminal_attachable=True,
+            terminal_host="100.64.0.2",
+            terminal_port=27888,
+            terminal_protocol_version=2,
+        )))
+        asyncio.run(self.db.register_interactive_pi_session(PiBridgeRegister(
+            session_id="interactive-no-terminal",
+            incarnation="interactive-no-terminal-incarnation",
         )))
         with TestClient(self.app) as client:
             delegated = client.get("/api/v1/pi/sessions/attach-child/attach-info")
-            interactive = client.get("/api/v1/pi/sessions/interactive-no-terminal/attach-info")
+            interactive = client.get("/api/v1/pi/sessions/interactive-terminal/attach-info")
+            unavailable = client.get("/api/v1/pi/sessions/interactive-no-terminal/attach-info")
 
         self.assertEqual(delegated.status_code, 200, delegated.text)
         self.assertEqual(delegated.json(), {
@@ -281,8 +290,15 @@ class PiSessionsApiTests(unittest.TestCase):
             "websocket_url": "ws://100.64.0.89:27888/v1/sessions/attach-child/attach",
         })
         self.assertEqual(interactive.status_code, 200, interactive.text)
-        self.assertFalse(interactive.json()["attachable"])
-        self.assertIn("interactive", interactive.json()["reason"])
+        self.assertEqual(interactive.json(), {
+            "session_id": "interactive-terminal",
+            "attachable": True,
+            "transport": "direct-interactive-websocket",
+            "protocol_version": 2,
+            "websocket_url": "ws://100.64.0.2:27888/v1/sessions/interactive-terminal/attach",
+        })
+        self.assertFalse(unavailable.json()["attachable"])
+        self.assertIn("host relay", unavailable.json()["reason"])
 
     def test_pi_session_sse_replays_from_durable_cursor(self):
         session_id = "stream-session"
