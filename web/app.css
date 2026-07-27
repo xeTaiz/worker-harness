@@ -94,7 +94,7 @@ button { color: inherit; }
 .terminal-toolbar span.connecting { color: var(--warning); }
 .terminal-toolbar span.error { color: var(--danger); }
 .terminal-toolbar button, .terminal-keys button { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; color: #aebdd1; background: var(--surface); font-size: 10px; cursor: pointer; }
-#terminal-output { flex: 1; min-height: 0; margin: 0; padding: 12px; overflow: auto; outline: none; color: #c9f6df; background: #05080d; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; overscroll-behavior: contain; }
+#terminal-output { flex: 1; min-height: 0; margin: 0; padding: 12px; overflow: auto; outline: none; color: #c9f6df; background: #05080d; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre; overflow-wrap: normal; overscroll-behavior: contain; }
 #terminal-output:focus { box-shadow: inset 0 0 0 1px #315f61; }
 .terminal-keys { display: flex; flex: none; gap: 6px; padding: 6px 10px; overflow-x: auto; border-top: 1px solid #192232; scrollbar-width: none; }
 .terminal-keys button { flex: none; min-width: 42px; min-height: 32px; }

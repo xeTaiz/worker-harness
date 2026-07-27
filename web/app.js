@@ -47,7 +47,13 @@ const state = {
   settings: null,
   attachInfo: null,
   terminalSocket: null,
-  terminalBuffer: "",
+  terminalCells: [[]],
+  terminalRow: 0,
+  terminalCol: 0,
+  terminalRows: 24,
+  terminalCols: 80,
+  terminalPending: "",
+  terminalSavedCursor: [0, 0],
   terminalDecoder: new TextDecoder(),
   viewMode: "transcript",
   navigation: 0,
@@ -263,22 +269,148 @@ function setSessionMode(mode) {
   }
 }
 
-function cleanTerminalText(text) {
-  return text
-    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/\x1b[()][0-2A-Z]/g, "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n");
+function resetTerminalScreen(rows = state.terminalRows, cols = state.terminalCols) {
+  state.terminalRows = rows;
+  state.terminalCols = cols;
+  state.terminalCells = Array.from({ length: rows }, () => []);
+  state.terminalRow = 0;
+  state.terminalCol = 0;
+  state.terminalPending = "";
+  state.terminalSavedCursor = [0, 0];
+  terminalOutput.textContent = "";
+}
+
+function renderTerminalScreen() {
+  terminalOutput.textContent = state.terminalCells
+    .map((line) => line.join("").replace(/\s+$/, ""))
+    .join("\n")
+    .replace(/\n+$/, "");
+}
+
+function ensureTerminalLine(row = state.terminalRow) {
+  while (state.terminalCells.length <= row) state.terminalCells.push([]);
+  return state.terminalCells[row];
+}
+
+function terminalLineFeed() {
+  if (state.terminalRow >= state.terminalRows - 1) {
+    state.terminalCells.shift();
+    state.terminalCells.push([]);
+  } else {
+    state.terminalRow += 1;
+  }
+}
+
+function putTerminalCharacter(character) {
+  if (state.terminalCol >= state.terminalCols) {
+    state.terminalCol = 0;
+    terminalLineFeed();
+  }
+  const line = ensureTerminalLine();
+  while (line.length < state.terminalCol) line.push(" ");
+  line[state.terminalCol] = character;
+  state.terminalCol += 1;
+}
+
+function handleTerminalCsi(body, final) {
+  const privateMode = body.startsWith("?");
+  const clean = privateMode ? body.slice(1) : body;
+  const values = clean.split(";").map((value) => Number.parseInt(value, 10));
+  const value = (index = 0, fallback = 1) => Number.isFinite(values[index]) && values[index] !== 0 ? values[index] : fallback;
+  const clampCursor = () => {
+    state.terminalRow = Math.max(0, Math.min(state.terminalRows - 1, state.terminalRow));
+    state.terminalCol = Math.max(0, Math.min(state.terminalCols - 1, state.terminalCol));
+  };
+
+  if (final === "A") state.terminalRow -= value();
+  else if (final === "B") state.terminalRow += value();
+  else if (final === "C") state.terminalCol += value();
+  else if (final === "D") state.terminalCol -= value();
+  else if (final === "E") { state.terminalRow += value(); state.terminalCol = 0; }
+  else if (final === "F") { state.terminalRow -= value(); state.terminalCol = 0; }
+  else if (final === "G") state.terminalCol = value(0, 1) - 1;
+  else if (final === "d") state.terminalRow = value(0, 1) - 1;
+  else if (final === "H" || final === "f") {
+    state.terminalRow = value(0, 1) - 1;
+    state.terminalCol = value(1, 1) - 1;
+  } else if (final === "J") {
+    const mode = Number.isFinite(values[0]) ? values[0] : 0;
+    if (mode === 2 || mode === 3) {
+      state.terminalCells = Array.from({ length: state.terminalRows }, () => []);
+    } else if (mode === 0) {
+      ensureTerminalLine().splice(state.terminalCol);
+      for (let row = state.terminalRow + 1; row < state.terminalRows; row += 1) state.terminalCells[row] = [];
+    } else if (mode === 1) {
+      for (let row = 0; row < state.terminalRow; row += 1) state.terminalCells[row] = [];
+      ensureTerminalLine().fill(" ", 0, state.terminalCol + 1);
+    }
+  } else if (final === "K") {
+    const mode = Number.isFinite(values[0]) ? values[0] : 0;
+    const line = ensureTerminalLine();
+    if (mode === 0) line.splice(state.terminalCol);
+    else if (mode === 1) line.fill(" ", 0, state.terminalCol + 1);
+    else if (mode === 2) state.terminalCells[state.terminalRow] = [];
+  } else if (final === "P") {
+    ensureTerminalLine().splice(state.terminalCol, value());
+  } else if (final === "@") {
+    ensureTerminalLine().splice(state.terminalCol, 0, ...Array(value()).fill(" "));
+  } else if (final === "X") {
+    const line = ensureTerminalLine();
+    while (line.length < state.terminalCol + value()) line.push(" ");
+    line.fill(" ", state.terminalCol, state.terminalCol + value());
+  } else if (final === "s") {
+    state.terminalSavedCursor = [state.terminalRow, state.terminalCol];
+  } else if (final === "u") {
+    [state.terminalRow, state.terminalCol] = state.terminalSavedCursor;
+  }
+  // SGR colors and private mode changes are intentionally ignored; cursor and
+  // erase operations are retained so spinners and full-screen redraws update.
+  clampCursor();
 }
 
 function appendTerminalOutput(text) {
-  state.terminalBuffer += cleanTerminalText(text);
-  if (state.terminalBuffer.length > 200_000) {
-    state.terminalBuffer = `[older terminal output trimmed]\n${state.terminalBuffer.slice(-180_000)}`;
+  const input = state.terminalPending + text;
+  let index = 0;
+  while (index < input.length) {
+    const character = input[index];
+    if (character === "\x1b") {
+      if (index + 1 >= input.length) break;
+      const next = input[index + 1];
+      if (next === "[") {
+        let end = index + 2;
+        while (end < input.length && !(input.charCodeAt(end) >= 0x40 && input.charCodeAt(end) <= 0x7e)) end += 1;
+        if (end >= input.length) break;
+        handleTerminalCsi(input.slice(index + 2, end), input[end]);
+        index = end + 1;
+        continue;
+      }
+      if (next === "]") {
+        let end = index + 2;
+        while (end < input.length && input[end] !== "\x07" && !(input[end] === "\x1b" && input[end + 1] === "\\")) end += 1;
+        if (end >= input.length) break;
+        index = input[end] === "\x07" ? end + 1 : end + 2;
+        continue;
+      }
+      if (next === "(" || next === ")") {
+        if (index + 2 >= input.length) break;
+        index += 3;
+        continue;
+      }
+      if (next === "7") state.terminalSavedCursor = [state.terminalRow, state.terminalCol];
+      else if (next === "8") [state.terminalRow, state.terminalCol] = state.terminalSavedCursor;
+      else if (next === "c") resetTerminalScreen();
+      index += 2;
+      continue;
+    }
+    if (character === "\r") state.terminalCol = 0;
+    else if (character === "\n") terminalLineFeed();
+    else if (character === "\b") state.terminalCol = Math.max(0, state.terminalCol - 1);
+    else if (character === "\t") state.terminalCol = Math.min(state.terminalCols - 1, (Math.floor(state.terminalCol / 8) + 1) * 8);
+    else if (character >= " " && character !== "\x7f") putTerminalCharacter(character);
+    index += 1;
   }
-  terminalOutput.textContent = state.terminalBuffer;
-  terminalOutput.scrollTop = terminalOutput.scrollHeight;
+  state.terminalPending = input.slice(index);
+  renderTerminalScreen();
 }
 
 function disconnectTerminal(reason = "Disconnected") {
@@ -290,17 +422,18 @@ function disconnectTerminal(reason = "Disconnected") {
 }
 
 function resizeTerminal() {
-  const socket = state.terminalSocket;
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
   const rows = Math.min(1000, Math.max(8, Math.floor(terminalOutput.clientHeight / 18)));
   const cols = Math.min(1000, Math.max(20, Math.floor(terminalOutput.clientWidth / 8)));
-  socket.send(JSON.stringify({ type: "resize", rows, cols }));
+  if (rows !== state.terminalRows || cols !== state.terminalCols) resetTerminalScreen(rows, cols);
+  const socket = state.terminalSocket;
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "resize", rows, cols }));
 }
 
 function connectTerminal() {
   if (!state.attachInfo?.attachable || !state.attachInfo.websocket_url) return;
   if (state.terminalSocket && state.terminalSocket.readyState <= WebSocket.OPEN) return;
   disconnectTerminal("Connecting…");
+  resetTerminalScreen();
   state.terminalDecoder = new TextDecoder();
   terminalStatus.className = "connecting";
   const socket = new WebSocket(state.attachInfo.websocket_url);
@@ -392,8 +525,7 @@ async function openSession(id) {
   state.expanded.clear();
   state.settings = null;
   state.attachInfo = null;
-  state.terminalBuffer = "";
-  terminalOutput.textContent = "";
+  resetTerminalScreen();
   disconnectTerminal();
   sessionModes.classList.add("hidden");
   setSessionMode("transcript");
