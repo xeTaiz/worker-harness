@@ -21,6 +21,14 @@
         <h1 id="page-title">Pi sessions</h1>
         <p id="page-subtitle">Worker Harness</p>
       </div>
+      <nav id="session-switcher" class="session-switcher hidden" aria-label="Switch Pi session">
+        <button id="previous-session" class="switch-button" type="button" aria-label="Previous session">‹</button>
+        <label class="session-picker-wrap">
+          <span class="sr-only">Current session</span>
+          <select id="session-picker" aria-label="Current Pi session"></select>
+        </label>
+        <button id="next-session" class="switch-button" type="button" aria-label="Next session">›</button>
+      </nav>
       <span id="connection-dot" class="connection-dot" title="Disconnected"></span>
       <button id="install" class="install-button hidden">Install</button>
       <button id="refresh" class="icon-button" aria-label="Refresh sessions">↻</button>

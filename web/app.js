@@ -13,6 +13,10 @@ const backButton = $("#back");
 const refreshButton = $("#refresh");
 const title = $("#page-title");
 const subtitle = $("#page-subtitle");
+const sessionSwitcher = $("#session-switcher");
+const sessionPicker = $("#session-picker");
+const previousSession = $("#previous-session");
+const nextSession = $("#next-session");
 const connectionDot = $("#connection-dot");
 const composer = $("#composer");
 const messageInput = $("#message");
@@ -66,6 +70,25 @@ function sessionContext(session) {
   return [session.host, session.cwd].filter(Boolean).join(" · ") || session.tmux_session || session.id;
 }
 
+function isInternalSession(session) {
+  return session.name?.startsWith("subagent-");
+}
+
+function isHistoricalSession(session) {
+  return ["stopped", "failed", "termination_unknown"].includes(session.state);
+}
+
+function switchableSessions() {
+  const sessions = state.sessions.filter((session) => !isInternalSession(session) && !isHistoricalSession(session));
+  if (state.selected && !isInternalSession(state.selected) && !sessions.some((session) => session.id === state.selected.id)) {
+    sessions.push(state.selected);
+  }
+  return sessions.sort((left, right) => {
+    const byLabel = sessionLabel(left).localeCompare(sessionLabel(right));
+    return byLabel || left.id.localeCompare(right.id);
+  });
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     ...options,
@@ -108,10 +131,9 @@ function showListError(message) {
 
 function renderSessionList() {
   sessionList.replaceChildren();
-  const operatorSessions = state.sessions.filter((session) => !session.name?.startsWith("subagent-"));
-  const isHistory = (session) => ["stopped", "failed", "termination_unknown"].includes(session.state);
-  const historical = operatorSessions.filter(isHistory);
-  const current = operatorSessions.filter((session) => !isHistory(session));
+  const operatorSessions = state.sessions.filter((session) => !isInternalSession(session));
+  const historical = operatorSessions.filter(isHistoricalSession);
+  const current = operatorSessions.filter((session) => !isHistoricalSession(session));
   const visible = state.showHistory ? operatorSessions : current;
   const working = current.filter((session) => session.state === "working").length;
   const historyToggle = node("button", "summary-pill history-toggle", `${state.showHistory ? "Hide history" : "History"} ${historical.length}`);
@@ -163,7 +185,35 @@ function renderSessionHeader() {
   for (const value of [state.selected.host, state.selected.cwd, state.selected.worker_id && `worker ${state.selected.worker_id.slice(0, 8)}`].filter(Boolean)) {
     meta.append(node("span", "meta-chip", value));
   }
+  renderSessionSwitcher();
   renderSessionControls();
+}
+
+function renderSessionSwitcher() {
+  if (!state.selected) return;
+  const sessions = switchableSessions();
+  sessionPicker.replaceChildren();
+  for (const session of sessions) {
+    const option = node(
+      "option",
+      "",
+      `${sessionLabel(session)} · ${session.state.replaceAll("_", " ")} · ${session.id.slice(0, 6)}`,
+    );
+    option.value = session.id;
+    option.selected = session.id === state.selected.id;
+    sessionPicker.append(option);
+  }
+  previousSession.disabled = sessions.length < 2;
+  nextSession.disabled = sessions.length < 2;
+}
+
+function cycleSession(direction) {
+  if (!state.selected) return;
+  const sessions = switchableSessions();
+  if (sessions.length < 2) return;
+  const current = Math.max(0, sessions.findIndex((session) => session.id === state.selected.id));
+  const target = sessions[(current + direction + sessions.length) % sessions.length];
+  if (target) location.hash = `session/${encodeURIComponent(target.id)}`;
 }
 
 function renderSessionControls() {
@@ -192,6 +242,8 @@ async function openSession(id) {
   listView.classList.add("hidden");
   detailView.classList.remove("hidden");
   backButton.classList.remove("hidden");
+  sessionSwitcher.classList.remove("hidden");
+  document.body.classList.add("session-open");
   refreshButton.classList.add("hidden");
   transcript.replaceChildren(node("div", "empty-transcript", "Loading durable session history…"));
   state.cursor = 0;
@@ -424,6 +476,8 @@ function closeDetail() {
   detailView.classList.add("hidden");
   listView.classList.remove("hidden");
   backButton.classList.add("hidden");
+  sessionSwitcher.classList.add("hidden");
+  document.body.classList.remove("session-open");
   refreshButton.classList.remove("hidden");
   title.textContent = "Pi sessions";
   subtitle.textContent = "Worker Harness";
@@ -512,6 +566,13 @@ jumpLatest.addEventListener("click", () => {
   jumpLatest.classList.add("hidden");
 });
 backButton.addEventListener("click", () => { location.hash = ""; });
+sessionPicker.addEventListener("change", () => {
+  if (sessionPicker.value && sessionPicker.value !== state.selected?.id) {
+    location.hash = `session/${encodeURIComponent(sessionPicker.value)}`;
+  }
+});
+previousSession.addEventListener("click", () => cycleSession(-1));
+nextSession.addEventListener("click", () => cycleSession(1));
 refreshButton.addEventListener("click", () => loadSessions());
 window.addEventListener("hashchange", route);
 window.addEventListener("beforeinstallprompt", (event) => {

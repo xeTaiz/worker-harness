@@ -22,6 +22,7 @@ button, textarea, select { font: inherit; }
 button, select { -webkit-tap-highlight-color: transparent; }
 button { color: inherit; }
 .hidden { display: none !important; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .app-shell { min-height: 100dvh; background: radial-gradient(circle at 85% -10%, #173149 0, transparent 34rem), var(--bg); }
 .topbar {
   position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 12px;
@@ -33,6 +34,14 @@ button { color: inherit; }
 .title-wrap { flex: 1; min-width: 0; }
 .title-wrap h1 { margin: 0; overflow: hidden; font-size: 16px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .title-wrap p { margin: 2px 0 0; color: var(--muted); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+.session-open .title-wrap { display: none; }
+.session-switcher { display: flex; flex: 1; align-items: center; gap: 6px; min-width: 0; }
+.session-picker-wrap { flex: 1; min-width: 0; }
+.session-picker-wrap select { width: 100%; min-height: 40px; padding: 7px 28px 7px 10px; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; outline: none; color: var(--text); background: var(--surface); font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.session-picker-wrap select:focus { border-color: #527499; box-shadow: 0 0 0 3px #52749922; }
+.switch-button { flex: none; width: 36px; height: 40px; padding: 0; border: 1px solid var(--line); border-radius: 12px; color: var(--accent-2); background: var(--surface); font-size: 25px; line-height: 1; cursor: pointer; }
+.switch-button:active { transform: scale(.95); }
+.switch-button:disabled { color: #58677b; opacity: .5; cursor: default; }
 .icon-button, .install-button { min-width: 40px; min-height: 40px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); cursor: pointer; }
 .icon-button:active, .install-button:active { transform: scale(.96); }
 .install-button { min-width: auto; padding: 0 13px; color: var(--accent); font-size: 12px; font-weight: 700; }
@@ -107,6 +116,13 @@ button { color: inherit; }
 .composer button { flex: none; width: 44px; height: 44px; border: 0; border-radius: 14px; color: #07110f; background: var(--accent); font-size: 22px; font-weight: 800; }
 .composer button:disabled { opacity: .45; }
 .composer-status { min-height: 12px; max-width: 720px; margin: 5px auto 0; color: var(--muted); font-size: 10px; }
+@media (max-width: 560px) {
+  .session-open .topbar { gap: 7px; padding-inline: 10px; }
+  .session-open .brand-mark { display: none; }
+  .session-open .icon-button { min-width: 36px; }
+  .session-picker-wrap select { font-size: 11px; }
+  .switch-button { width: 32px; }
+}
 @media (min-width: 760px) {
   .topbar { padding-inline: max(24px, calc((100vw - 960px) / 2)); }
   .list-view { padding-inline: 24px; }
