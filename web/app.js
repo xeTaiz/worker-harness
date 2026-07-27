@@ -31,6 +31,7 @@ const state = {
   items: new Map(),
   expanded: new Set(),
   settings: null,
+  showHistory: false,
   followLatest: true,
   installPrompt: null,
 };
@@ -107,15 +108,26 @@ function showListError(message) {
 
 function renderSessionList() {
   sessionList.replaceChildren();
-  const active = state.sessions.filter((session) => ["working", "idle", "starting"].includes(session.state)).length;
-  const working = state.sessions.filter((session) => session.state === "working").length;
+  const operatorSessions = state.sessions.filter((session) => !session.name?.startsWith("subagent-"));
+  const isHistory = (session) => ["stopped", "failed", "termination_unknown"].includes(session.state);
+  const historical = operatorSessions.filter(isHistory);
+  const current = operatorSessions.filter((session) => !isHistory(session));
+  const visible = state.showHistory ? operatorSessions : current;
+  const working = current.filter((session) => session.state === "working").length;
+  const historyToggle = node("button", "summary-pill history-toggle", `${state.showHistory ? "Hide history" : "History"} ${historical.length}`);
+  historyToggle.type = "button";
+  historyToggle.setAttribute("aria-pressed", String(state.showHistory));
+  historyToggle.addEventListener("click", () => {
+    state.showHistory = !state.showHistory;
+    renderSessionList();
+  });
   $("#summary").replaceChildren(
-    summaryPill(state.sessions.length, "total"),
-    summaryPill(active, "active"),
+    summaryPill(current.length, "current"),
     summaryPill(working, "working"),
+    historyToggle,
   );
-  emptyState.classList.toggle("hidden", state.sessions.length !== 0);
-  for (const session of state.sessions) {
+  emptyState.classList.toggle("hidden", visible.length !== 0);
+  for (const session of visible) {
     const card = node("button", "session-card");
     card.type = "button";
     card.addEventListener("click", () => { location.hash = `session/${encodeURIComponent(session.id)}`; });
@@ -127,7 +139,10 @@ function renderSessionList() {
     );
     const context = node("p", "session-context", sessionContext(session));
     const foot = node("div", "session-foot");
-    foot.append(node("span", "", session.session_type), node("span", "", relativeTime(session.updated_at || session.created_at)));
+    foot.append(
+      node("span", "", `${session.session_type} · ${session.id.slice(0, 6)}`),
+      node("span", "", relativeTime(session.updated_at || session.created_at)),
+    );
     card.append(head, context, foot);
     sessionList.append(card);
   }

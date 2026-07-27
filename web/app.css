@@ -48,6 +48,8 @@ button { color: inherit; }
 .summary-row { display: flex; gap: 8px; margin-bottom: 14px; overflow-x: auto; scrollbar-width: none; }
 .summary-pill { flex: none; padding: 8px 11px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: #101722b3; font-size: 12px; }
 .summary-pill strong { color: var(--text); }
+.history-toggle { cursor: pointer; }
+.history-toggle[aria-pressed="true"] { border-color: #527499; color: var(--accent-2); background: #14243a; }
 .session-list { display: grid; gap: 11px; }
 .session-card { width: 100%; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); text-align: left; background: linear-gradient(145deg, #121b29, #0e151f); box-shadow: 0 12px 32px #0003; cursor: pointer; }
 .session-card:active { transform: scale(.99); border-color: #3d506d; }
