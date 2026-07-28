@@ -26,9 +26,12 @@ sessions expose a **Terminal preview** tab through the worker relay on port
 tab through an auto-started host relay on the host's Tailnet port `27888`; random
 terminals and Zellij are reported non-attachable for now. The host relay binds
 only to loopback and uses Tailscale Serve, so grant the local operator permission
-once on each interactive host:
+once on each interactive host. Interactive terminal attachment additionally
+requires `tmux` and Bun; missing Bun leaves semantic registration available but
+marks raw terminal attachment unavailable.
 
 ```bash
+bun --version
 sudo tailscale set --operator="$(id -un)"
 ```
 
