@@ -71,6 +71,9 @@ def main(
         format="%(message)s",
         handlers=[RichHandler(console=console, rich_tracebacks=True)],
     )
+    # Request summaries obscure interactive pickers and corrupt JSON output.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     _state["output"] = output
 
 

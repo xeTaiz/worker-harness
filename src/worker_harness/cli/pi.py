@@ -126,6 +126,21 @@ def _resolve_session(rows: list[dict], target: str) -> dict:
     raise RuntimeError(f"Pi session selector {target!r} is ambiguous")
 
 
+async def _attachable_candidates(rows: list[dict]) -> list[dict]:
+    async def available(row: dict) -> dict | None:
+        session_id = str(row.get("id") or "")
+        try:
+            info = await _request(
+                "GET", f"/api/v1/pi/sessions/{quote(session_id, safe='')}/attach-info"
+            )
+        except RuntimeError:
+            return None
+        return row if info.get("attachable") else None
+
+    checked = await asyncio.gather(*(available(row) for row in rows))
+    return [row for row in checked if row is not None]
+
+
 def _pick_session(rows: list[dict]) -> dict:
     if not rows:
         raise RuntimeError("no working or idle Pi sessions are registered")
@@ -193,7 +208,11 @@ def attach(
         from worker_harness.pi_terminal import attach_terminal, focus_local_session
 
         candidates = _attach_candidates(await _request("GET", "/api/v1/pi/sessions"))
-        selected = _resolve_session(candidates, target) if target else _pick_session(candidates)
+        selected = (
+            _resolve_session(candidates, target)
+            if target
+            else _pick_session(await _attachable_candidates(candidates))
+        )
         session_id = str(selected.get("id") or "")
         if not stream and await focus_local_session(session_id):
             return

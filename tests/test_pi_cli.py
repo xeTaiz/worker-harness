@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import tempfile
@@ -62,6 +63,16 @@ class PiCliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         parsed = json.loads(result.output)
         self.assertEqual([row["id"] for row in parsed], ["interactive-session-id"])
+
+    def test_attach_picker_filters_non_attachable_sessions(self):
+        rows = [self._session(), {**self._session(), "id": "offline"}]
+        request = AsyncMock(side_effect=[
+            {"session_id": "interactive-session-id", "attachable": True},
+            {"session_id": "offline", "attachable": False, "reason": "relay offline"},
+        ])
+        with patch.object(pi, "_request", new=request):
+            selected = asyncio.run(pi._attachable_candidates(rows))
+        self.assertEqual([row["id"] for row in selected], ["interactive-session-id"])
 
     def test_attach_picker_maps_full_fzf_row_back_to_session(self):
         rows = [self._session(), {**self._session(), "id": "second", "name": "other"}]
