@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 import typer
@@ -13,10 +18,23 @@ from rich.table import Table
 app = typer.Typer(help="Inspect and message registered Pi sessions")
 console = Console()
 
+_ACTIVE_STATES = {"working", "idle"}
+
 
 def _base_url() -> str:
     from worker_harness.cli.app import get_config
 
+    if os.environ.get("WH_ORCHESTRATOR_URL"):
+        return get_config().control.url.rstrip("/")
+    # The Pi bridge already persists this setting; native attach should work
+    # from tmux without requiring a duplicate shell environment variable.
+    bridge_config = Path.home() / ".pi" / "worker-harness" / "config.json"
+    try:
+        configured = str(json.loads(bridge_config.read_text(encoding="utf8")).get("orchestratorUrl") or "")
+        if configured.startswith(("http://", "https://")):
+            return configured.rstrip("/")
+    except (OSError, json.JSONDecodeError):
+        pass
     return get_config().control.url.rstrip("/")
 
 
@@ -79,6 +97,124 @@ def sessions(
         asyncio.run(run())
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+
+
+def _attach_candidates(rows: list[dict]) -> list[dict]:
+    candidates = [row for row in rows if row.get("state") in _ACTIVE_STATES]
+    state_order = {"working": 0, "idle": 1}
+    type_order = {"interactive": 0, "delegated": 1}
+    return sorted(
+        candidates,
+        key=lambda row: (
+            state_order.get(str(row.get("state")), 9),
+            type_order.get(str(row.get("session_type")), 9),
+            -int(row.get("updated_at") or 0),
+        ),
+    )
+
+
+def _resolve_session(rows: list[dict], target: str) -> dict:
+    exact = [row for row in rows if row.get("id") == target or row.get("name") == target]
+    if len(exact) == 1:
+        return exact[0]
+    prefix = [row for row in rows if str(row.get("id", "")).startswith(target)]
+    if len(prefix) == 1:
+        return prefix[0]
+    if not exact and not prefix:
+        raise RuntimeError(f"no active Pi session matches {target!r}")
+    raise RuntimeError(f"Pi session selector {target!r} is ambiguous")
+
+
+def _pick_session(rows: list[dict]) -> dict:
+    if not rows:
+        raise RuntimeError("no working or idle Pi sessions are registered")
+    fzf = shutil.which("fzf")
+    if not fzf:
+        if len(rows) == 1:
+            return rows[0]
+        raise RuntimeError("fzf is required when no session ID is supplied")
+    by_id = {str(row.get("id")): row for row in rows}
+    lines = []
+    for row in rows:
+        session_id = str(row.get("id", ""))
+        label = str(row.get("name") or row.get("task") or "-").replace("\t", " ")
+        location = str(row.get("host") or row.get("worker_id") or "-").replace("\t", " ")
+        cwd = str(row.get("cwd") or "-").replace("\t", " ")
+        lines.append(
+            "\t".join((
+                session_id,
+                str(row.get("state") or ""),
+                str(row.get("session_type") or ""),
+                label,
+                location,
+                cwd,
+            ))
+        )
+    result = subprocess.run(
+        [
+            fzf,
+            "--no-tmux",
+            "--height=100%",
+            "--layout=reverse",
+            "--border",
+            "--delimiter=\\t",
+            "--with-nth=2..",
+            "--header=STATE  TYPE  NAME/TASK  HOST/WORKER  CWD",
+            "--prompt=Pi session> ",
+        ],
+        input="\n".join(lines) + "\n",
+        text=True,
+        stdout=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode == 130 or not result.stdout.strip():
+        raise typer.Abort()
+    if result.returncode != 0:
+        raise RuntimeError(f"fzf session picker failed with exit code {result.returncode}")
+    session_id = result.stdout.strip().split("\t", 1)[0]
+    if session_id not in by_id:
+        raise RuntimeError("fzf returned an unknown Pi session")
+    return by_id[session_id]
+
+
+@app.command("attach")
+def attach(
+    target: str | None = typer.Argument(None, help="Session ID, unique ID prefix, or exact session name"),
+    stream: bool = typer.Option(
+        False,
+        "--stream",
+        help="Stream through the relay even when the original pane is in this local tmux server",
+    ),
+):
+    """Attach this terminal to a discovered Pi session; press Ctrl-] to detach."""
+
+    async def run() -> None:
+        from worker_harness.pi_terminal import attach_terminal, focus_local_session
+
+        candidates = _attach_candidates(await _request("GET", "/api/v1/pi/sessions"))
+        selected = _resolve_session(candidates, target) if target else _pick_session(candidates)
+        session_id = str(selected.get("id") or "")
+        if not stream and await focus_local_session(session_id):
+            return
+        info = await _request(
+            "GET", f"/api/v1/pi/sessions/{quote(session_id, safe='')}/attach-info"
+        )
+        if not info.get("attachable"):
+            raise RuntimeError(str(info.get("reason") or "Pi session is not attachable"))
+        if int(info.get("protocol_version") or 0) != 2:
+            raise RuntimeError(
+                f"unsupported Pi terminal protocol {info.get('protocol_version')!r}; expected 2"
+            )
+        websocket_url = str(info.get("websocket_url") or "")
+        await attach_terminal(websocket_url)
+
+    try:
+        asyncio.run(run())
+    except typer.Abort:
+        raise
+    except (RuntimeError, KeyboardInterrupt) as exc:
+        console.print(f"[red]{exc or 'attachment interrupted'}[/]")
         raise typer.Exit(1) from exc
 
 

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from typer.testing import CliRunner
@@ -33,6 +36,17 @@ class PiCliTests(unittest.TestCase):
             "cwd": "/repo",
         }
 
+    def test_base_url_reuses_pi_bridge_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / ".pi" / "worker-harness" / "config.json"
+            config.parent.mkdir(parents=True)
+            config.write_text('{"orchestratorUrl":"http://orchestrator.tail:12889/"}')
+            with (
+                patch.dict(pi.os.environ, {}, clear=True),
+                patch.object(pi.Path, "home", return_value=Path(directory)),
+            ):
+                self.assertEqual(pi._base_url(), "http://orchestrator.tail:12889")
+
     def test_sessions_text(self):
         with patch.object(pi, "_request", new=AsyncMock(return_value=[self._session()])):
             result = self.runner.invoke(pi.app, ["sessions"])
@@ -48,6 +62,71 @@ class PiCliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         parsed = json.loads(result.output)
         self.assertEqual([row["id"] for row in parsed], ["interactive-session-id"])
+
+    def test_attach_picker_maps_full_fzf_row_back_to_session(self):
+        rows = [self._session(), {**self._session(), "id": "second", "name": "other"}]
+        chosen = subprocess.CompletedProcess([], 0, "second\tidle\tinteractive\tother\tlaptop\t/repo\n", "")
+        with (
+            patch.object(pi.shutil, "which", return_value="/usr/bin/fzf"),
+            patch.object(pi.subprocess, "run", return_value=chosen),
+        ):
+            selected = pi._pick_session(rows)
+        self.assertEqual(selected["id"], "second")
+
+    def test_attach_resolves_prefix_and_streams_protocol_v2(self):
+        request = AsyncMock(side_effect=[
+            [self._session()],
+            {
+                "session_id": "interactive-session-id",
+                "attachable": True,
+                "transport": "direct-interactive-websocket",
+                "protocol_version": 2,
+                "websocket_url": "ws://100.64.0.2:27888/v1/sessions/interactive-session-id/attach",
+            },
+        ])
+        focus = AsyncMock(return_value=False)
+        terminal = AsyncMock()
+        with (
+            patch.object(pi, "_request", new=request),
+            patch("worker_harness.pi_terminal.focus_local_session", new=focus),
+            patch("worker_harness.pi_terminal.attach_terminal", new=terminal),
+        ):
+            result = self.runner.invoke(pi.app, ["attach", "interactive-"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        focus.assert_awaited_once_with("interactive-session-id")
+        terminal.assert_awaited_once_with(
+            "ws://100.64.0.2:27888/v1/sessions/interactive-session-id/attach"
+        )
+        self.assertEqual(request.await_args_list[1].args, (
+            "GET", "/api/v1/pi/sessions/interactive-session-id/attach-info"
+        ))
+
+    def test_attach_focuses_local_tmux_without_requesting_attach_info(self):
+        request = AsyncMock(return_value=[self._session()])
+        focus = AsyncMock(return_value=True)
+        terminal = AsyncMock()
+        with (
+            patch.object(pi, "_request", new=request),
+            patch("worker_harness.pi_terminal.focus_local_session", new=focus),
+            patch("worker_harness.pi_terminal.attach_terminal", new=terminal),
+        ):
+            result = self.runner.invoke(pi.app, ["attach", "repo-agent"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_awaited_once_with("GET", "/api/v1/pi/sessions")
+        terminal.assert_not_awaited()
+
+    def test_attach_reports_unavailable_session(self):
+        request = AsyncMock(side_effect=[
+            [self._session()],
+            {"session_id": "interactive-session-id", "attachable": False, "reason": "relay offline"},
+        ])
+        with (
+            patch.object(pi, "_request", new=request),
+            patch("worker_harness.pi_terminal.focus_local_session", new=AsyncMock(return_value=False)),
+        ):
+            result = self.runner.invoke(pi.app, ["attach", "interactive-session-id"])
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("relay offline", result.output)
 
     def test_prompt_uses_steer_delivery(self):
         request = AsyncMock(return_value={"id": "interactive-session-id", "command_id": "command-1"})

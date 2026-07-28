@@ -13,10 +13,12 @@ dependencies = [
     "psutil>=6.1",
     "uvicorn>=0.34",
     "fastapi>=0.115",
+    "websockets>=13,<14",
 ]
 
 [project.scripts]
 worker-harness = "worker_harness.cli.app:main_entry"
+wh = "worker_harness.cli.app:main_entry"
 
 [build-system]
 requires = ["hatchling"]
@@ -24,3 +26,9 @@ build-backend = "hatchling.build"
 
 [tool.rye.scripts]
 worker-harness = "worker_harness.cli.app:main_entry"
+wh = "worker_harness.cli.app:main_entry"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]

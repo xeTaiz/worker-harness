@@ -1,0 +1,204 @@
+"""Native terminal client for Pi session relay attachments."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import tty
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, AsyncIterator
+
+from websockets.asyncio.client import connect
+from websockets.exceptions import WebSocketException
+
+DETACH_BYTE = b"\x1d"  # Ctrl-]
+
+
+def _relay_socket_path() -> Path:
+    configured = os.environ.get("WH_PI_HOST_RELAY_SOCKET")
+    if configured:
+        return Path(configured)
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/worker-harness-{os.getuid()}"
+    return Path(runtime) / "worker-harness" / "pi-host-relay.sock"
+
+
+async def _relay_request(payload: dict[str, Any]) -> dict[str, Any]:
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_unix_connection(_relay_socket_path()), timeout=0.5
+    )
+    try:
+        writer.write(json.dumps(payload).encode() + b"\n")
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.readline(), timeout=0.5)
+        if not raw:
+            raise RuntimeError("local Pi host relay closed without a response")
+        response = json.loads(raw)
+        if not response.get("ok"):
+            raise RuntimeError(str(response.get("error") or "local Pi session is unavailable"))
+        return response
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def focus_local_session(session_id: str) -> bool:
+    """Switch the invoking tmux client when the requested Pi pane is local."""
+
+    current_tmux = os.environ.get("TMUX", "").split(",", 1)[0]
+    if not current_tmux:
+        return False
+    try:
+        route = await _relay_request({"action": "describe", "session_id": session_id})
+    except (OSError, asyncio.TimeoutError, RuntimeError, json.JSONDecodeError):
+        return False
+    route_socket = str(route.get("tmux_socket") or "")
+    if not route_socket or os.path.realpath(route_socket) != os.path.realpath(current_tmux):
+        return False
+    target = (
+        f"{route.get('tmux_session')}:{route.get('window_index')}"
+        f".{route.get('pane_index')}"
+    )
+    result = subprocess.run(
+        ["tmux", "-S", route_socket, "switch-client", "-t", target, ";", "select-pane", "-t", target],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"could not focus local tmux pane: {result.stderr.strip()}")
+    return True
+
+
+def terminal_size(fd: int) -> tuple[int, int]:
+    try:
+        size = os.get_terminal_size(fd)
+    except OSError:
+        size = shutil.get_terminal_size(fallback=(80, 24))
+    return max(1, size.lines), max(1, size.columns)
+
+
+@contextmanager
+def raw_terminal(fd: int):
+    if not os.isatty(fd):
+        raise RuntimeError("terminal attachment requires an interactive TTY")
+    original = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original)
+
+
+async def _stdin_chunks(fd: int) -> AsyncIterator[bytes]:
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[bytes | BaseException] = asyncio.Queue()
+
+    def readable() -> None:
+        try:
+            queue.put_nowait(os.read(fd, 65536))
+        except BaseException as exc:  # surface terminal read failures in the coroutine
+            queue.put_nowait(exc)
+
+    loop.add_reader(fd, readable)
+    try:
+        while True:
+            item = await queue.get()
+            if isinstance(item, BaseException):
+                raise item
+            if not item:
+                return
+            yield item
+    finally:
+        loop.remove_reader(fd)
+
+
+async def _send_input(websocket: Any, stdin_fd: int) -> None:
+    async for chunk in _stdin_chunks(stdin_fd):
+        detach = chunk.find(DETACH_BYTE)
+        if detach >= 0:
+            if detach:
+                await websocket.send(chunk[:detach])
+            return
+        await websocket.send(chunk)
+
+
+async def _send_resizes(websocket: Any, stdout_fd: int, changed: asyncio.Event) -> None:
+    while True:
+        rows, cols = terminal_size(stdout_fd)
+        await websocket.send(json.dumps({"type": "resize", "rows": rows, "cols": cols}))
+        await changed.wait()
+        changed.clear()
+
+
+async def _receive_output(websocket: Any, stdout_fd: int) -> None:
+    async for message in websocket:
+        if isinstance(message, bytes):
+            os.write(stdout_fd, message)
+            continue
+        try:
+            frame = json.loads(message)
+        except json.JSONDecodeError:
+            os.write(stdout_fd, message.encode())
+            continue
+        if frame.get("type") == "error":
+            raise RuntimeError(str(frame.get("detail") or "terminal relay reported an error"))
+        # Status frames are protocol metadata; tmux's binary redraw is the UI.
+
+
+async def attach_terminal(
+    websocket_url: str,
+    *,
+    stdin_fd: int | None = None,
+    stdout_fd: int | None = None,
+) -> None:
+    """Attach the current TTY to a Pi relay until disconnect or Ctrl-]."""
+
+    stdin_fd = sys.stdin.fileno() if stdin_fd is None else stdin_fd
+    stdout_fd = sys.stdout.fileno() if stdout_fd is None else stdout_fd
+    if not websocket_url.startswith(("ws://", "wss://")):
+        raise RuntimeError("attach-info returned an invalid WebSocket URL")
+
+    resize_changed = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    signal_installed = False
+    try:
+        loop.add_signal_handler(signal.SIGWINCH, resize_changed.set)
+        signal_installed = True
+    except (NotImplementedError, RuntimeError):
+        pass
+
+    try:
+        async with connect(
+            websocket_url,
+            max_size=None,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=2,
+        ) as websocket:
+            with raw_terminal(stdin_fd):
+                tasks = {
+                    asyncio.create_task(_send_input(websocket, stdin_fd), name="pi-attach-input"),
+                    asyncio.create_task(_receive_output(websocket, stdout_fd), name="pi-attach-output"),
+                    asyncio.create_task(_send_resizes(websocket, stdout_fd, resize_changed), name="pi-attach-resize"),
+                }
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                for task in done:
+                    task.result()
+    except (OSError, WebSocketException, asyncio.TimeoutError) as exc:
+        raise RuntimeError(f"terminal relay unavailable: {exc}") from exc
+    finally:
+        if signal_installed:
+            loop.remove_signal_handler(signal.SIGWINCH)

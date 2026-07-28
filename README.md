@@ -36,6 +36,21 @@ The host relay enforces one attached writer. Delegated relays do not yet share a
 durable orchestrator lease, and gateway fallback is still future work, so avoid
 attaching multiple writing clients to a delegated session.
 
+For a native terminal attachment, install the CLI on each operator device and
+pick a session:
+
+```bash
+uv tool install --editable ~/Dev/worker-harness
+wh pi attach                         # interactive fzf picker
+wh pi attach <id-prefix-or-name>     # select directly
+```
+
+Press `Ctrl-]` to detach. When invoked from tmux, the client switches directly
+to an original pane in the same local tmux server; remote/delegated sessions
+stream their raw PTY into the current terminal. Pass `--stream` to force the
+relay path even for a local pane. The companion dotfiles bind prefix + `A` to a
+95% tmux popup running the picker.
+
 Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 
 ## Build images
