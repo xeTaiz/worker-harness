@@ -52,7 +52,7 @@ Press `Ctrl-]` to detach. When invoked from tmux, the client switches directly
 to an original pane in the same local tmux server; remote/delegated sessions
 stream their raw PTY into the current terminal. Pass `--stream` to force the
 relay path even for a local pane. The companion dotfiles bind prefix + `A` to a
-95% tmux popup running the picker.
+disposable fullscreen tmux window running the picker.
 
 Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 

@@ -133,10 +133,19 @@ async def _send_input(websocket: Any, stdin_fd: int) -> None:
 
 
 async def _send_resizes(websocket: Any, stdout_fd: int, changed: asyncio.Event) -> None:
+    last_size: tuple[int, int] | None = None
     while True:
-        rows, cols = terminal_size(stdout_fd)
-        await websocket.send(json.dumps({"type": "resize", "rows": rows, "cols": cols}))
-        await changed.wait()
+        size = terminal_size(stdout_fd)
+        if size != last_size:
+            rows, cols = size
+            await websocket.send(json.dumps({"type": "resize", "rows": rows, "cols": cols}))
+            last_size = size
+        # SIGWINCH is the fast path. Polling closes gaps in nested tmux and on
+        # platforms that update the PTY dimensions without delivering it.
+        try:
+            await asyncio.wait_for(changed.wait(), timeout=0.5)
+        except asyncio.TimeoutError:
+            pass
         changed.clear()
 
 

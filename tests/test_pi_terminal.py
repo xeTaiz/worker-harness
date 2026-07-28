@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import pty
 import subprocess
@@ -39,6 +41,23 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(pi_terminal, "_stdin_chunks", chunks):
             await pi_terminal._send_input(websocket, 0)
         self.assertEqual(websocket.sent, [b"hello", b"before"])
+
+    async def test_resize_poll_detects_nested_tmux_size_change_without_signal(self):
+        websocket = FakeWebSocket()
+        sizes = iter([(24, 80), (24, 80), (40, 120), (40, 120)])
+        with patch.object(pi_terminal, "terminal_size", side_effect=lambda _fd: next(sizes, (40, 120))):
+            task = asyncio.create_task(pi_terminal._send_resizes(websocket, 1, asyncio.Event()))
+            for _ in range(20):
+                if len(websocket.sent) >= 2:
+                    break
+                await asyncio.sleep(0.1)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        frames = [json.loads(message) for message in websocket.sent]
+        self.assertEqual(frames, [
+            {"type": "resize", "rows": 24, "cols": 80},
+            {"type": "resize", "rows": 40, "cols": 120},
+        ])
 
     async def test_receive_output_writes_binary_and_ignores_status(self):
         read_fd, write_fd = os.pipe()
