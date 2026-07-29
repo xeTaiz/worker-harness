@@ -80,7 +80,7 @@ Delegated Pi, worker:
   PWA            -- orchestrator gateway fallback --> worker relay ------^
 ```
 
-CLI and multiplexer clients prefer direct Tailnet attachment. The Tailnet-served PWA uses the orchestrator gateway by default to avoid per-host browser/TLS/origin setup. CLI clients fall back to the gateway when direct relay connection fails. Both paths use the same terminal frame protocol and durable writer lease.
+CLI and multiplexer clients prefer direct Tailnet attachment. The Tailnet-served PWA uses the orchestrator gateway by default to avoid per-host browser/TLS/origin setup. CLI clients fall back to the gateway when direct relay connection fails. Both paths use the same terminal frame protocol and bounded multi-attachment policy.
 
 **V1 transport decision:** direct relay TCP `27888` is the primary data path and the only relay port published through Tailscale Serve. The previously explored internal `SessionTunnelManager`/SSH-local-forward replacement is not part of the current roadmap. Reconsider it only if direct Tailnet relay reachability or the approved ACL posture proves insufficient. The existing user-managed tunnel plane remains separate.
 
@@ -173,7 +173,7 @@ The tmux implementation is feature-complete. The bridge captures stable tmux soc
 
 The remaining tmux work is rollout and acceptance across all hosts, not new attachment architecture. Attachments created before pane-marker support must be reopened once before cycling.
 
-Zellij follows durable leasing and gateway fallback. Its adapter must provide the same behavior: exact local-pane focus where the Zellij API permits it, remote PTY attachment, resize, detach, and cross-agent cycling. A full plugin is optional; CLI and keybinding parity come first.
+Zellij follows multi-attachment hardening and gateway fallback. Its adapter must provide the same behavior: exact local-pane focus where the Zellij API permits it, remote PTY attachment, resize, detach, and cross-agent cycling. A full plugin is optional; CLI and keybinding parity come first.
 
 ### 6.2 Terminal protocol
 
@@ -185,43 +185,42 @@ Protocol v2, currently deployed, contains:
 - `close(reason)`;
 - `status`/reconnect metadata.
 
-Direct and gateway routes share this framing. Protocol v3 will add `role`, lease identity, monotonic writer epoch, lease-loss/handoff status, and reconnect metadata. The gateway remains a byte transport proxy and does not reinterpret Pi semantics.
+Direct and gateway routes share this framing. Multiple WebSockets are normal tmux clients; no protocol-level writer ownership or durable lease is added. The gateway remains a byte transport proxy and does not reinterpret Pi semantics.
 
-### 6.3 Durable writer lease and handoff — next milestone
+### 6.3 Multi-attachment robustness — next milestone
 
-The current relays are not a durable ownership system: the interactive host relay has an in-memory one-writer exclusion, while the delegated worker relay does not yet provide equivalent durable fencing. Before Zellij, both relays must implement one shared model:
+The fabric is single-operator and intentionally permits multiple read-write clients to view and type into the same tmux pane. Reattachment/handoff means opening another ordinary tmux client; it is not an ownership transfer. The original physical terminal remains usable.
 
-- the orchestrator SQLite database is authoritative for the current writer lease and monotonic per-session writer epoch;
-- one read-write attachment is allowed per session;
-- read-only observers never send terminal input and do not own the writer lease;
-- a stable device ID plus unique attach/lease ID identifies the holder for UI, renew, reconnect, and audit;
-- lease acquisition, renewal, release, expiry, and explicit takeover are serialized transactionally using orchestrator time;
-- a higher epoch fences every lower-epoch writer on both direct and gateway paths;
-- cycling and clean detach release promptly; crash recovery relies on bounded expiry;
-- reconnect with the same unexpired lease resumes the same tmux client view without restarting Pi;
-- cross-device takeover closes or demotes the old writer and redraws the same surviving Pi session on the new device.
+Detailed implementation TODOs:
 
-For restart-safe fencing, a relay must not forget the highest accepted epoch. The implementation must either persist the high-water mark locally and have the orchestrator synchronize each grant before returning it to a client, or use an equivalently strong relay-validation mechanism. Merely carrying an epoch from the client to an in-memory relay is insufficient because a relay restart could temporarily admit a stale writer.
+1. **Common policy:** allow at most eight live attachments per Pi session on both host and worker relays. Reject the ninth with a typed `attachment_limit` error and a stable WebSocket close code. Expose active counts in relay health/metrics.
+2. **Per-connection identity:** allocate an in-memory attachment ID for exact cleanup. Never key cleanup solely by session ID.
+3. **One-hour inactivity:** track application activity per attachment. Terminal input, output, and resize frames refresh activity; WebSocket ping/pong alone does not. After more than 3600 seconds without application activity, send `{type:"status", state:"idle-timeout"}`, close only that attachment, and leave Pi/tmux running.
+4. **Worker relay:** add an async-safe per-session reservation/count around `_relay_terminal`; release in `finally`; add a watchdog task to each PTY/WebSocket pair; make limits/timeouts configurable for tests while defaulting to `8` and `3600`.
+5. **Interactive host relay:** replace `Map<sessionId, Attachment>` with per-session attachment-ID sets/maps and reserve capacity during WebSocket upgrade so simultaneous opens cannot exceed the cap.
+6. **Shared tmux window state:** snapshot/unzoom/zoom once for the first attachment to a pane, reference-count subsequent attachments, and restore the operator's original active pane/zoom only after the final attachment closes and only when the relay-applied state still matches. Concurrent relay attachment to two different target panes in one shared tmux window must fail explicitly rather than corrupting zoom state.
+7. **Route lifecycle:** unregister, stale-route reap, relay shutdown, PTY exit, WebSocket close, and idle timeout must each clean every relevant attachment idempotently without killing the source Pi session.
+8. **Resize semantics:** retain tmux `window-size latest`; the most recently connected/resized client controls shared dimensions. Clients send resize only when their actual dimensions change, avoiding continuous contention. Document this single-operator tradeoff.
+9. **Native UX:** direct attach remains first choice; an idle-timeout status restores the local TTY and returns the fullscreen attachment window to the attachable-agent selector. `Ctrl-]`, `Ctrl-a x`, and cycling remain immediate clean detach paths.
+10. **PWA UX:** idle timeout closes the terminal socket and returns to the session selector/list. Manual reconnect creates a fresh ordinary attachment; no ownership recovery state is required.
+11. **Compatibility:** keep protocol v2 framing and legacy `websocket_url`. Add fields/status codes compatibly; no database migration or protocol-v3 lease rollout is required.
+12. **Tests:** cover two simultaneous read-write clients, cap/release races, one-hour timeout with a short test clock, input/output/resize activity refresh, source-session survival, final-only zoom restoration, route teardown, and current tmux sizing behavior.
 
-Proposed timing is a 30-second lease with renewal every 10 seconds. Existing direct streams should remain usable during a short orchestrator outage; no new takeover can occur until authority returns. Final expiry/grace behavior and takeover confirmation are explicit decisions to settle before implementation.
+### 6.4 Orchestrator gateway fallback — follows multi-attach hardening
 
-The lease unquestionably fences Worker Harness relay/gateway writers. The original physical tmux client on the source host is a separate decision: leaving it as trusted break-glass access is simple and matches the Tailnet/single-operator model, while strict exclusivity would require dynamically toggling matching tmux clients read-only (`switch-client -r`) and reliably restoring them as they navigate. V1 must state which guarantee it makes rather than implying that a remote lease can silently control arbitrary local keyboard input.
+The control service on `:12889` exposes a WebSocket gateway that resolves the same direct host/worker relay as `attach-info`, opens it upstream, and pumps protocol-v2 frames in both directions. A gateway stream is simply another bounded attachment and may coexist with direct clients.
 
-Observer support should begin with delegated sessions. Interactive tmux observers must not zoom or resize the operator's shared source window; semantic transcript viewing remains the safe read-only fallback until a non-perturbing raw observer path is proven.
+Detailed implementation TODOs:
 
-### 6.4 Orchestrator gateway fallback — following lease enforcement
-
-The control service on `:12889` will expose a WebSocket gateway that opens the selected direct host/worker relay upstream and pumps protocol frames in both directions. It uses the same lease and writer epoch as the direct path; direct and gateway clients therefore cannot become simultaneous writers.
-
-The gateway requirements are:
-
-- no SQLite work in the per-frame byte pumps;
-- strict receive-then-send backpressure with bounded WebSocket queues;
-- no unbounded terminal buffering or dropped terminal bytes;
-- per-send stall watchdog and clean close propagation;
-- a small configurable concurrency cap and observable refusal/health metrics;
-- direct-first fallback for CLI/multiplexer clients and gateway-first same-origin behavior for the PWA;
-- reconnect using the existing lease where valid, otherwise an explicit lease-lost/takeover flow.
+1. Extend `attach-info` compatibly with `direct_websocket_url` and `gateway_websocket_url`, retaining `websocket_url` as the direct URL for old clients.
+2. Add `WS /api/v1/pi/sessions/{id}/attach-gateway` only to the operator control service; never add it to worker ingest `:12888`.
+3. Resolve session state and direct relay target once before pumping. Forward only validated initial `rows`/`cols` query parameters upstream.
+4. Use two strict receive-then-send tasks with no unbounded intermediate terminal queue and no SQLite work per frame. Preserve text/binary frames exactly.
+5. Bound WebSocket library queues, cap concurrent gateway streams, apply a per-send stall watchdog, and propagate close/cancellation in both directions. Never persist or log terminal payload bytes.
+6. Native CLI/tmux/Zellij clients try direct first and use gateway only for connection/upgrade failures. They must not fallback after a deliberate idle timeout or clean detach.
+7. The PWA uses gateway first for same-origin reliability, then direct if the gateway cannot be opened. Display the active transport accurately.
+8. Add gateway active/refused/close-reason metrics and health visibility.
+9. Test binary and JSON frame fidelity, bidirectional close, unavailable upstream, direct/gateway coexistence under the relay cap, slow-client timeout/backpressure, and URL construction behind HTTP/HTTPS.
 
 ## 7. Session data and APIs
 
@@ -236,7 +235,6 @@ pi_sessions(
   model, pi_version, config_revision,
   terminal_locator JSON, attachable,
   state, last_activity_ts, parent_session_id nullable,
-  writer_epoch,
   created_at, stopped_at
 )
 
@@ -249,14 +247,9 @@ pi_delegations(
   id, parent_session_id, worker_id, child_session_id,
   task, state, created_at, completed_at
 )
-
-pi_attach_leases(
-  session_id, lease_id, device_id, client_label,
-  role, writer_epoch, acquired_at, renewed_at, expires_at
-)
 ```
 
-`pi_attach_leases` stores the current durable writer holder; lease lifecycle and handoff events are also appended to `pi_session_events` for diagnosis. `writer_epoch` is monotonic and never reused. Observers may be connection-scoped rather than durable rows, but are bounded and visible in attachment status/metrics.
+Terminal attachments are deliberately connection-scoped and are not persisted in SQLite. The relays expose bounded live attachment counts/metrics; reconnecting creates a normal new tmux client rather than recovering ownership state.
 
 Extend jobs with:
 
@@ -281,13 +274,10 @@ POST /api/v1/pi/sessions/{id}:cancel
 POST /api/v1/pi/delegations
 GET  /api/v1/pi/delegations/{id}
 GET  /api/v1/pi/sessions/{id}/attach-info
-POST /api/v1/pi/sessions/{id}/attach-leases
-POST /api/v1/pi/sessions/{id}/attach-leases/{lease_id}:renew
-DELETE /api/v1/pi/sessions/{id}/attach-leases/{lease_id}
 WS   /api/v1/pi/sessions/{id}/attach-gateway
 ```
 
-Lease mutation is explicit and never hidden in a cacheable `GET`. `attach-info` reports protocol capabilities plus direct and gateway URLs. Acquisition returns `409` when another unexpired writer holds the session unless the caller explicitly requests a confirmed takeover.
+`attach-info` reports protocol capabilities plus direct and gateway URLs. Neither path acquires durable ownership: each successful WebSocket is one bounded attachment to the same underlying tmux session.
 
 Worker-ingest endpoints on `:12888`:
 
@@ -358,8 +348,8 @@ It selects the likely target from session name, CWD, recent activity, and explic
 
 1. **CLI:** `wh pi sessions`, `wh pi events`, `wh pi prompt`, and `wh pi attach` are implemented. `wh pi watch` and a CLI delegation convenience command remain optional parity work because the Pi extension already exposes delegation.
 2. **tmux:** local exact-pane focus and remote attachment are implemented, including fullscreen resize, detach, and cross-agent cycling.
-3. **Zellij:** follows lease and gateway completion and reuses the same discovery/attachment contract; it is a client adapter, not a new session plane.
-4. **Mobile webapp/PWA:** the Tailnet-served session directory, durable semantic transcript, session switching, prompt/steer composer, model/thinking controls, and terminal preview are implemented. Durable writer/observer UX, gateway transport, HTTPS installation, and optional xterm-grade rendering remain.
+3. **Zellij:** follows multi-attachment hardening and gateway completion and reuses the same discovery/attachment contract; it is a client adapter, not a new session plane.
+4. **Mobile webapp/PWA:** the Tailnet-served session directory, durable semantic transcript, session switching, prompt/steer composer, model/thinking controls, and terminal preview are implemented. Gateway transport, idle-detach UX, HTTPS installation, and optional xterm-grade rendering remain.
 
 The global router in §9 is an orthogonal agent/service, not another terminal client. Its implementation and acceptance must not be combined with Zellij or PWA delivery milestones.
 
@@ -373,11 +363,11 @@ Semantic transcript events share the durable `pi_session_events` log. SQLite ass
 - Ordinary interactive bridges register on `:12889`, survive incarnation replacement, report lifecycle/model/thinking state, upload durable sanitized transcript events, and claim/ack prompt/configure commands. Delegated reports enter through `:12888`; stale projections receive permanent `410 Gone` handling.
 - SQLite sequence cursors, bounded replay, SSE, latest-exchange backfill, and the mobile-first semantic webapp are implemented. Live acceptance still needs repeated-reload deduplication and orchestrator-restart bridge re-registration checks.
 - Direct protocol-v2 terminal relays are implemented for delegated worker sessions and ordinary tmux sessions. The native CLI supports attachable-only discovery, exact local-pane focus, remote fullscreen streaming, reliable initial/dynamic sizing, `Ctrl-]`, and a dedicated tmux cycling key table. The latest tmux slice is feature-complete; fleet rollout and a local/remote/delegated cycling matrix remain.
-- The next shared milestones are protocol-v3 durable writer leases/handoff, observer semantics, and the orchestrator gateway. Zellij follows those shared layers. The global router remains a separate orthogonal milestone.
+- The next shared milestones are bounded multi-attachment/idle cleanup and the orchestrator gateway. Zellij follows those shared layers. The global router remains a separate orthogonal milestone.
 
 ### M0 — contracts and schema — complete
 
-Define session/job schemas, state transitions, relay frame protocol, direct-vs-gateway transport selection, and orchestrator-only SQLite write ownership. Protocol-v3 attachment-lease schema is added in M3b.
+Define session/job schemas, state transitions, relay frame protocol, direct-vs-gateway transport selection, and orchestrator-only SQLite write ownership. Terminal attachments remain ephemeral relay state.
 
 **Gate:** schema/API unit tests cover state transitions, stale session reaping, event idempotency, and linked job visibility.
 
@@ -399,17 +389,17 @@ The host relay, native terminal client, direct local focus, remote PTY stream, f
 
 **Remaining gate:** deploy current Worker Harness/dotfiles to every operator and interactive host; validate local→local, local→remote, remote→local, and delegated cycling plus reconnect and clean detach.
 
-### M3b — durable lease, observers, and handoff — next
+### M3b — bounded multi-attachment and idle cleanup — next
 
-Implement protocol-v3 lease APIs, monotonic writer epochs, restart-safe relay fencing, one writer across direct/gateway paths, bounded observers, renew/release/takeover, and client reconnect state machines.
+Allow up to eight concurrent read-write clients per Pi session on both relays, with exact per-connection cleanup, shared tmux zoom reference counting, one-hour application inactivity detach, and selector return UX.
 
-**Gate:** two devices cannot write concurrently; explicit handoff continues the same Pi session; stale clients are fenced even across relay/orchestrator restart; observer input is impossible; crash recovery converges within the documented bound.
+**Gate:** eight simultaneous clients can view/type; the ninth is rejected; activity refreshes the timer; an idle client detaches without ending Pi; the final disconnect alone restores source layout; reconnect is an ordinary new attachment.
 
 ### M3c — orchestrator gateway fallback — follows M3b
 
-Implement the bounded `:12889` WebSocket proxy using the same protocol-v3 lease and frame semantics. PWA uses gateway-first; CLI/multiplexer clients use direct-first with fallback.
+Implement the bounded `:12889` protocol-v2 WebSocket proxy. PWA uses gateway-first; CLI/multiplexer clients use direct-first with fallback.
 
-**Gate:** direct and gateway clients race safely under one writer epoch; resize/input/detach/reconnect work through the proxy; slow/dead clients cannot create unbounded memory or starve control-plane SQLite work.
+**Gate:** direct and gateway clients coexist under the relay cap; resize/input/detach and idle timeout work through the proxy; slow/dead clients cannot create unbounded memory or starve control-plane SQLite work.
 
 ### M4 — worker daemon session service — complete
 
@@ -425,21 +415,21 @@ Implement worker child launch, fixed tool profile, `bash` override, local tmux e
 
 ### M6 — sync delegation and worker-child attach — direct path complete
 
-Sync wait/result behavior, truthful cancellation/timeout handling, direct worker-child attachment, and linked session/job UI details are implemented. Durable ownership and gateway transport are shared M3b/M3c work rather than delegation-specific work.
+Sync wait/result behavior, truthful cancellation/timeout handling, direct worker-child attachment, and linked session/job UI details are implemented. Multi-attachment hardening and gateway transport are shared M3b/M3c work rather than delegation-specific work.
 
 **Gate:** attach to a running delegated child from a second device, inspect its command logs, cancel it, and observe terminal/session/job convergence; then rerun through the gateway after M3c.
 
 ### M7 — Zellij adapter — after M3c
 
-Implement Zellij registration metadata, exact local focus where supported, remote PTY attachment, resize/detach, and the same cross-agent cycling UX. Reuse protocol v3, leases, and gateway fallback; do not invent a second attachment control plane.
+Implement Zellij registration metadata, exact local focus where supported, remote PTY attachment, resize/detach, and the same cross-agent cycling UX. Reuse protocol v2 multi-attach and gateway fallback; do not invent a second attachment control plane.
 
-**Gate:** Zellij focuses an existing local Pi pane or opens a remote attachment, then cycles between local/remote/delegated agents with the same ownership and handoff behavior as tmux.
+**Gate:** Zellij focuses an existing local Pi pane or opens a remote attachment, then cycles between local/remote/delegated agents with the same behavior as tmux.
 
 ### M8 — PWA attachment hardening
 
-Add writer/observer/takeover UI, automatic gateway reconnect, lease-loss handling, and HTTPS publication for installable behavior. An xterm-grade renderer is optional and does not block semantic chat.
+Add gateway fallback, inactivity return-to-selector UX, manual/automatic reconnect affordances, and HTTPS publication for installable behavior. An xterm-grade renderer is optional and does not block semantic chat.
 
-**Gate:** a phone/browser observes or owns a session through the gateway, survives reload/network interruption, and hands ownership to/from the native client without duplicate writers.
+**Gate:** a phone/browser attaches through the gateway, detaches cleanly after inactivity, trivially reconnects from the selector, and may coexist with native clients.
 
 ### M9 — global router — orthogonal
 
@@ -454,9 +444,9 @@ Completed spikes: tmux PTY relay/direct WebSocket/resize/input, bridge replaceme
 Remaining work, in order:
 
 1. **Tmux closure matrix:** current versions on every host; local/remote/delegated cycle and wraparound; reconnect; orchestrator restart re-registration; repeated web reload without duplicate backfill.
-2. **Lease/fence prototype:** two clients contend for one delegated session; transactional acquire/renew/release/takeover; relay restart preserves the high-water fence; old writer cannot send after takeover.
-3. **Observer prototype:** delegated `tmux attach -r` path, input dropped by relay, bounded observer count, no effect on writer dimensions. Interactive raw observers remain gated on a non-perturbing layout/size proof.
-4. **Gateway backpressure:** direct upstream relay plus deliberately slow downstream client; prove bounded memory, send watchdog, close propagation, and direct/gateway writer fencing.
+2. **Multi-attach prototype:** eight concurrent clients to one delegated and one interactive session; ninth rejection; activity-refresh and short-clock idle timeout; shared zoom final-only restore; underlying Pi survives every detach.
+3. **Gateway backpressure:** direct upstream relay plus deliberately slow downstream client; prove frame fidelity, bounded memory, send watchdog, close propagation, and coexistence with direct clients.
+4. **Native/PWA fallback:** force direct connection failure, confirm gateway selection, idle-timeout return to selector, and immediate reattach.
 5. **Zellij adapter spike:** stable session/tab/pane identity, exact local focus command, second-client PTY behavior, resize semantics, and detach cleanup before production integration.
 6. **PWA HTTPS:** choose Tailnet HTTPS publication and validate service-worker installation/update behavior.
 
@@ -469,5 +459,5 @@ Remaining work, in order:
 - Git/checkouts/deploy keys on workers for Pi release distribution.
 - Public browser access, Funnel, native mobile apps, and multi-tenant operation.
 - Replacing direct relay `27888` with an internal SSH `SessionTunnelManager` unless a demonstrated reachability/ACL problem reopens that decision.
-- Collaborative multi-writer terminals, CRDT terminal editing, or treating interleaved concurrent input as acceptable ownership semantics.
+- Durable writer leases, ownership transfer, collaborative editing guarantees, or CRDT terminal semantics. Concurrent input from the single operator is allowed and follows normal tmux arrival ordering.
 - Guaranteeing exactly-once execution; commands/events remain idempotent and uncertainty is surfaced explicitly.
