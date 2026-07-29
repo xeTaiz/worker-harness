@@ -120,6 +120,12 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PiTerminalTests(unittest.TestCase):
+    def test_terminal_url_adds_initial_dimensions_and_preserves_query(self):
+        self.assertEqual(
+            pi_terminal.terminal_url("ws://host/attach?token=x", 52, 188),
+            "ws://host/attach?token=x&rows=52&cols=188",
+        )
+
     def test_raw_terminal_restores_attributes(self):
         master_fd, slave_fd = pty.openpty()
         try:

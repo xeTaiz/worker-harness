@@ -14,6 +14,7 @@ import tty
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from websockets.asyncio.client import connect
 from websockets.exceptions import WebSocketException
@@ -164,6 +165,15 @@ async def _receive_output(websocket: Any, stdout_fd: int) -> None:
         # Status frames are protocol metadata; tmux's binary redraw is the UI.
 
 
+def terminal_url(websocket_url: str, rows: int, cols: int) -> str:
+    """Include initial PTY dimensions in the WebSocket upgrade request."""
+
+    parts = urlsplit(websocket_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.update({"rows": str(rows), "cols": str(cols)})
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
 async def attach_terminal(
     websocket_url: str,
     *,
@@ -176,6 +186,9 @@ async def attach_terminal(
     stdout_fd = sys.stdout.fileno() if stdout_fd is None else stdout_fd
     if not websocket_url.startswith(("ws://", "wss://")):
         raise RuntimeError("attach-info returned an invalid WebSocket URL")
+
+    initial_rows, initial_cols = terminal_size(stdout_fd)
+    websocket_url = terminal_url(websocket_url, initial_rows, initial_cols)
 
     resize_changed = asyncio.Event()
     loop = asyncio.get_running_loop()
