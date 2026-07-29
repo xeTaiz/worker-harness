@@ -205,6 +205,8 @@ For restart-safe fencing, a relay must not forget the highest accepted epoch. Th
 
 Proposed timing is a 30-second lease with renewal every 10 seconds. Existing direct streams should remain usable during a short orchestrator outage; no new takeover can occur until authority returns. Final expiry/grace behavior and takeover confirmation are explicit decisions to settle before implementation.
 
+The lease unquestionably fences Worker Harness relay/gateway writers. The original physical tmux client on the source host is a separate decision: leaving it as trusted break-glass access is simple and matches the Tailnet/single-operator model, while strict exclusivity would require dynamically toggling matching tmux clients read-only (`switch-client -r`) and reliably restoring them as they navigate. V1 must state which guarantee it makes rather than implying that a remote lease can silently control arbitrary local keyboard input.
+
 Observer support should begin with delegated sessions. Interactive tmux observers must not zoom or resize the operator's shared source window; semantic transcript viewing remains the safe read-only fallback until a non-perturbing raw observer path is proven.
 
 ### 6.4 Orchestrator gateway fallback — following lease enforcement
