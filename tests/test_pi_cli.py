@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 from typer.testing import CliRunner
 
@@ -64,6 +64,21 @@ class PiCliTests(unittest.TestCase):
         parsed = json.loads(result.output)
         self.assertEqual([row["id"] for row in parsed], ["interactive-session-id"])
 
+    def test_cycle_order_wraps_in_both_directions(self):
+        rows = [
+            {**self._session(), "id": "first"},
+            {**self._session(), "id": "second"},
+            {**self._session(), "id": "third"},
+        ]
+        self.assertEqual(
+            [row["id"] for row in pi._cycle_order(rows, "second", "next")],
+            ["third", "first"],
+        )
+        self.assertEqual(
+            [row["id"] for row in pi._cycle_order(rows, "second", "previous")],
+            ["first", "third"],
+        )
+
     def test_attach_picker_filters_non_attachable_sessions(self):
         rows = [self._session(), {**self._session(), "id": "offline"}]
         request = AsyncMock(side_effect=[
@@ -96,7 +111,7 @@ class PiCliTests(unittest.TestCase):
             },
         ])
         focus = AsyncMock(return_value=False)
-        terminal = AsyncMock()
+        terminal = AsyncMock(return_value=None)
         with (
             patch.object(pi, "_request", new=request),
             patch("worker_harness.pi_terminal.focus_local_session", new=focus),
@@ -106,16 +121,48 @@ class PiCliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         focus.assert_awaited_once_with("interactive-session-id")
         terminal.assert_awaited_once_with(
-            "ws://100.64.0.2:27888/v1/sessions/interactive-session-id/attach"
+            "ws://100.64.0.2:27888/v1/sessions/interactive-session-id/attach",
+            cycle_requests=ANY,
         )
         self.assertEqual(request.await_args_list[1].args, (
             "GET", "/api/v1/pi/sessions/interactive-session-id/attach-info"
         ))
 
+    def test_attach_cycles_to_next_available_session(self):
+        first = {**self._session(), "id": "first"}
+        second = {**self._session(), "id": "second", "name": "second-agent"}
+        request = AsyncMock(side_effect=[
+            [first, second],
+            {
+                "attachable": True,
+                "protocol_version": 2,
+                "websocket_url": "ws://relay/first",
+            },
+            [first, second],
+            {"attachable": True},
+            {
+                "attachable": True,
+                "protocol_version": 2,
+                "websocket_url": "ws://relay/second",
+            },
+        ])
+        terminal = AsyncMock(side_effect=["next", None])
+        with (
+            patch.object(pi, "_request", new=request),
+            patch.object(pi, "_mark_attach_pane"),
+            patch("worker_harness.pi_terminal.attach_terminal", new=terminal),
+        ):
+            result = self.runner.invoke(pi.app, ["attach", "first", "--stream"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            [call.args[0] for call in terminal.await_args_list],
+            ["ws://relay/first", "ws://relay/second"],
+        )
+
     def test_attach_focuses_local_tmux_without_requesting_attach_info(self):
         request = AsyncMock(return_value=[self._session()])
         focus = AsyncMock(return_value=True)
-        terminal = AsyncMock()
+        terminal = AsyncMock(return_value=None)
         with (
             patch.object(pi, "_request", new=request),
             patch("worker_harness.pi_terminal.focus_local_session", new=focus),

@@ -51,8 +51,11 @@ wh pi attach <id-prefix-or-name>     # select directly
 Press `Ctrl-]` to detach. When invoked from tmux, the client switches directly
 to an original pane in the same local tmux server; remote/delegated sessions
 stream their raw PTY into the current terminal. Pass `--stream` to force the
-relay path even for a local pane. The companion dotfiles bind prefix + `A` to a
-disposable fullscreen tmux window running the picker.
+relay path even for a local pane. The companion dotfiles reserve `Ctrl-a` as a
+secondary Worker Harness prefix while leaving tmux's normal `Ctrl-b` prefix
+unchanged: `Ctrl-a Ctrl-a` opens a disposable fullscreen attachment,
+`Ctrl-a j/l` cycles to the next attachable Pi agent, `Ctrl-a h/k` cycles to the
+previous one, and `Ctrl-a x` disconnects.
 
 Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 

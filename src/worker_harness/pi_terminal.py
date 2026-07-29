@@ -179,8 +179,9 @@ async def attach_terminal(
     *,
     stdin_fd: int | None = None,
     stdout_fd: int | None = None,
-) -> None:
-    """Attach the current TTY to a Pi relay until disconnect or Ctrl-]."""
+    cycle_requests: asyncio.Queue[str] | None = None,
+) -> str | None:
+    """Attach until disconnect/Ctrl-], returning a requested cycle direction."""
 
     stdin_fd = sys.stdin.fileno() if stdin_fd is None else stdin_fd
     stdout_fd = sys.stdout.fileno() if stdout_fd is None else stdout_fd
@@ -213,12 +214,19 @@ async def attach_terminal(
                     asyncio.create_task(_receive_output(websocket, stdout_fd), name="pi-attach-output"),
                     asyncio.create_task(_send_resizes(websocket, stdout_fd, resize_changed), name="pi-attach-resize"),
                 }
+                cycle_task: asyncio.Task[str] | None = None
+                if cycle_requests is not None:
+                    cycle_task = asyncio.create_task(cycle_requests.get(), name="pi-attach-cycle")
+                    tasks.add(cycle_task)
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                direction = cycle_task.result() if cycle_task in done else None
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
                 for task in done:
-                    task.result()
+                    if task is not cycle_task:
+                        task.result()
+                return direction
     except (OSError, WebSocketException, asyncio.TimeoutError) as exc:
         raise RuntimeError(f"terminal relay unavailable: {exc}") from exc
     finally:

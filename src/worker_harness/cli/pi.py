@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 from urllib.parse import quote
@@ -126,6 +127,23 @@ def _resolve_session(rows: list[dict], target: str) -> dict:
     raise RuntimeError(f"Pi session selector {target!r} is ambiguous")
 
 
+def _cycle_order(rows: list[dict], current_session_id: str, direction: str) -> list[dict]:
+    """Return candidates after the current session, wrapping in picker order."""
+
+    if direction not in {"next", "previous"}:
+        raise ValueError(f"unknown cycle direction {direction!r}")
+    if len(rows) < 2:
+        return []
+    current_index = next(
+        (index for index, row in enumerate(rows) if str(row.get("id") or "") == current_session_id),
+        -1,
+    )
+    step = 1 if direction == "next" else -1
+    if current_index < 0:
+        return rows if step > 0 else list(reversed(rows))
+    return [rows[(current_index + step * offset) % len(rows)] for offset in range(1, len(rows))]
+
+
 async def _attachable_candidates(rows: list[dict]) -> list[dict]:
     async def available(row: dict) -> dict | None:
         session_id = str(row.get("id") or "")
@@ -139,6 +157,36 @@ async def _attachable_candidates(rows: list[dict]) -> list[dict]:
 
     checked = await asyncio.gather(*(available(row) for row in rows))
     return [row for row in checked if row is not None]
+
+
+async def _cycle_session(current_session_id: str, direction: str) -> dict:
+    candidates = _attach_candidates(await _request("GET", "/api/v1/pi/sessions"))
+    available = await _attachable_candidates(
+        _cycle_order(candidates, current_session_id, direction)
+    )
+    if not available:
+        raise RuntimeError("no other attachable Pi sessions are registered")
+    return available[0]
+
+
+def _mark_attach_pane(session_id: str | None) -> None:
+    """Expose attachment state to the dedicated tmux key table."""
+
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return
+    command = ["tmux", "set-option", "-p", "-t", pane]
+    if session_id:
+        command.extend(["@wh_pi_attach_session", session_id])
+    else:
+        command.extend(["-u", "@wh_pi_attach_session"])
+    subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
 
 
 def _pick_session(rows: list[dict]) -> dict:
@@ -213,20 +261,43 @@ def attach(
             if target
             else _pick_session(await _attachable_candidates(candidates))
         )
-        session_id = str(selected.get("id") or "")
-        if not stream and await focus_local_session(session_id):
-            return
-        info = await _request(
-            "GET", f"/api/v1/pi/sessions/{quote(session_id, safe='')}/attach-info"
-        )
-        if not info.get("attachable"):
-            raise RuntimeError(str(info.get("reason") or "Pi session is not attachable"))
-        if int(info.get("protocol_version") or 0) != 2:
-            raise RuntimeError(
-                f"unsupported Pi terminal protocol {info.get('protocol_version')!r}; expected 2"
-            )
-        websocket_url = str(info.get("websocket_url") or "")
-        await attach_terminal(websocket_url)
+        cycle_requests: asyncio.Queue[str] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        installed_signals: list[signal.Signals] = []
+        for signum, direction in ((signal.SIGUSR1, "next"), (signal.SIGUSR2, "previous")):
+            try:
+                loop.add_signal_handler(signum, cycle_requests.put_nowait, direction)
+                installed_signals.append(signum)
+            except (NotImplementedError, RuntimeError):
+                pass
+
+        try:
+            while True:
+                session_id = str(selected.get("id") or "")
+                _mark_attach_pane(session_id)
+                if not stream and await focus_local_session(session_id):
+                    return
+                info = await _request(
+                    "GET", f"/api/v1/pi/sessions/{quote(session_id, safe='')}/attach-info"
+                )
+                if not info.get("attachable"):
+                    raise RuntimeError(str(info.get("reason") or "Pi session is not attachable"))
+                if int(info.get("protocol_version") or 0) != 2:
+                    raise RuntimeError(
+                        f"unsupported Pi terminal protocol {info.get('protocol_version')!r}; expected 2"
+                    )
+                websocket_url = str(info.get("websocket_url") or "")
+                direction = await attach_terminal(
+                    websocket_url,
+                    cycle_requests=cycle_requests,
+                )
+                if direction is None:
+                    return
+                selected = await _cycle_session(session_id, direction)
+        finally:
+            _mark_attach_pane(None)
+            for signum in installed_signals:
+                loop.remove_signal_handler(signum)
 
     try:
         asyncio.run(run())
