@@ -53,9 +53,10 @@ to an original pane in the same local tmux server; remote/delegated sessions
 stream their raw PTY into the current terminal. Pass `--stream` to force the
 relay path even for a local pane. The companion dotfiles reserve `Ctrl-a` as a
 secondary Worker Harness prefix while leaving tmux's normal `Ctrl-b` prefix
-unchanged: `Ctrl-a Ctrl-a` opens a disposable fullscreen attachment,
-`Ctrl-a j/l` cycles to the next attachable Pi agent, `Ctrl-a h/k` cycles to the
-previous one, and `Ctrl-a x` disconnects.
+unchanged: `Ctrl-a Ctrl-a` opens the attachment picker (switching directly to
+same-server panes), `Ctrl-a Ctrl-j/Ctrl-l` cycles to the next attachable Pi
+agent, `Ctrl-a Ctrl-h/Ctrl-k` cycles to the previous one, and `Ctrl-a x`
+disconnects a stream or leaves a directly focused local agent.
 
 Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 

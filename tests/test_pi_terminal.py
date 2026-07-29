@@ -97,8 +97,11 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
             focused = await pi_terminal.focus_local_session("session-1")
         self.assertTrue(focused)
         self.assertEqual(run.call_args.args[0], [
-            "tmux", "-S", "/tmp/tmux-test/default", "switch-client", "-t", "work:3.2",
-            ";", "select-pane", "-t", "work:3.2",
+            "tmux", "-S", "/tmp/tmux-test/default",
+            "set-option", "-p", "-t", "work:3.2", "@wh_pi_attach_session", "session-1", ";",
+            "set-option", "-p", "-t", "work:3.2", "@wh_pi_attach_mode", "local", ";",
+            "switch-client", "-t", "work:3.2", ";",
+            "select-pane", "-t", "work:3.2",
         ])
 
     async def test_focus_local_session_ignores_different_tmux_server(self):

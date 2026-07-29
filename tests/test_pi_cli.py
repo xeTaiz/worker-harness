@@ -159,6 +159,25 @@ class PiCliTests(unittest.TestCase):
             ["ws://relay/first", "ws://relay/second"],
         )
 
+    def test_relative_attach_can_focus_the_next_local_session(self):
+        first = {**self._session(), "id": "first"}
+        second = {**self._session(), "id": "second"}
+        request = AsyncMock(side_effect=[
+            [first, second],
+            {"attachable": True},
+        ])
+        focus = AsyncMock(return_value=True)
+        with (
+            patch.object(pi, "_request", new=request),
+            patch.object(pi, "_mark_attach_pane"),
+            patch("worker_harness.pi_terminal.focus_local_session", new=focus),
+        ):
+            result = self.runner.invoke(
+                pi.app, ["attach", "first", "--relative", "next"]
+            )
+        self.assertEqual(result.exit_code, 0, result.output)
+        focus.assert_awaited_once_with("second")
+
     def test_attach_focuses_local_tmux_without_requesting_attach_info(self):
         request = AsyncMock(return_value=[self._session()])
         focus = AsyncMock(return_value=True)

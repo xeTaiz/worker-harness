@@ -67,7 +67,13 @@ async def focus_local_session(session_id: str) -> bool:
         f".{route.get('pane_index')}"
     )
     result = subprocess.run(
-        ["tmux", "-S", route_socket, "switch-client", "-t", target, ";", "select-pane", "-t", target],
+        [
+            "tmux", "-S", route_socket,
+            "set-option", "-p", "-t", target, "@wh_pi_attach_session", session_id, ";",
+            "set-option", "-p", "-t", target, "@wh_pi_attach_mode", "local", ";",
+            "switch-client", "-t", target, ";",
+            "select-pane", "-t", target,
+        ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,

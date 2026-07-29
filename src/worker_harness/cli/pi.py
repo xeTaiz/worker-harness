@@ -170,23 +170,25 @@ async def _cycle_session(current_session_id: str, direction: str) -> dict:
 
 
 def _mark_attach_pane(session_id: str | None) -> None:
-    """Expose attachment state to the dedicated tmux key table."""
+    """Expose streamed attachment state to the dedicated tmux key table."""
 
     pane = os.environ.get("TMUX_PANE")
     if not pane:
         return
-    command = ["tmux", "set-option", "-p", "-t", pane]
-    if session_id:
-        command.extend(["@wh_pi_attach_session", session_id])
-    else:
-        command.extend(["-u", "@wh_pi_attach_session"])
-    subprocess.run(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    values = {
+        "@wh_pi_attach_session": session_id,
+        "@wh_pi_attach_mode": "stream" if session_id else None,
+    }
+    for option, value in values.items():
+        command = ["tmux", "set-option", "-p", "-t", pane]
+        command.extend([option, value] if value else ["-u", option])
+        subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
 
 
 def _pick_session(rows: list[dict]) -> dict:
@@ -249,18 +251,29 @@ def attach(
         "--stream",
         help="Stream through the relay even when the original pane is in this local tmux server",
     ),
+    relative: str | None = typer.Option(
+        None,
+        "--relative",
+        help="Select the next or previous attachable session relative to TARGET",
+        hidden=True,
+    ),
 ):
     """Attach this terminal to a discovered Pi session; press Ctrl-] to detach."""
 
     async def run() -> None:
         from worker_harness.pi_terminal import attach_terminal, focus_local_session
 
-        candidates = _attach_candidates(await _request("GET", "/api/v1/pi/sessions"))
-        selected = (
-            _resolve_session(candidates, target)
-            if target
-            else _pick_session(await _attachable_candidates(candidates))
-        )
+        if relative:
+            if relative not in {"next", "previous"} or not target:
+                raise RuntimeError("--relative requires TARGET and either next or previous")
+            selected = await _cycle_session(target, relative)
+        else:
+            candidates = _attach_candidates(await _request("GET", "/api/v1/pi/sessions"))
+            selected = (
+                _resolve_session(candidates, target)
+                if target
+                else _pick_session(await _attachable_candidates(candidates))
+            )
         cycle_requests: asyncio.Queue[str] = asyncio.Queue()
         loop = asyncio.get_running_loop()
         installed_signals: list[signal.Signals] = []
