@@ -1,8 +1,9 @@
 ---
 title: Distributed Pi Session Fabric
-status: draft
+status: active
 scope: single-operator Tailnet
 created: 2026-07-24
+updated: 2026-07-29
 ---
 
 # Distributed Pi Session Fabric
@@ -79,9 +80,11 @@ Delegated Pi, worker:
   PWA            -- orchestrator gateway fallback --> worker relay ------^
 ```
 
-CLI/Zellij prefer direct Tailnet attachment. The Tailnet-served PWA may proxy via the orchestrator gateway to avoid per-host browser/TLS/origin setup. Both paths use the same terminal frame protocol.
+CLI and multiplexer clients prefer direct Tailnet attachment. The Tailnet-served PWA uses the orchestrator gateway by default to avoid per-host browser/TLS/origin setup. CLI clients fall back to the gateway when direct relay connection fails. Both paths use the same terminal frame protocol and durable writer lease.
 
-The global router does not send terminal bytes. It sends a semantic prompt through the bridge.
+**V1 transport decision:** direct relay TCP `27888` is the primary data path and the only relay port published through Tailscale Serve. The previously explored internal `SessionTunnelManager`/SSH-local-forward replacement is not part of the current roadmap. Reconsider it only if direct Tailnet relay reachability or the approved ACL posture proves insufficient. The existing user-managed tunnel plane remains separate.
+
+The global router is orthogonal to terminal clients and does not send terminal bytes. It sends semantic prompts through the bridge.
 
 ## 4. Pi release/config distribution for workers
 
@@ -162,32 +165,61 @@ pi.sendUserMessage(message, { deliverAs: "steer" | "followUp" })
 
 ## 6. Terminal attachment
 
-### 6.1 Plain Pi is supported
+### 6.1 Plain Pi and tmux v1
 
 The operator continues to run plain `pi` inside tmux or Zellij; no mandatory `wh pi start` wrapper is introduced.
 
-On attach request, the bridge/relay uses its captured locator to start a second local multiplexer client inside a PTY:
+The tmux implementation is feature-complete. The bridge captures stable tmux socket and pane identity, and the host relay resolves mutable session/window/pane indices. `wh pi attach` switches directly to the original pane when it belongs to the invoking tmux server; otherwise it starts a disposable linked tmux client in a PTY and streams it through the relay. Native attachment supports fullscreen rendering, upgrade-time dimensions, resize polling, raw input/output, `Ctrl-]` detach, and agent cycling across local and remote sessions. The companion dotfiles reserve `Ctrl-a` as a Worker Harness prefix while leaving tmux's normal prefix unchanged.
 
-```text
-tmux:   tmux attach-session -t <captured-session>
-zellij: zellij attach <captured-session>
-```
+The remaining tmux work is rollout and acceptance across all hosts, not new attachment architecture. Attachments created before pane-marker support must be reopened once before cycling.
 
-The helper forwards terminal input, output, resize, and close frames. tmux is the first supported implementation. Zellij v1 may attach the whole session rather than focus the exact pane.
+Zellij follows durable leasing and gateway fallback. Its adapter must provide the same behavior: exact local-pane focus where the Zellij API permits it, remote PTY attachment, resize, detach, and cross-agent cycling. A full plugin is optional; CLI and keybinding parity come first.
 
 ### 6.2 Terminal protocol
 
-The protocol is shared by direct and gateway routes and contains:
+Protocol v2, currently deployed, contains:
 
-- `open(session_id, rows, cols)`;
+- WebSocket upgrade with `session_id`, initial `rows`, and `cols`;
 - raw terminal `input` and `output` byte frames;
 - `resize(rows, cols)`;
 - `close(reason)`;
 - `status`/reconnect metadata.
 
-All trusted clients may write in v1, matching normal shared tmux behavior. Concurrent input interleaves by arrival order; this is accepted UX, not treated as an authorization violation.
+Direct and gateway routes share this framing. Protocol v3 will add `role`, lease identity, monotonic writer epoch, lease-loss/handoff status, and reconnect metadata. The gateway remains a byte transport proxy and does not reinterpret Pi semantics.
 
-The PWA gateway is a transport proxy only. It does not attempt to render Pi semantics itself.
+### 6.3 Durable writer lease and handoff — next milestone
+
+The current relays are not a durable ownership system: the interactive host relay has an in-memory one-writer exclusion, while the delegated worker relay does not yet provide equivalent durable fencing. Before Zellij, both relays must implement one shared model:
+
+- the orchestrator SQLite database is authoritative for the current writer lease and monotonic per-session writer epoch;
+- one read-write attachment is allowed per session;
+- read-only observers never send terminal input and do not own the writer lease;
+- a stable device ID plus unique attach/lease ID identifies the holder for UI, renew, reconnect, and audit;
+- lease acquisition, renewal, release, expiry, and explicit takeover are serialized transactionally using orchestrator time;
+- a higher epoch fences every lower-epoch writer on both direct and gateway paths;
+- cycling and clean detach release promptly; crash recovery relies on bounded expiry;
+- reconnect with the same unexpired lease resumes the same tmux client view without restarting Pi;
+- cross-device takeover closes or demotes the old writer and redraws the same surviving Pi session on the new device.
+
+For restart-safe fencing, a relay must not forget the highest accepted epoch. The implementation must either persist the high-water mark locally and have the orchestrator synchronize each grant before returning it to a client, or use an equivalently strong relay-validation mechanism. Merely carrying an epoch from the client to an in-memory relay is insufficient because a relay restart could temporarily admit a stale writer.
+
+Proposed timing is a 30-second lease with renewal every 10 seconds. Existing direct streams should remain usable during a short orchestrator outage; no new takeover can occur until authority returns. Final expiry/grace behavior and takeover confirmation are explicit decisions to settle before implementation.
+
+Observer support should begin with delegated sessions. Interactive tmux observers must not zoom or resize the operator's shared source window; semantic transcript viewing remains the safe read-only fallback until a non-perturbing raw observer path is proven.
+
+### 6.4 Orchestrator gateway fallback — following lease enforcement
+
+The control service on `:12889` will expose a WebSocket gateway that opens the selected direct host/worker relay upstream and pumps protocol frames in both directions. It uses the same lease and writer epoch as the direct path; direct and gateway clients therefore cannot become simultaneous writers.
+
+The gateway requirements are:
+
+- no SQLite work in the per-frame byte pumps;
+- strict receive-then-send backpressure with bounded WebSocket queues;
+- no unbounded terminal buffering or dropped terminal bytes;
+- per-send stall watchdog and clean close propagation;
+- a small configurable concurrency cap and observable refusal/health metrics;
+- direct-first fallback for CLI/multiplexer clients and gateway-first same-origin behavior for the PWA;
+- reconnect using the existing lease where valid, otherwise an explicit lease-lost/takeover flow.
 
 ## 7. Session data and APIs
 
@@ -202,6 +234,7 @@ pi_sessions(
   model, pi_version, config_revision,
   terminal_locator JSON, attachable,
   state, last_activity_ts, parent_session_id nullable,
+  writer_epoch,
   created_at, stopped_at
 )
 
@@ -214,7 +247,14 @@ pi_delegations(
   id, parent_session_id, worker_id, child_session_id,
   task, state, created_at, completed_at
 )
+
+pi_attach_leases(
+  session_id, lease_id, device_id, client_label,
+  role, writer_epoch, acquired_at, renewed_at, expires_at
+)
 ```
+
+`pi_attach_leases` stores the current durable writer holder; lease lifecycle and handoff events are also appended to `pi_session_events` for diagnosis. `writer_epoch` is monotonic and never reused. Observers may be connection-scoped rather than durable rows, but are bounded and visible in attachment status/metrics.
 
 Extend jobs with:
 
@@ -238,7 +278,14 @@ POST /api/v1/pi/sessions/{id}:prompt
 POST /api/v1/pi/sessions/{id}:cancel
 POST /api/v1/pi/delegations
 GET  /api/v1/pi/delegations/{id}
+GET  /api/v1/pi/sessions/{id}/attach-info
+POST /api/v1/pi/sessions/{id}/attach-leases
+POST /api/v1/pi/sessions/{id}/attach-leases/{lease_id}:renew
+DELETE /api/v1/pi/sessions/{id}/attach-leases/{lease_id}
+WS   /api/v1/pi/sessions/{id}/attach-gateway
 ```
+
+Lease mutation is explicit and never hidden in a cacheable `GET`. `attach-info` reports protocol capabilities plus direct and gateway URLs. Acquisition returns `409` when another unexpired writer holds the session unless the caller explicitly requests a confirmed takeover.
 
 Worker-ingest endpoints on `:12888`:
 
@@ -307,80 +354,109 @@ It selects the likely target from session name, CWD, recent activity, and explic
 
 ## 10. Client delivery
 
-1. **CLI:** `wh pi sessions`, `wh pi watch`, `wh pi attach`, `wh pi delegate`.
-2. **tmux/Zellij:** local focus where locator matches; otherwise an attach client in a new pane.
-3. **Mobile webapp/PWA:** Tailnet-served session list/state, durable semantic transcript, prompt/steer composer, and later xterm-style terminal attachment/global-router chat.
+1. **CLI:** `wh pi sessions`, `wh pi events`, `wh pi prompt`, and `wh pi attach` are implemented. `wh pi watch` and a CLI delegation convenience command remain optional parity work because the Pi extension already exposes delegation.
+2. **tmux:** local exact-pane focus and remote attachment are implemented, including fullscreen resize, detach, and cross-agent cycling.
+3. **Zellij:** follows lease and gateway completion and reuses the same discovery/attachment contract; it is a client adapter, not a new session plane.
+4. **Mobile webapp/PWA:** the Tailnet-served session directory, durable semantic transcript, session switching, prompt/steer composer, model/thinking controls, and terminal preview are implemented. Durable writer/observer UX, gateway transport, HTTPS installation, and optional xterm-grade rendering remain.
 
-Semantic transcript events share the durable `pi_session_events` log. SQLite assigns a monotonically increasing sequence per session; `GET /api/v1/pi/sessions/{id}/events?after=<sequence>` provides bounded replay and `/stream` tails the same log as SSE using that sequence as `Last-Event-ID`. Both ordinary and delegated bridges batch text deltas, emit final sanitized messages plus tool/lifecycle status, omit hidden thinking blocks, and retry stable event IDs. Worker children first persist accepted batches into the existing worker-local FIFO before registration-port delivery. The webapp uses SSE for replayable output and the existing semantic prompt API for input; tool calls/results are compact previews with explicit full-text expansion. Interactive bridges also report their current/available models and thinking level, and accept durable `configure` commands from web controls through the same claim/ack queue. Raw terminal transport remains a separate later attachment path.
+The global router in §9 is an orthogonal agent/service, not another terminal client. Its implementation and acceptance must not be combined with Zellij or PWA delivery milestones.
+
+Semantic transcript events share the durable `pi_session_events` log. SQLite assigns a monotonically increasing sequence per session; `GET /api/v1/pi/sessions/{id}/events?after=<sequence>` provides bounded replay and `/stream` tails the same log as SSE using that sequence as `Last-Event-ID`. Both ordinary and delegated bridges batch text deltas, emit final sanitized messages plus tool/lifecycle status, omit hidden thinking blocks, and retry stable event IDs. Worker children first persist accepted batches into the existing worker-local FIFO before registration-port delivery. The webapp uses SSE for replayable output and the existing semantic prompt API for input; tool calls/results are compact previews with explicit full-text expansion. Interactive bridges also report their current/available models and thinking level, and accept durable `configure` commands from web controls through the same claim/ack queue. Raw terminal transport remains a separate protocol/UI mode from the semantic transcript even though both are now implemented.
 
 ## 11. Milestones and acceptance gates
 
-**Implementation status (2026-07-26):** the direct worker relay, durable worker-local delegated-session records, PTY-backed tmux attachment, release activation helper, and control-plane delegation/session/prompt/cancel APIs are implemented. A worker binds a loopback FastAPI/WebSocket relay on `WH_PI_RELAY_PORT` (default `27888`), publishes only that TCP port through userspace Tailscale Serve, advertises relay capability in its heartbeat schema, and removes its specific Serve rule during graceful daemon shutdown. A direct Tailnet WebSocket now receives typed status plus terminal byte frames and can resize/input a disposable tmux client without ending its Pi. `scripts/build-pi-release.sh` packages a Bun/Pi release from the orchestrator host; `wh-pi-release-activate` verifies hashes and atomically changes `WH_DIR/pi/current`. The parent Pi extension has `wh_delegate`/Pi-session tool support.
+**Implementation status (2026-07-29):** the worker/delegation plane, session/event plane, semantic web client, and tmux client are implemented.
 
-Worker event ingest is now implemented in source: the relay stores each lifecycle transition in a per-session, persisted FIFO outbox with stable event IDs and retries it in order after failures/restarts; registration-port ingest deduplicates retried IDs. Delegation duration gates report acknowledged expiry as `stopped` and unacknowledged expiry as `termination_unknown`. `wh_delegate.sync` waits for an idle/known terminal projection, applies the duration gate at its exact deadline, and returns `settled=false` for `termination_unknown` rather than inventing a result. A single explicit child extension now reports Pi `agent_start`/`agent_settled` state through an unadvertised loopback service, so `idle` comes from Pi lifecycle rather than tmux heuristics.
+- Delegated children use immutable activated releases, isolated homes, explicit Pi lifecycle hooks, truthful timeout states, durable outboxes, and private Unix-socket bash/job execution linked by `origin_session_id`. The approved archdome `WH_FAKEROOT=1` canary remains required and live-verified. Delegated children receive no parent Worker Harness, vault, or planning/subagent surfaces.
+- Ordinary interactive bridges register on `:12889`, survive incarnation replacement, report lifecycle/model/thinking state, upload durable sanitized transcript events, and claim/ack prompt/configure commands. Delegated reports enter through `:12888`; stale projections receive permanent `410 Gone` handling.
+- SQLite sequence cursors, bounded replay, SSE, latest-exchange backfill, and the mobile-first semantic webapp are implemented. Live acceptance still needs repeated-reload deduplication and orchestrator-restart bridge re-registration checks.
+- Direct protocol-v2 terminal relays are implemented for delegated worker sessions and ordinary tmux sessions. The native CLI supports attachable-only discovery, exact local-pane focus, remote fullscreen streaming, reliable initial/dynamic sizing, `Ctrl-]`, and a dedicated tmux cycling key table. The latest tmux slice is feature-complete; fleet rollout and a local/remote/delegated cycling matrix remain.
+- The next shared milestones are protocol-v3 durable writer leases/handoff, observer semantics, and the orchestrator gateway. Zellij follows those shared layers. The global router remains a separate orthogonal milestone.
 
-The same private service overrides the child builtin `bash`: it is reachable only through a mode-`0600` Unix-domain socket at `${WH_DIR}/harness/pi-job/socket` in a mode-`0700` directory (never a TCP listener), launches a canonical `wh_<job-id>` tmux job, persists its manifest and daemon-owned exit status, retains the existing harness log layout, and sends revisioned durable reports linked by `origin_session_id`. Parent job inspection remains the existing job API/tool surface with an origin-session filter. The public Tailscale-published terminal relay has no job-creation route. Local regression coverage, a real `pi-worker` launcher smoke, and live archdome validation prove the socket job, report ingest, origin filter, and closed Tailnet TCP surface.
+### M0 — contracts and schema — complete
 
-The first Phase C slice adds ordinary non-worker Pi registration on control port `12889`, bridge incarnation replacement, idempotent lifecycle events, heartbeat expiry, durable prompt claim/ack, and `wh pi sessions|events|prompt`. The normal Pi extension uses an outbound long-poll and `sendUserMessage`, aborting its handle on reload/session replacement; it never opens another published port. Deployment of orchestrator `42b50a0` plus a normal Pi `/reload` live-verified registration, `agent-start`, prompt queue/claim/ack, and delivery of a `steer` message into the original session. The next source slice adds cursor-based durable transcript replay, SSE tailing, transcript capture for both interactive and delegated bridges, and a dependency-free mobile-first webapp served by the control service; deployment and live transcript acceptance are still pending. Global router, raw interactive terminal attachment, and Zellij remain future milestones.
-
-**Current Phase A/B checklist:** A1 (delegation smoke), A2 (release provider config), A4 (acknowledged timeout/`sync`), and B1–B4 are live-verified. Under the Luna-pinned release `pi-0.80.10-luna-ready-094b051`, a real `openai-codex/gpt-5.6-luna` delegated model turn chose the overridden `bash`, produced linked delegated job `5954a2e5-62ad-4014-95f3-12fa8f3d0326`, and its canonical log returned `LUNA_READY_UDS_BASH_OK` plus `EXIT:0`. The child lifecycle stream contained explicit `bridge-ready`, `agent-start`, and `agent-settled`; prompt submission waits for `bridge-ready` rather than guessing from tmux. The approved archdome `WH_FAKEROOT=1` canary continues to provide direct Tailscale SSH, generic `wh_dispatch`, and `wh_get_job_logs`. Permanent `410 Gone` ingest responses durably abandon stale event/job outboxes so pre-upgrade projections cannot retry forever.
-
-### M0 — contracts and schema
-
-Define session/job schemas, state transitions, relay frame protocol, direct-vs-gateway transport selection, and SQLite single-writer ownership.
+Define session/job schemas, state transitions, relay frame protocol, direct-vs-gateway transport selection, and orchestrator-only SQLite write ownership. Protocol-v3 attachment-lease schema is added in M3b.
 
 **Gate:** schema/API unit tests cover state transitions, stale session reaping, event idempotency, and linked job visibility.
 
-### M1 — worker Pi release rollout
+### M1 — worker Pi release rollout — complete
 
 Implement release build, direct streamed artifact push, staged hash verification, promotion, and heartbeat version fields.
 
 **Gate:** canary worker receives a release; a running child retains old runtime while a new child reports the new Pi/config revision.
 
-### M2 — non-worker bridge, registry, and injection
+### M2 — non-worker bridge, registry, and injection — complete
 
-Implement direct bridge registration/liveness/event upload, session list/events APIs, and `sendUserMessage` command delivery. Implement global router after this API exists.
+Implement direct bridge registration/liveness/event upload, session list/events APIs, and `sendUserMessage` command delivery. The global router consumes this API later in M9.
 
-**Gate:** plain Pi inside tmux registers; router sends a steer/follow-up; response appears in original terminal and session event stream; reload leaves no stale bridge handle.
+**Gate:** plain Pi inside tmux registers; a steer/follow-up appears in the original terminal and durable session event stream; reload leaves no stale bridge handle.
 
-### M3 — tmux relay and direct attach
+### M3a — tmux relay and direct attach — feature-complete
 
-Implement host relay helper and direct terminal WebSocket protocol for tmux. Add gateway proxy fallback.
+The host relay, native terminal client, direct local focus, remote PTY stream, fullscreen sizing, resize, detach, and cross-agent cycling are implemented.
 
-**Gate:** attach from a second Tailnet machine, resize, disconnect/reconnect, send input, and continue the same Pi session. Confirm accepted concurrent-input behavior.
+**Remaining gate:** deploy current Worker Harness/dotfiles to every operator and interactive host; validate local→local, local→remote, remote→local, and delegated cycling plus reconnect and clean detach.
 
-### M4 — worker daemon session service
+### M3b — durable lease, observers, and handoff — next
+
+Implement protocol-v3 lease APIs, monotonic writer epochs, restart-safe relay fencing, one writer across direct/gateway paths, bounded observers, renew/release/takeover, and client reconnect state machines.
+
+**Gate:** two devices cannot write concurrently; explicit handoff continues the same Pi session; stale clients are fenced even across relay/orchestrator restart; observer input is impossible; crash recovery converges within the documented bound.
+
+### M3c — orchestrator gateway fallback — follows M3b
+
+Implement the bounded `:12889` WebSocket proxy using the same protocol-v3 lease and frame semantics. PWA uses gateway-first; CLI/multiplexer clients use direct-first with fallback.
+
+**Gate:** direct and gateway clients race safely under one writer epoch; resize/input/detach/reconnect work through the proxy; slow/dead clients cannot create unbounded memory or starve control-plane SQLite work.
+
+### M4 — worker daemon session service — complete
 
 Extend worker daemon with Unix socket bridge API, loopback relay service, Tailscale Serve publication, worker session/event/job ingest, and lifecycle/reconnect management.
 
 **Gate:** a local worker bridge registers a synthetic delegated session; an operator connects to its published relay; other worker-tagged nodes are denied by ACL.
 
-### M5 — async `wh_delegate` and delegated bash jobs
+### M5 — async `wh_delegate` and delegated bash jobs — complete
 
 Implement worker child launch, fixed tool profile, `bash` override, local tmux executor, job reporting, and asynchronous delegation state.
 
 **Gate:** an interactive Pi delegates to a selected worker; child edits/runs commands; every command is listed as a linked delegated job with logs; child has no `wh_*` or subagent tools.
 
-### M6 — sync delegation and worker-child attach
+### M6 — sync delegation and worker-child attach — direct path complete
 
-Add sync wait/result behavior, cancellation, direct/gateway attach to worker children, and linked session/job UI details.
+Sync wait/result behavior, truthful cancellation/timeout handling, direct worker-child attachment, and linked session/job UI details are implemented. Durable ownership and gateway transport are shared M3b/M3c work rather than delegation-specific work.
 
-**Gate:** attach to a running delegated child from a second device, inspect its command logs, cancel it, and observe terminal/session/job convergence.
+**Gate:** attach to a running delegated child from a second device, inspect its command logs, cancel it, and observe terminal/session/job convergence; then rerun through the gateway after M3c.
 
-### M7 — Zellij and PWA
+### M7 — Zellij adapter — after M3c
 
-Implement local-focus/remote-attach Zellij UX and Tailnet PWA session directory, terminal, and global-router chat.
+Implement Zellij registration metadata, exact local focus where supported, remote PTY attachment, resize/detach, and the same cross-agent cycling UX. Reuse protocol v3, leases, and gateway fallback; do not invent a second attachment control plane.
 
-**Gate:** phone/browser attaches through gateway fallback; Zellij focuses local session or opens a remote attach pane; global router forwards a request and displays the linked response.
+**Gate:** Zellij focuses an existing local Pi pane or opens a remote attachment, then cycles between local/remote/delegated agents with the same ownership and handoff behavior as tmux.
 
-## 12. Required spikes before broad implementation
+### M8 — PWA attachment hardening
 
-1. **Tmux relay:** host-side PTY helper, direct WebSocket, resize/reconnect/input test.
-2. **Bridge lifecycle:** session replacement/reload while bridge transport is active.
-3. **Worker relay publication:** loopback worker daemon service published with userspace `tailscale serve`, direct connection from an ordinary member, denied worker-to-worker path.
-4. **Bash override:** same-name extension tool overrides builtin `bash`, returns compatible results, and cannot expose blocked tools.
-5. **Release artifact:** direct large-file rollout and integrity verification into WH_DIR.
-6. **SQLite concurrency:** concurrent bridge/worker event writers plus control reads remain correct under WAL/busy timeout.
+Add writer/observer/takeover UI, automatic gateway reconnect, lease-loss handling, and HTTPS publication for installable behavior. An xterm-grade renderer is optional and does not block semantic chat.
+
+**Gate:** a phone/browser observes or owns a session through the gateway, survives reload/network interruption, and hands ownership to/from the native client without duplicate writers.
+
+### M9 — global router — orthogonal
+
+Implement the constrained router from §9 independently of terminal-client delivery. It lists active interactive sessions and sends semantic prompts; it neither owns terminal leases nor blocks Zellij/PWA work.
+
+**Gate:** ambiguous requests ask for a target; unambiguous requests reach the intended existing interactive session and render the linked durable response.
+
+## 12. Required spikes and acceptance work
+
+Completed spikes: tmux PTY relay/direct WebSocket/resize/input, bridge replacement and stale-context handling, worker relay publication with worker-tag ACL denial, same-name delegated bash override, immutable release activation, and SQLite event idempotency/concurrency.
+
+Remaining work, in order:
+
+1. **Tmux closure matrix:** current versions on every host; local/remote/delegated cycle and wraparound; reconnect; orchestrator restart re-registration; repeated web reload without duplicate backfill.
+2. **Lease/fence prototype:** two clients contend for one delegated session; transactional acquire/renew/release/takeover; relay restart preserves the high-water fence; old writer cannot send after takeover.
+3. **Observer prototype:** delegated `tmux attach -r` path, input dropped by relay, bounded observer count, no effect on writer dimensions. Interactive raw observers remain gated on a non-perturbing layout/size proof.
+4. **Gateway backpressure:** direct upstream relay plus deliberately slow downstream client; prove bounded memory, send watchdog, close propagation, and direct/gateway writer fencing.
+5. **Zellij adapter spike:** stable session/tab/pane identity, exact local focus command, second-client PTY behavior, resize semantics, and detach cleanup before production integration.
+6. **PWA HTTPS:** choose Tailnet HTTPS publication and validate service-worker installation/update behavior.
 
 ## 13. Explicit non-goals
 
@@ -390,5 +466,6 @@ Implement local-focus/remote-attach Zellij UX and Tailnet PWA session directory,
 - LiteLLM in the first release.
 - Git/checkouts/deploy keys on workers for Pi release distribution.
 - Public browser access, Funnel, native mobile apps, and multi-tenant operation.
-- Exact-pane Zellij focus in the first attach release.
-- Guaranteeing exactly-once execution or solving simultaneous terminal input interleaving.
+- Replacing direct relay `27888` with an internal SSH `SessionTunnelManager` unless a demonstrated reachability/ACL problem reopens that decision.
+- Collaborative multi-writer terminals, CRDT terminal editing, or treating interleaved concurrent input as acceptable ownership semantics.
+- Guaranteeing exactly-once execution; commands/events remain idempotent and uncertainty is surfaced explicitly.
