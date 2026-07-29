@@ -187,11 +187,11 @@ Protocol v2, currently deployed, contains:
 
 Direct and gateway routes share this framing. Multiple WebSockets are normal tmux clients; no protocol-level writer ownership or durable lease is added. The gateway remains a byte transport proxy and does not reinterpret Pi semantics.
 
-### 6.3 Multi-attachment robustness — next milestone
+### 6.3 Multi-attachment robustness — implemented; live rollout pending
 
 The fabric is single-operator and intentionally permits multiple read-write clients to view and type into the same tmux pane. Reattachment/handoff means opening another ordinary tmux client; it is not an ownership transfer. The original physical terminal remains usable.
 
-Detailed implementation TODOs:
+Implemented in Worker Harness `8f20af5` and dotfiles `c3b6273`; the checklist remains the acceptance contract:
 
 1. **Common policy:** allow at most eight live attachments per Pi session on both host and worker relays. Reject the ninth with a typed `attachment_limit` error and a stable WebSocket close code. Expose active counts in relay health/metrics.
 2. **Per-connection identity:** allocate an in-memory attachment ID for exact cleanup. Never key cleanup solely by session ID.
@@ -206,11 +206,11 @@ Detailed implementation TODOs:
 11. **Compatibility:** keep protocol v2 framing and legacy `websocket_url`. Add fields/status codes compatibly; no database migration or protocol-v3 lease rollout is required.
 12. **Tests:** cover two simultaneous read-write clients, cap/release races, one-hour timeout with a short test clock, input/resize activity refresh, output-not-activity behavior, source-session survival, final-only zoom restoration, route teardown, and current tmux sizing behavior.
 
-### 6.4 Orchestrator gateway fallback — follows multi-attach hardening
+### 6.4 Orchestrator gateway fallback — implemented; deployment pending
 
 The control service on `:12889` exposes a WebSocket gateway that resolves the same direct host/worker relay as `attach-info`, opens it upstream, and pumps protocol-v2 frames in both directions. A gateway stream is simply another bounded attachment and may coexist with direct clients.
 
-Detailed implementation TODOs:
+Implemented in Worker Harness `8f20af5`; the checklist remains the acceptance contract:
 
 1. Extend `attach-info` compatibly with `direct_websocket_url` and `gateway_websocket_url`, retaining `websocket_url` as the direct URL for old clients.
 2. Add `WS /api/v1/pi/sessions/{id}/attach-gateway` only to the operator control service; never add it to worker ingest `:12888`.
@@ -363,7 +363,7 @@ Semantic transcript events share the durable `pi_session_events` log. SQLite ass
 - Ordinary interactive bridges register on `:12889`, survive incarnation replacement, report lifecycle/model/thinking state, upload durable sanitized transcript events, and claim/ack prompt/configure commands. Delegated reports enter through `:12888`; stale projections receive permanent `410 Gone` handling.
 - SQLite sequence cursors, bounded replay, SSE, latest-exchange backfill, and the mobile-first semantic webapp are implemented. Live acceptance still needs repeated-reload deduplication and orchestrator-restart bridge re-registration checks.
 - Direct protocol-v2 terminal relays are implemented for delegated worker sessions and ordinary tmux sessions. The native CLI supports attachable-only discovery, exact local-pane focus, remote fullscreen streaming, reliable initial/dynamic sizing, `Ctrl-]`, and a dedicated tmux cycling key table. The latest tmux slice is feature-complete; fleet rollout and a local/remote/delegated cycling matrix remain.
-- The next shared milestones are bounded multi-attachment/idle cleanup and the orchestrator gateway. Zellij follows those shared layers. The global router remains a separate orthogonal milestone.
+- Bounded multi-attachment/idle cleanup and the orchestrator gateway are implemented in source and await deployment/live acceptance. Zellij follows their acceptance. The global router remains a separate orthogonal milestone.
 
 ### M0 — contracts and schema — complete
 
@@ -389,13 +389,13 @@ The host relay, native terminal client, direct local focus, remote PTY stream, f
 
 **Remaining gate:** deploy current Worker Harness/dotfiles to every operator and interactive host; validate local→local, local→remote, remote→local, and delegated cycling plus reconnect and clean detach.
 
-### M3b — bounded multi-attachment and idle cleanup — next
+### M3b — bounded multi-attachment and idle cleanup — implemented; live acceptance pending
 
 Allow up to eight concurrent read-write clients per Pi session on both relays, with exact per-connection cleanup, shared tmux zoom reference counting, one-hour application inactivity detach, and selector return UX.
 
 **Gate:** eight simultaneous clients can view/type; the ninth is rejected; activity refreshes the timer; an idle client detaches without ending Pi; the final disconnect alone restores source layout; reconnect is an ordinary new attachment.
 
-### M3c — orchestrator gateway fallback — follows M3b
+### M3c — orchestrator gateway fallback — implemented; deployment/live acceptance pending
 
 Implement the bounded `:12889` protocol-v2 WebSocket proxy. PWA uses gateway-first; CLI/multiplexer clients use direct-first with fallback.
 
