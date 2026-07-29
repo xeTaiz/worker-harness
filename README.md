@@ -36,9 +36,11 @@ sudo tailscale set --operator="$(id -un)"
 ```
 
 Host and delegated relays allow up to eight concurrent read-write attachments
-per Pi session, matching normal single-operator tmux behavior. The most recent
-client resize controls the shared tmux window. A client with no input or resize
-activity for one hour is detached without stopping Pi and can immediately
+per Pi session, matching normal single-operator tmux behavior. If a new attach
+arrives at capacity, the longest-idle attachment is detached and returned to
+its selector, preventing lockout even if idle cleanup fails. The most recent
+client resize controls the shared tmux window. A client with no input or changed
+resize activity for one hour is detached without stopping Pi and can immediately
 reattach. Native clients prefer the direct Tailnet relay and fall back through
 the orchestrator gateway; the PWA uses the same-origin gateway first.
 

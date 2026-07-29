@@ -8,6 +8,7 @@ import logging
 import os
 from collections import Counter
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, Literal, TypeVar
@@ -331,12 +332,82 @@ def _terminal_url_with_dimensions(url: str, rows: int, cols: int) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
+@dataclass
+class _GatewayAttachment:
+    id: str
+    client: WebSocket
+    last_activity: float
+    rows: int
+    cols: int
+    evict: asyncio.Event = field(default_factory=asyncio.Event)
+    released: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def note_client_frame(self, data: bytes | str) -> None:
+        """Track input and changed resize frames without altering the payload."""
+
+        if isinstance(data, bytes):
+            self.last_activity = asyncio.get_running_loop().time()
+            return
+        try:
+            frame = json.loads(data)
+        except (json.JSONDecodeError, TypeError):
+            self.last_activity = asyncio.get_running_loop().time()
+            return
+        if not isinstance(frame, dict):
+            self.last_activity = asyncio.get_running_loop().time()
+            return
+        if frame.get("type") == "resize":
+            rows = _terminal_dimension(frame.get("rows"), self.rows)
+            cols = _terminal_dimension(frame.get("cols"), self.cols)
+            if (rows, cols) != (self.rows, self.cols):
+                self.rows, self.cols = rows, cols
+                self.last_activity = asyncio.get_running_loop().time()
+            return
+        self.last_activity = asyncio.get_running_loop().time()
+
+
+async def _reserve_gateway_attachment(
+    app: FastAPI, session_id: str, attachment: _GatewayAttachment
+) -> _GatewayAttachment | None:
+    """Atomically admit an attachment and signal the longest-idle victim."""
+
+    victim = None
+    async with app.state.pi_gateway_lock:
+        active = app.state.pi_gateway_attachments.setdefault(session_id, {})
+        if len(active) >= app.state.pi_gateway_max_per_session:
+            victim = min(
+                active.values(),
+                key=lambda candidate: (candidate.last_activity, candidate.id),
+            )
+            active.pop(victim.id, None)
+            app.state.pi_gateway_evictions_total += 1
+        active[attachment.id] = attachment
+    if victim is not None:
+        victim.evict.set()
+    return victim
+
+
+async def _release_gateway_attachment(
+    app: FastAPI, session_id: str, attachment: _GatewayAttachment
+) -> None:
+    """Release exactly this attachment; delayed victim cleanup is harmless."""
+
+    async with app.state.pi_gateway_lock:
+        active = app.state.pi_gateway_attachments.get(session_id)
+        if active is not None and active.get(attachment.id) is attachment:
+            active.pop(attachment.id, None)
+            if not active:
+                app.state.pi_gateway_attachments.pop(session_id, None)
+    attachment.released.set()
+
+
 async def _pump_terminal_gateway(
     client: WebSocket,
     upstream: Any,
     *,
     send_timeout: float = 10.0,
-) -> None:
+    attachment: _GatewayAttachment | None = None,
+) -> str:
     """Pump terminal frames without buffering or touching persistent state."""
 
     async def client_to_upstream() -> None:
@@ -348,6 +419,8 @@ async def _pump_terminal_gateway(
             if data is None:
                 data = message.get("text")
             if data is not None:
+                if attachment is not None:
+                    attachment.note_client_frame(data)
                 await asyncio.wait_for(upstream.send(data), timeout=send_timeout)
 
     async def upstream_to_client() -> None:
@@ -361,12 +434,18 @@ async def _pump_terminal_gateway(
         asyncio.create_task(client_to_upstream(), name="pi-gateway-client-upstream"),
         asyncio.create_task(upstream_to_client(), name="pi-gateway-upstream-client"),
     }
+    eviction_task = None
+    if attachment is not None:
+        eviction_task = asyncio.create_task(attachment.evict.wait(), name="pi-gateway-eviction")
+        tasks.add(eviction_task)
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for task in pending:
         task.cancel()
     await asyncio.gather(*pending, return_exceptions=True)
     for task in done:
-        task.result()
+        if task is not eviction_task:
+            task.result()
+    return "replaced" if eviction_task in done else "completed"
 
 
 def create_app(db: Database) -> FastAPI:
@@ -382,8 +461,9 @@ def create_app(db: Database) -> FastAPI:
     app.state.metrics = Metrics()
     app.state.tunnels = TunnelRegistry()
     app.state.pi_gateway_lock = asyncio.Lock()
-    app.state.pi_gateway_counts = Counter()
+    app.state.pi_gateway_attachments = {}
     app.state.pi_gateway_refused_total = 0
+    app.state.pi_gateway_evictions_total = 0
     app.state.pi_gateway_close_reasons = Counter()
     app.state.pi_gateway_max_per_session = _positive_int_env(
         "WH_PI_MAX_ATTACHMENTS", 8
@@ -395,9 +475,14 @@ def create_app(db: Database) -> FastAPI:
     async def health():
         """Control-plane liveness endpoint (separate from registration)."""
         async with app.state.pi_gateway_lock:
-            gateway_by_session = dict(app.state.pi_gateway_counts)
+            gateway_by_session = {
+                session_id: len(active)
+                for session_id, active in app.state.pi_gateway_attachments.items()
+                if active
+            }
             gateway_close_reasons = dict(app.state.pi_gateway_close_reasons)
             gateway_refused_total = app.state.pi_gateway_refused_total
+            gateway_evictions_total = app.state.pi_gateway_evictions_total
         return {
             "status": "healthy",
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -405,6 +490,7 @@ def create_app(db: Database) -> FastAPI:
             "pi_gateway_attachments_by_session": gateway_by_session,
             "pi_gateway_max_per_session": app.state.pi_gateway_max_per_session,
             "pi_gateway_refused_total": gateway_refused_total,
+            "pi_gateway_evictions_total": gateway_evictions_total,
             "pi_gateway_close_reasons": gateway_close_reasons,
         }
 
@@ -681,28 +767,34 @@ def create_app(db: Database) -> FastAPI:
             await websocket.close(code=4409, reason=str(info.get("reason") or "session not attachable")[:120])
             return
 
-        rejected = False
-        async with app.state.pi_gateway_lock:
-            active = app.state.pi_gateway_counts[session_id]
-            if active >= app.state.pi_gateway_max_per_session:
-                app.state.pi_gateway_refused_total += 1
-                rejected = True
-            else:
-                app.state.pi_gateway_counts[session_id] += 1
-        if rejected:
-            await websocket.send_json({
-                "type": "error",
-                "code": "attachment_limit",
-                "limit": app.state.pi_gateway_max_per_session,
-            })
-            await websocket.close(code=4429, reason="gateway attachment limit reached")
-            return
-
         rows = _terminal_dimension(websocket.query_params.get("rows"), 24)
         cols = _terminal_dimension(websocket.query_params.get("cols"), 80)
+        attachment = _GatewayAttachment(
+            id=str(uuid4()),
+            client=websocket,
+            last_activity=asyncio.get_running_loop().time(),
+            rows=rows,
+            cols=cols,
+        )
+        victim = await _reserve_gateway_attachment(app, session_id, attachment)
+        if victim is not None:
+            try:
+                await asyncio.wait_for(victim.released.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                log.warning("timed out waiting for evicted Pi gateway attachment cleanup")
+
         upstream_url = _terminal_url_with_dimensions(info["direct_websocket_url"], rows, cols)
         close_reason = "completed"
         try:
+            if attachment.evict.is_set():
+                close_reason = "replaced"
+                await websocket.send_json({
+                    "type": "status",
+                    "state": "replaced",
+                    "reason": "attachment capacity reclaimed by a newer client",
+                })
+                await websocket.close(code=4410, reason="replaced by newer attachment")
+                return
             async with websocket_connect(
                 upstream_url,
                 max_size=None,
@@ -711,7 +803,17 @@ def create_app(db: Database) -> FastAPI:
                 ping_timeout=20,
                 close_timeout=2,
             ) as upstream:
-                await _pump_terminal_gateway(websocket, upstream)
+                outcome = await _pump_terminal_gateway(
+                    websocket, upstream, attachment=attachment
+                )
+                if outcome == "replaced":
+                    close_reason = "replaced"
+                    await websocket.send_json({
+                        "type": "status",
+                        "state": "replaced",
+                        "reason": "attachment capacity reclaimed by a newer client",
+                    })
+                    await websocket.close(code=4410, reason="replaced by newer attachment")
         except ConnectionClosed as exc:
             close_reason = f"upstream-{exc.code}"
             try:
@@ -735,9 +837,7 @@ def create_app(db: Database) -> FastAPI:
         finally:
             async with app.state.pi_gateway_lock:
                 app.state.pi_gateway_close_reasons[close_reason] += 1
-                app.state.pi_gateway_counts[session_id] -= 1
-                if app.state.pi_gateway_counts[session_id] <= 0:
-                    del app.state.pi_gateway_counts[session_id]
+            await _release_gateway_attachment(app, session_id, attachment)
 
     @app.get("/api/v1/pi/sessions/{session_id}/events")
     async def pi_session_events(

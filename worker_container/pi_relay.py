@@ -93,6 +93,18 @@ class SessionRecord(BaseModel):
 
 
 @dataclass
+class AttachmentSlot:
+    id: str
+    websocket: WebSocket | None
+    loop: asyncio.AbstractEventLoop
+    last_activity: float
+    rows: int = 24
+    cols: int = 80
+    evict: asyncio.Event = field(default_factory=asyncio.Event)
+    released: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass
 class RelayState:
     """Durable local session ownership; tmux remains alive across attaches."""
 
@@ -120,7 +132,8 @@ class RelayState:
     )
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _attachment_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    _attachments: dict[str, set[str]] = field(default_factory=dict)
+    _attachments: dict[str, dict[str, AttachmentSlot]] = field(default_factory=dict)
+    attachment_evictions_total: int = 0
     _outbox_task: asyncio.Task[None] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
@@ -135,23 +148,36 @@ class RelayState:
             raise ValueError("attach_idle_seconds must be positive")
         self._load()
 
-    async def reserve_attachment(self, session_id: str) -> str | None:
-        """Reserve one bounded, process-local terminal attachment slot."""
+    async def reserve_attachment(
+        self, session_id: str, websocket: WebSocket | None = None
+    ) -> tuple[AttachmentSlot, AttachmentSlot | None]:
+        """Reserve a slot, reclaiming the longest-idle attachment at capacity."""
 
+        loop = asyncio.get_running_loop()
         async with self._attachment_lock:
-            active = self._attachments.setdefault(session_id, set())
+            active = self._attachments.setdefault(session_id, {})
+            victim = None
             if len(active) >= self.max_attachments_per_session:
-                return None
+                victim = min(active.values(), key=lambda slot: (slot.last_activity, slot.id))
+                active.pop(victim.id, None)
+                victim.loop.call_soon_threadsafe(victim.evict.set)
+                self.attachment_evictions_total += 1
             attachment_id = str(uuid4())
-            active.add(attachment_id)
-            return attachment_id
+            slot = AttachmentSlot(
+                id=attachment_id,
+                websocket=websocket,
+                loop=loop,
+                last_activity=loop.time(),
+            )
+            active[attachment_id] = slot
+            return slot, victim
 
     async def release_attachment(self, session_id: str, attachment_id: str) -> None:
         async with self._attachment_lock:
             active = self._attachments.get(session_id)
             if not active:
                 return
-            active.discard(attachment_id)
+            active.pop(attachment_id, None)
             if not active:
                 self._attachments.pop(session_id, None)
 
@@ -551,15 +577,14 @@ async def _relay_terminal(
     tmux_tmpdir: Path,
     *,
     idle_seconds: float,
+    attachment: AttachmentSlot,
 ) -> None:
     """Attach a disposable tmux client PTY; never kill the underlying Pi."""
 
     loop = asyncio.get_running_loop()
-    last_client_activity = loop.time()
 
     def touch_client_activity() -> None:
-        nonlocal last_client_activity
-        last_client_activity = loop.time()
+        attachment.last_activity = loop.time()
 
     master_fd, slave_fd = pty.openpty()
     _set_winsize(slave_fd, 24, 80)
@@ -606,15 +631,18 @@ async def _relay_terminal(
                 os.write(master_fd, text.encode())
                 continue
             if frame.get("type") == "resize":
-                touch_client_activity()
-                _set_winsize(master_fd, int(frame["rows"]), int(frame["cols"]))
+                rows, cols = int(frame["rows"]), int(frame["cols"])
+                if (rows, cols) != (attachment.rows, attachment.cols):
+                    touch_client_activity()
+                    attachment.rows, attachment.cols = rows, cols
+                    _set_winsize(master_fd, rows, cols)
             elif frame.get("type") == "input":
                 touch_client_activity()
                 os.write(master_fd, str(frame.get("data", "")).encode())
 
     async def idle_watchdog() -> None:
         while True:
-            remaining = idle_seconds - (loop.time() - last_client_activity)
+            remaining = idle_seconds - (loop.time() - attachment.last_activity)
             if remaining <= 0:
                 await websocket.send_json({
                     "type": "status",
@@ -628,15 +656,27 @@ async def _relay_terminal(
     output_task = asyncio.create_task(read_output())
     input_task = asyncio.create_task(read_input())
     idle_task = asyncio.create_task(idle_watchdog())
+    eviction_task = asyncio.create_task(attachment.evict.wait())
     try:
         done, pending = await asyncio.wait(
-            {output_task, input_task, idle_task}, return_when=asyncio.FIRST_COMPLETED
+            {output_task, input_task, idle_task, eviction_task},
+            return_when=asyncio.FIRST_COMPLETED,
         )
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
         for task in done:
             task.result()
+        if eviction_task in done:
+            try:
+                await websocket.send_json({
+                    "type": "status",
+                    "state": "replaced",
+                    "reason": "attachment capacity reclaimed by a newer client",
+                })
+                await websocket.close(code=4410, reason="replaced by newer attachment")
+            except RuntimeError:
+                pass
     finally:
         if proc.returncode is None:
             proc.terminate()
@@ -688,6 +728,7 @@ def create_relay_app(
             "attachments_by_session": attachments_by_session,
             "max_attachments_per_session": relay_state.max_attachments_per_session,
             "attachment_idle_seconds": relay_state.attach_idle_seconds,
+            "attachment_evictions_total": relay_state.attachment_evictions_total,
         }
 
     @app.get("/v1/sessions", response_model=list[SessionRecord])
@@ -731,15 +772,12 @@ def create_relay_app(
             await websocket.send_json({"type": "error", "code": "session_not_running", "state": session.state})
             await websocket.close(code=4409, reason=session.detail[:120])
             return
-        attachment_id = await relay_state.reserve_attachment(session_id)
-        if attachment_id is None:
-            await websocket.send_json({
-                "type": "error",
-                "code": "attachment_limit",
-                "limit": relay_state.max_attachments_per_session,
-            })
-            await websocket.close(code=4429, reason="attachment limit reached")
-            return
+        attachment, victim = await relay_state.reserve_attachment(session_id, websocket)
+        if victim is not None:
+            try:
+                await asyncio.wait_for(victim.released.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                pass
         try:
             await websocket.send_json(
                 {
@@ -748,7 +786,7 @@ def create_relay_app(
                     "state": session.state,
                     "terminal": "ready",
                     "protocol_version": PROTOCOL_VERSION,
-                    "attachment_id": attachment_id,
+                    "attachment_id": attachment.id,
                 }
             )
             await _relay_terminal(
@@ -756,9 +794,11 @@ def create_relay_app(
                 session,
                 relay_state.tmux_tmpdir,
                 idle_seconds=relay_state.attach_idle_seconds,
+                attachment=attachment,
             )
         finally:
-            await relay_state.release_attachment(session_id, attachment_id)
+            await relay_state.release_attachment(session_id, attachment.id)
+            attachment.released.set()
 
     return app
 

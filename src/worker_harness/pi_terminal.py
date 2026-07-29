@@ -169,7 +169,7 @@ async def _receive_output(websocket: Any, stdout_fd: int) -> str | None:
         if frame.get("type") == "error":
             detail = frame.get("detail") or frame.get("code") or "terminal relay reported an error"
             raise RuntimeError(str(detail))
-        if frame.get("type") == "status" and frame.get("state") == "idle-timeout":
+        if frame.get("type") == "status" and frame.get("state") in {"idle-timeout", "replaced"}:
             return "select"
         # Other status frames are protocol metadata; tmux's binary redraw is the UI.
     return None

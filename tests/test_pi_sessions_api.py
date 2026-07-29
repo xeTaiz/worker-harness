@@ -15,7 +15,10 @@ from starlette.websockets import WebSocketDisconnect
 
 from worker_harness.db import Database
 from worker_harness.heartbeat import (
+    _GatewayAttachment,
     _pump_terminal_gateway,
+    _release_gateway_attachment,
+    _reserve_gateway_attachment,
     _terminal_url_with_dimensions,
     create_app,
     create_registration_app,
@@ -115,6 +118,7 @@ class PiSessionsApiTests(unittest.TestCase):
         self.assertIn("attach-info", script.text)
         self.assertIn("gateway_websocket_url", script.text)
         self.assertIn("idle-timeout", script.text)
+        self.assertIn("replaced", script.text)
         self.assertIn("orchestrator gateway", script.text)
         self.assertIn("DOMPurify", script.text)
         self.assertIn("renderMathInElement", script.text)
@@ -391,6 +395,40 @@ class PiSessionsApiTests(unittest.TestCase):
                     with self.assertRaises(WebSocketDisconnect) as closed:
                         websocket.receive_text()
                     self.assertEqual(getattr(closed.exception, "code", None), 1011)
+
+    def test_gateway_reclaims_longest_idle_stream_at_capacity(self):
+        async def run():
+            self.app.state.pi_gateway_max_per_session = 2
+            first = _GatewayAttachment("first", AsyncMock(), 1.0, 24, 80)
+            second = _GatewayAttachment("second", AsyncMock(), 2.0, 24, 80)
+            replacement = _GatewayAttachment("replacement", AsyncMock(), 3.0, 24, 80)
+            self.assertIsNone(
+                await _reserve_gateway_attachment(self.app, "gateway-bounded", first)
+            )
+            self.assertIsNone(
+                await _reserve_gateway_attachment(self.app, "gateway-bounded", second)
+            )
+            victim = await _reserve_gateway_attachment(
+                self.app, "gateway-bounded", replacement
+            )
+            self.assertIs(victim, first)
+            self.assertTrue(first.evict.is_set())
+            self.assertEqual(
+                set(self.app.state.pi_gateway_attachments["gateway-bounded"]),
+                {"second", "replacement"},
+            )
+            self.assertEqual(self.app.state.pi_gateway_evictions_total, 1)
+            # Delayed cleanup from the victim cannot release a surviving slot.
+            await _release_gateway_attachment(self.app, "gateway-bounded", first)
+            self.assertEqual(
+                set(self.app.state.pi_gateway_attachments["gateway-bounded"]),
+                {"second", "replacement"},
+            )
+            await _release_gateway_attachment(self.app, "gateway-bounded", second)
+            await _release_gateway_attachment(self.app, "gateway-bounded", replacement)
+            self.assertNotIn("gateway-bounded", self.app.state.pi_gateway_attachments)
+
+        asyncio.run(run())
 
     def test_pi_session_sse_replays_from_durable_cursor(self):
         session_id = "stream-session"

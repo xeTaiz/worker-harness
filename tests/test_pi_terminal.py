@@ -125,6 +125,12 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(await pi_terminal._receive_output(websocket, 1), "select")
 
+    async def test_receive_output_returns_to_selector_when_replaced_at_capacity(self):
+        websocket = FakeWebSocket([
+            '{"type":"status","state":"replaced","reason":"capacity reclaimed"}',
+        ])
+        self.assertEqual(await pi_terminal._receive_output(websocket, 1), "select")
+
     async def test_receive_output_surfaces_relay_error(self):
         websocket = FakeWebSocket(['{"type":"error","detail":"already attached"}'])
         with self.assertRaisesRegex(RuntimeError, "already attached"):

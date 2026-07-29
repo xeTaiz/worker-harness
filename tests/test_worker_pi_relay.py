@@ -158,24 +158,29 @@ class PiRelayTests(unittest.TestCase):
                     default_cwd=Path(tmp),
                     max_attachments_per_session=2,
                 )
-                first = await state.reserve_attachment("child")
-                second = await state.reserve_attachment("child")
-                self.assertTrue(first)
-                self.assertTrue(second)
-                self.assertIsNone(await state.reserve_attachment("child"))
+                first, victim = await state.reserve_attachment("child")
+                second, victim2 = await state.reserve_attachment("child")
+                self.assertIsNone(victim)
+                self.assertIsNone(victim2)
+                first.last_activity = 1.0
+                second.last_activity = 2.0
+                replacement, reclaimed = await state.reserve_attachment("child")
+                self.assertIs(reclaimed, first)
                 total, per_session = await state.attachment_counts()
                 self.assertEqual((total, per_session), (2, {"child": 2}))
-                await state.release_attachment("child", str(first))
-                replacement = await state.reserve_attachment("child")
-                self.assertTrue(replacement)
-                await state.release_attachment("child", str(second))
-                await state.release_attachment("child", str(replacement))
-                await state.release_attachment("child", str(replacement))
+                self.assertEqual(state.attachment_evictions_total, 1)
+                # A delayed cleanup from the evicted attachment cannot release
+                # either surviving slot.
+                await state.release_attachment("child", first.id)
+                self.assertEqual(await state.attachment_counts(), (2, {"child": 2}))
+                await state.release_attachment("child", second.id)
+                await state.release_attachment("child", replacement.id)
+                await state.release_attachment("child", replacement.id)
                 self.assertEqual(await state.attachment_counts(), (0, {}))
 
         asyncio.run(run())
 
-    def test_worker_relay_rejects_ninth_style_attachment_without_stopping_pi(self):
+    def test_worker_relay_reclaims_longest_idle_attachment_without_stopping_pi(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = self.relay.RelayState(
                 root=Path(tmp) / "sessions",
@@ -184,24 +189,48 @@ class PiRelayTests(unittest.TestCase):
                 max_attachments_per_session=1,
             )
             app = self.relay.create_relay_app(state)
+            session_id = f"bounded-{time.time_ns()}"
             with TestClient(app) as client:
-                created = client.post("/v1/sessions", json={"session_id": "bounded"})
+                created = client.post("/v1/sessions", json={"session_id": session_id})
                 self.assertEqual(created.status_code, 201)
-                with client.websocket_connect("/v1/sessions/bounded/attach") as first:
-                    self.assertEqual(first.receive_json()["type"], "status")
-                    with client.websocket_connect("/v1/sessions/bounded/attach") as second:
-                        self.assertEqual(
-                            second.receive_json(),
-                            {"type": "error", "code": "attachment_limit", "limit": 1},
+                with client.websocket_connect(f"/v1/sessions/{session_id}/attach") as first:
+                    first_status = first.receive_json()
+                    self.assertEqual(first_status["type"], "status")
+                    with client.websocket_connect(f"/v1/sessions/{session_id}/attach") as second:
+                        second_status = second.receive_json()
+                        self.assertEqual(second_status["type"], "status")
+                        self.assertNotEqual(
+                            first_status["attachment_id"], second_status["attachment_id"]
                         )
-                        with self.assertRaises(WebSocketDisconnect) as closed:
-                            second.receive_text()
-                        self.assertEqual(closed.exception.code, 4429)
-                    health = client.get("/healthz").json()
-                    self.assertEqual(health["attachments_by_session"], {"bounded": 1})
+                        replaced = None
+                        for _ in range(20):
+                            message = first.receive()
+                            if message.get("text"):
+                                payload = json.loads(message["text"])
+                                if payload.get("state") == "replaced":
+                                    replaced = payload
+                                    break
+                        self.assertEqual(
+                            replaced,
+                            {
+                                "type": "status",
+                                "state": "replaced",
+                                "reason": "attachment capacity reclaimed by a newer client",
+                            },
+                        )
+                        close_code = None
+                        for _ in range(20):
+                            message = first.receive()
+                            if message.get("type") == "websocket.close":
+                                close_code = message.get("code")
+                                break
+                        self.assertEqual(close_code, 4410)
+                        health = client.get("/healthz").json()
+                        self.assertEqual(health["attachments_by_session"], {session_id: 1})
+                        self.assertEqual(health["attachment_evictions_total"], 1)
                 self.assertEqual(client.get("/v1/sessions").json()[0]["state"], "working")
                 self.assertEqual(client.get("/healthz").json()["attachment_count"], 0)
-                client.post("/v1/sessions/bounded:cancel")
+                client.post(f"/v1/sessions/{session_id}:cancel")
 
     def test_worker_relay_detaches_idle_client_but_preserves_session(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -193,7 +193,7 @@ The fabric is single-operator and intentionally permits multiple read-write clie
 
 Implemented in Worker Harness `8f20af5` and dotfiles `c3b6273`; the checklist remains the acceptance contract:
 
-1. **Common policy:** allow at most eight live attachments per Pi session on both host and worker relays. Reject the ninth with a typed `attachment_limit` error and a stable WebSocket close code. Expose active counts in relay health/metrics.
+1. **Common policy:** allow at most eight live attachments per Pi session on both host and worker relays. When a new attachment arrives at capacity, atomically reclaim the longest-idle attachment and admit the newcomer so a broken idle reaper cannot lock out the operator. The victim receives `{type:"status", state:"replaced"}` and WebSocket close code `4410`; a typed `attachment_limit`/`4429` remains only as a defensive fallback if no reservation can be reclaimed. Expose active and eviction counts in relay health/metrics.
 2. **Per-connection identity:** allocate an in-memory attachment ID for exact cleanup. Never key cleanup solely by session ID.
 3. **One-hour inactivity:** track client-originated application activity per attachment. Terminal input and changed resize frames refresh activity; PTY output and WebSocket ping/pong do not, because tmux status redraws would otherwise keep abandoned clients alive forever. After more than 3600 seconds without client activity, send `{type:"status", state:"idle-timeout"}`, close only that attachment, and leave Pi/tmux running. Passive viewers may therefore be detached after one hour and can immediately reattach.
 4. **Worker relay:** add an async-safe per-session reservation/count around `_relay_terminal`; release in `finally`; add a watchdog task to each PTY/WebSocket pair; make limits/timeouts configurable for tests while defaulting to `8` and `3600`.
@@ -203,8 +203,8 @@ Implemented in Worker Harness `8f20af5` and dotfiles `c3b6273`; the checklist re
 8. **Resize semantics:** retain tmux `window-size latest`; the most recently connected/resized client controls shared dimensions. Clients send resize only when their actual dimensions change, avoiding continuous contention. Document this single-operator tradeoff.
 9. **Native UX:** direct attach remains first choice; an idle-timeout status restores the local TTY and returns the fullscreen attachment window to the attachable-agent selector. `Ctrl-]`, `Ctrl-a x`, and cycling remain immediate clean detach paths.
 10. **PWA UX:** idle timeout closes the terminal socket and returns to the session selector/list. Manual reconnect creates a fresh ordinary attachment; no ownership recovery state is required.
-11. **Compatibility:** keep protocol v2 framing and legacy `websocket_url`. Add fields/status codes compatibly; no database migration or protocol-v3 lease rollout is required.
-12. **Tests:** cover two simultaneous read-write clients, cap/release races, one-hour timeout with a short test clock, input/resize activity refresh, output-not-activity behavior, source-session survival, final-only zoom restoration, route teardown, and current tmux sizing behavior.
+11. **Compatibility:** keep protocol v2 framing and legacy `websocket_url`. Add the `replaced` status and close code `4410` compatibly; native and PWA victims return to their selector and can immediately reclaim a slot in turn. No database migration or protocol-v3 lease rollout is required.
+12. **Tests:** cover two simultaneous read-write clients, longest-idle replacement at capacity, pending-reservation and delayed-cleanup races, one-hour timeout with a short test clock, input/changed-resize activity refresh, output-not-activity behavior, source-session survival, final-only zoom restoration, route teardown, and current tmux sizing behavior.
 
 ### 6.4 Orchestrator gateway fallback — implemented; deployment pending
 
@@ -216,10 +216,10 @@ Implemented in Worker Harness `8f20af5`; the checklist remains the acceptance co
 2. Add `WS /api/v1/pi/sessions/{id}/attach-gateway` only to the operator control service; never add it to worker ingest `:12888`.
 3. Resolve session state and direct relay target once before pumping. Forward only validated initial `rows`/`cols` query parameters upstream.
 4. Use two strict receive-then-send tasks with no unbounded intermediate terminal queue and no SQLite work per frame. Preserve text/binary frames exactly.
-5. Bound WebSocket library queues, cap concurrent gateway streams, apply a per-send stall watchdog, and propagate close/cancellation in both directions. Never persist or log terminal payload bytes.
+5. Bound WebSocket library queues, cap concurrent gateway streams, reclaim the longest-idle gateway stream before opening a replacement upstream, apply a per-send stall watchdog, and propagate close/cancellation in both directions. The upstream relay remains the authoritative unified cap across direct and gateway clients. Never persist or log terminal payload bytes.
 6. Native CLI/tmux/Zellij clients try direct first and use gateway only for connection/upgrade failures. They must not fallback after a deliberate idle timeout or clean detach.
 7. The PWA uses gateway first for same-origin reliability, then direct if the gateway cannot be opened. Display the active transport accurately.
-8. Add gateway active/refused/close-reason metrics and health visibility.
+8. Add gateway active/refused/evicted/close-reason metrics and health visibility.
 9. Test binary and JSON frame fidelity, bidirectional close, unavailable upstream, direct/gateway coexistence under the relay cap, slow-client timeout/backpressure, and URL construction behind HTTP/HTTPS.
 
 ## 7. Session data and APIs
@@ -393,7 +393,7 @@ The host relay, native terminal client, direct local focus, remote PTY stream, f
 
 Allow up to eight concurrent read-write clients per Pi session on both relays, with exact per-connection cleanup, shared tmux zoom reference counting, one-hour application inactivity detach, and selector return UX.
 
-**Gate:** eight simultaneous clients can view/type; the ninth is rejected; activity refreshes the timer; an idle client detaches without ending Pi; the final disconnect alone restores source layout; reconnect is an ordinary new attachment.
+**Gate:** eight simultaneous clients can view/type; a ninth atomically replaces the longest-idle attachment without exceeding eight; the victim returns to its selector; activity refreshes the timer; an idle client detaches without ending Pi; delayed victim cleanup cannot release the replacement slot; the final disconnect alone restores source layout; reconnect is an ordinary new attachment.
 
 ### M3c — orchestrator gateway fallback — implemented; deployment/live acceptance pending
 
@@ -444,7 +444,7 @@ Completed spikes: tmux PTY relay/direct WebSocket/resize/input, bridge replaceme
 Remaining work, in order:
 
 1. **Tmux closure matrix:** current versions on every host; local/remote/delegated cycle and wraparound; reconnect; orchestrator restart re-registration; repeated web reload without duplicate backfill.
-2. **Multi-attach prototype:** eight concurrent clients to one delegated and one interactive session; ninth rejection; activity-refresh and short-clock idle timeout; shared zoom final-only restore; underlying Pi survives every detach.
+2. **Multi-attach prototype:** eight concurrent clients to one delegated and one interactive session; ninth attach replaces the longest-idle client; victim selector return; activity-refresh and short-clock idle timeout; shared zoom final-only restore; underlying Pi survives every detach.
 3. **Gateway backpressure:** direct upstream relay plus deliberately slow downstream client; prove frame fidelity, bounded memory, send watchdog, close propagation, and coexistence with direct clients.
 4. **Native/PWA fallback:** force direct connection failure, confirm gateway selection, idle-timeout return to selector, and immediate reattach.
 5. **Zellij adapter spike:** stable session/tab/pane identity, exact local focus command, second-client PTY behavior, resize semantics, and detach cleanup before production integration.

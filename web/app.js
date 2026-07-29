@@ -457,7 +457,7 @@ function connectTerminal() {
     const socket = new WebSocket(terminalConnectionUrl(rawUrl));
     let opened = false;
     let upstreamFailed = false;
-    let idleTimedOut = false;
+    let returnToSelector = false;
     socket.binaryType = "arraybuffer";
     state.terminalSocket = socket;
     socket.addEventListener("open", () => {
@@ -473,11 +473,13 @@ function connectTerminal() {
         try {
           const payload = JSON.parse(event.data);
           if (payload.type === "status") {
-            if (payload.state === "idle-timeout") {
-              idleTimedOut = true;
-              terminalStatus.textContent = "Detached after 1 hour of inactivity";
+            if (payload.state === "idle-timeout" || payload.state === "replaced") {
+              returnToSelector = true;
+              terminalStatus.textContent = payload.state === "replaced"
+                ? "Detached to make room for a newer attachment"
+                : "Detached after 1 hour of inactivity";
               terminalStatus.className = "";
-              socket.close(1000, "idle timeout acknowledged");
+              socket.close(1000, `${payload.state} acknowledged`);
               setTimeout(() => {
                 if (state.terminalSocket === socket || state.terminalSocket === null) closeDetail();
               }, 0);
@@ -500,7 +502,7 @@ function connectTerminal() {
     socket.addEventListener("close", (event) => {
       if (state.terminalSocket !== socket) return;
       state.terminalSocket = null;
-      if (!idleTimedOut && index + 1 < candidates.length && (!opened || upstreamFailed)) {
+      if (!returnToSelector && index + 1 < candidates.length && (!opened || upstreamFailed)) {
         terminalStatus.textContent = `Trying ${candidates[index + 1][1]}…`;
         terminalStatus.className = "connecting";
         tryCandidate(index + 1);
