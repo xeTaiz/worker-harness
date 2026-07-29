@@ -429,52 +429,94 @@ function resizeTerminal() {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "resize", rows, cols }));
 }
 
+function terminalConnectionUrl(rawUrl) {
+  const url = new URL(rawUrl, window.location.href);
+  const rows = Math.min(1000, Math.max(8, Math.floor(terminalOutput.clientHeight / 18)));
+  const cols = Math.min(1000, Math.max(20, Math.floor(terminalOutput.clientWidth / 8)));
+  url.searchParams.set("rows", rows);
+  url.searchParams.set("cols", cols);
+  return url.toString();
+}
+
 function connectTerminal() {
-  if (!state.attachInfo?.attachable || !state.attachInfo.websocket_url) return;
+  if (!state.attachInfo?.attachable) return;
   if (state.terminalSocket && state.terminalSocket.readyState <= WebSocket.OPEN) return;
+  const candidates = [
+    [state.attachInfo.gateway_websocket_url, "orchestrator gateway"],
+    [state.attachInfo.direct_websocket_url || state.attachInfo.websocket_url, "direct relay"],
+  ].filter(([url], index, rows) => url && rows.findIndex(([seen]) => seen === url) === index);
+  if (!candidates.length) return;
+
   disconnectTerminal("Connecting…");
   resetTerminalScreen();
   state.terminalDecoder = new TextDecoder();
   terminalStatus.className = "connecting";
-  const socket = new WebSocket(state.attachInfo.websocket_url);
-  socket.binaryType = "arraybuffer";
-  state.terminalSocket = socket;
-  socket.addEventListener("open", () => {
-    if (state.terminalSocket !== socket) return;
-    terminalStatus.textContent = "Connected · direct worker relay";
-    terminalStatus.className = "online";
-    resizeTerminal();
-  });
-  socket.addEventListener("message", async (event) => {
-    if (state.terminalSocket !== socket) return;
-    if (typeof event.data === "string") {
-      try {
-        const payload = JSON.parse(event.data);
-        if (payload.type === "status") {
-          terminalStatus.textContent = `${payload.state || "connected"} · terminal ${payload.terminal || "ready"}`;
-          terminalStatus.className = "online";
-        } else if (payload.type === "error") {
-          appendTerminalOutput(`\n[relay error: ${payload.detail || payload.message || "unknown error"}]\n`);
+
+  const tryCandidate = (index) => {
+    const [rawUrl, transportLabel] = candidates[index];
+    const socket = new WebSocket(terminalConnectionUrl(rawUrl));
+    let opened = false;
+    let upstreamFailed = false;
+    let idleTimedOut = false;
+    socket.binaryType = "arraybuffer";
+    state.terminalSocket = socket;
+    socket.addEventListener("open", () => {
+      if (state.terminalSocket !== socket) return;
+      opened = true;
+      terminalStatus.textContent = `Connected · ${transportLabel}`;
+      terminalStatus.className = "online";
+      resizeTerminal();
+    });
+    socket.addEventListener("message", async (event) => {
+      if (state.terminalSocket !== socket) return;
+      if (typeof event.data === "string") {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.type === "status") {
+            if (payload.state === "idle-timeout") {
+              idleTimedOut = true;
+              terminalStatus.textContent = "Detached after 1 hour of inactivity";
+              terminalStatus.className = "";
+              socket.close(1000, "idle timeout acknowledged");
+              setTimeout(() => {
+                if (state.terminalSocket === socket || state.terminalSocket === null) closeDetail();
+              }, 0);
+              return;
+            }
+            terminalStatus.textContent = `${payload.state || "connected"} · ${transportLabel}`;
+            terminalStatus.className = "online";
+          } else if (payload.type === "error") {
+            upstreamFailed = payload.code === "upstream_unavailable";
+            appendTerminalOutput(`\n[relay error: ${payload.detail || payload.message || payload.code || "unknown error"}]\n`);
+          }
+        } catch {
+          appendTerminalOutput(event.data);
         }
-      } catch {
-        appendTerminalOutput(event.data);
+        return;
       }
-      return;
-    }
-    const bytes = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
-    appendTerminalOutput(state.terminalDecoder.decode(bytes, { stream: true }));
-  });
-  socket.addEventListener("close", (event) => {
-    if (state.terminalSocket !== socket) return;
-    state.terminalSocket = null;
-    terminalStatus.textContent = event.code === 1000 ? "Disconnected" : `Disconnected · code ${event.code}`;
-    terminalStatus.className = "";
-  });
-  socket.addEventListener("error", () => {
-    if (state.terminalSocket !== socket) return;
-    terminalStatus.textContent = "Connection failed";
-    terminalStatus.className = "error";
-  });
+      const bytes = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+      appendTerminalOutput(state.terminalDecoder.decode(bytes, { stream: true }));
+    });
+    socket.addEventListener("close", (event) => {
+      if (state.terminalSocket !== socket) return;
+      state.terminalSocket = null;
+      if (!idleTimedOut && index + 1 < candidates.length && (!opened || upstreamFailed)) {
+        terminalStatus.textContent = `Trying ${candidates[index + 1][1]}…`;
+        terminalStatus.className = "connecting";
+        tryCandidate(index + 1);
+        return;
+      }
+      terminalStatus.textContent = event.code === 1000 ? "Disconnected" : `Disconnected · code ${event.code}`;
+      terminalStatus.className = "";
+    });
+    socket.addEventListener("error", () => {
+      if (state.terminalSocket !== socket) return;
+      terminalStatus.textContent = "Connection failed";
+      terminalStatus.className = "error";
+    });
+  };
+
+  tryCandidate(0);
 }
 
 function sendTerminalInput(data) {

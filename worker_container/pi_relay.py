@@ -37,6 +37,22 @@ PROTOCOL_VERSION = 2
 _SESSION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 class SessionCreate(BaseModel):
     """Requested delegated Pi session. The worker determines its command."""
 
@@ -96,7 +112,15 @@ class RelayState:
     # child. It never binds a TCP port or reaches Tailscale Serve.
     job_socket: str | None = None
     sessions: dict[str, SessionRecord] = field(default_factory=dict)
+    max_attachments_per_session: int = field(
+        default_factory=lambda: _positive_int_env("WH_PI_MAX_ATTACHMENTS", 8)
+    )
+    attach_idle_seconds: float = field(
+        default_factory=lambda: _positive_float_env("WH_PI_ATTACH_IDLE_SECONDS", 3600.0)
+    )
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _attachment_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _attachments: dict[str, set[str]] = field(default_factory=dict)
     _outbox_task: asyncio.Task[None] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
@@ -105,7 +129,40 @@ class RelayState:
         self.tmux_tmpdir = (self.tmux_tmpdir or (self.root / "tmux")).expanduser().resolve()
         self.tmux_tmpdir.mkdir(parents=True, exist_ok=True)
         self.tmux_tmpdir.chmod(0o1777)
+        if self.max_attachments_per_session < 1:
+            raise ValueError("max_attachments_per_session must be positive")
+        if self.attach_idle_seconds <= 0:
+            raise ValueError("attach_idle_seconds must be positive")
         self._load()
+
+    async def reserve_attachment(self, session_id: str) -> str | None:
+        """Reserve one bounded, process-local terminal attachment slot."""
+
+        async with self._attachment_lock:
+            active = self._attachments.setdefault(session_id, set())
+            if len(active) >= self.max_attachments_per_session:
+                return None
+            attachment_id = str(uuid4())
+            active.add(attachment_id)
+            return attachment_id
+
+    async def release_attachment(self, session_id: str, attachment_id: str) -> None:
+        async with self._attachment_lock:
+            active = self._attachments.get(session_id)
+            if not active:
+                return
+            active.discard(attachment_id)
+            if not active:
+                self._attachments.pop(session_id, None)
+
+    async def attachment_counts(self) -> tuple[int, dict[str, int]]:
+        async with self._attachment_lock:
+            per_session = {
+                session_id: len(active)
+                for session_id, active in self._attachments.items()
+                if active
+            }
+        return sum(per_session.values()), per_session
 
     @staticmethod
     def _tmux_name(session_id: str) -> str:
@@ -488,8 +545,21 @@ def _set_winsize(fd: int, rows: int, cols: int) -> None:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
-async def _relay_terminal(websocket: WebSocket, record: SessionRecord, tmux_tmpdir: Path) -> None:
+async def _relay_terminal(
+    websocket: WebSocket,
+    record: SessionRecord,
+    tmux_tmpdir: Path,
+    *,
+    idle_seconds: float,
+) -> None:
     """Attach a disposable tmux client PTY; never kill the underlying Pi."""
+
+    loop = asyncio.get_running_loop()
+    last_client_activity = loop.time()
+
+    def touch_client_activity() -> None:
+        nonlocal last_client_activity
+        last_client_activity = loop.time()
 
     master_fd, slave_fd = pty.openpty()
     _set_winsize(slave_fd, 24, 80)
@@ -523,6 +593,7 @@ async def _relay_terminal(websocket: WebSocket, record: SessionRecord, tmux_tmpd
             if kind == "websocket.disconnect":
                 return
             if message.get("bytes") is not None:
+                touch_client_activity()
                 os.write(master_fd, message["bytes"])
                 continue
             text = message.get("text")
@@ -531,17 +602,36 @@ async def _relay_terminal(websocket: WebSocket, record: SessionRecord, tmux_tmpd
             try:
                 frame = json.loads(text)
             except json.JSONDecodeError:
+                touch_client_activity()
                 os.write(master_fd, text.encode())
                 continue
             if frame.get("type") == "resize":
+                touch_client_activity()
                 _set_winsize(master_fd, int(frame["rows"]), int(frame["cols"]))
             elif frame.get("type") == "input":
+                touch_client_activity()
                 os.write(master_fd, str(frame.get("data", "")).encode())
+
+    async def idle_watchdog() -> None:
+        while True:
+            remaining = idle_seconds - (loop.time() - last_client_activity)
+            if remaining <= 0:
+                await websocket.send_json({
+                    "type": "status",
+                    "state": "idle-timeout",
+                    "reason": "attachment inactive",
+                })
+                await websocket.close(code=4408, reason="attachment inactive")
+                return
+            await asyncio.sleep(min(remaining, 30.0))
 
     output_task = asyncio.create_task(read_output())
     input_task = asyncio.create_task(read_input())
+    idle_task = asyncio.create_task(idle_watchdog())
     try:
-        done, pending = await asyncio.wait({output_task, input_task}, return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait(
+            {output_task, input_task, idle_task}, return_when=asyncio.FIRST_COMPLETED
+        )
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
@@ -588,11 +678,16 @@ def create_relay_app(
     app.state.pi_relay = relay_state
 
     @app.get("/healthz")
-    async def healthz() -> dict[str, int | str]:
+    async def healthz() -> dict[str, Any]:
+        attachment_count, attachments_by_session = await relay_state.attachment_counts()
         return {
             "status": "healthy",
             "protocol_version": PROTOCOL_VERSION,
             "session_count": len(await relay_state.list()),
+            "attachment_count": attachment_count,
+            "attachments_by_session": attachments_by_session,
+            "max_attachments_per_session": relay_state.max_attachments_per_session,
+            "attachment_idle_seconds": relay_state.attach_idle_seconds,
         }
 
     @app.get("/v1/sessions", response_model=list[SessionRecord])
@@ -636,16 +731,34 @@ def create_relay_app(
             await websocket.send_json({"type": "error", "code": "session_not_running", "state": session.state})
             await websocket.close(code=4409, reason=session.detail[:120])
             return
-        await websocket.send_json(
-            {
-                "type": "status",
-                "session_id": session.session_id,
-                "state": session.state,
-                "terminal": "ready",
-                "protocol_version": PROTOCOL_VERSION,
-            }
-        )
-        await _relay_terminal(websocket, session, relay_state.tmux_tmpdir)
+        attachment_id = await relay_state.reserve_attachment(session_id)
+        if attachment_id is None:
+            await websocket.send_json({
+                "type": "error",
+                "code": "attachment_limit",
+                "limit": relay_state.max_attachments_per_session,
+            })
+            await websocket.close(code=4429, reason="attachment limit reached")
+            return
+        try:
+            await websocket.send_json(
+                {
+                    "type": "status",
+                    "session_id": session.session_id,
+                    "state": session.state,
+                    "terminal": "ready",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "attachment_id": attachment_id,
+                }
+            )
+            await _relay_terminal(
+                websocket,
+                session,
+                relay_state.tmux_tmpdir,
+                idle_seconds=relay_state.attach_idle_seconds,
+            )
+        finally:
+            await relay_state.release_attachment(session_id, attachment_id)
 
     return app
 

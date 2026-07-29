@@ -35,9 +35,12 @@ bun --version
 sudo tailscale set --operator="$(id -un)"
 ```
 
-The host relay enforces one attached writer. Delegated relays do not yet share a
-durable orchestrator lease, and gateway fallback is still future work, so avoid
-attaching multiple writing clients to a delegated session.
+Host and delegated relays allow up to eight concurrent read-write attachments
+per Pi session, matching normal single-operator tmux behavior. The most recent
+client resize controls the shared tmux window. A client with no input or resize
+activity for one hour is detached without stopping Pi and can immediately
+reattach. Native clients prefer the direct Tailnet relay and fall back through
+the orchestrator gateway; the PWA uses the same-origin gateway first.
 
 For a native terminal attachment, install the CLI on each operator device and
 pick a session:

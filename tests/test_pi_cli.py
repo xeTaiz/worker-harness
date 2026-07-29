@@ -108,6 +108,8 @@ class PiCliTests(unittest.TestCase):
                 "transport": "direct-interactive-websocket",
                 "protocol_version": 2,
                 "websocket_url": "ws://100.64.0.2:27888/v1/sessions/interactive-session-id/attach",
+                "direct_websocket_url": "ws://100.64.0.2:27888/v1/sessions/interactive-session-id/attach",
+                "gateway_websocket_url": "ws://orchestrator:12889/api/v1/pi/sessions/interactive-session-id/attach-gateway",
             },
         ])
         focus = AsyncMock(return_value=False)
@@ -122,6 +124,7 @@ class PiCliTests(unittest.TestCase):
         focus.assert_awaited_once_with("interactive-session-id")
         terminal.assert_awaited_once_with(
             "ws://100.64.0.2:27888/v1/sessions/interactive-session-id/attach",
+            fallback_websocket_url="ws://orchestrator:12889/api/v1/pi/sessions/interactive-session-id/attach-gateway",
             cycle_requests=ANY,
         )
         self.assertEqual(request.await_args_list[1].args, (
@@ -150,6 +153,30 @@ class PiCliTests(unittest.TestCase):
         with (
             patch.object(pi, "_request", new=request),
             patch.object(pi, "_mark_attach_pane"),
+            patch("worker_harness.pi_terminal.attach_terminal", new=terminal),
+        ):
+            result = self.runner.invoke(pi.app, ["attach", "first", "--stream"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            [call.args[0] for call in terminal.await_args_list],
+            ["ws://relay/first", "ws://relay/second"],
+        )
+
+    def test_idle_timeout_returns_attachment_window_to_picker(self):
+        first = {**self._session(), "id": "first"}
+        second = {**self._session(), "id": "second", "name": "second-agent"}
+        request = AsyncMock(side_effect=[
+            [first],
+            {"attachable": True, "protocol_version": 2, "websocket_url": "ws://relay/first"},
+            [second],
+            {"attachable": True},
+            {"attachable": True, "protocol_version": 2, "websocket_url": "ws://relay/second"},
+        ])
+        terminal = AsyncMock(side_effect=["select", None])
+        with (
+            patch.object(pi, "_request", new=request),
+            patch.object(pi, "_mark_attach_pane"),
+            patch.object(pi, "_pick_session", return_value=second),
             patch("worker_harness.pi_terminal.attach_terminal", new=terminal),
         ):
             result = self.runner.invoke(pi.app, ["attach", "first", "--stream"])

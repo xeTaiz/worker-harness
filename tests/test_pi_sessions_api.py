@@ -11,9 +11,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from worker_harness.db import Database
 from worker_harness.heartbeat import (
+    _pump_terminal_gateway,
+    _terminal_url_with_dimensions,
     create_app,
     create_registration_app,
     stream_pi_session_events,
@@ -110,6 +113,9 @@ class PiSessionsApiTests(unittest.TestCase):
         self.assertIn("EventSource", script.text)
         self.assertIn("new WebSocket", script.text)
         self.assertIn("attach-info", script.text)
+        self.assertIn("gateway_websocket_url", script.text)
+        self.assertIn("idle-timeout", script.text)
+        self.assertIn("orchestrator gateway", script.text)
         self.assertIn("DOMPurify", script.text)
         self.assertIn("renderMathInElement", script.text)
         self.assertEqual(marked.status_code, 200)
@@ -288,6 +294,8 @@ class PiSessionsApiTests(unittest.TestCase):
             "transport": "direct-worker-websocket",
             "protocol_version": 2,
             "websocket_url": "ws://100.64.0.89:27888/v1/sessions/attach-child/attach",
+            "direct_websocket_url": "ws://100.64.0.89:27888/v1/sessions/attach-child/attach",
+            "gateway_websocket_url": "ws://testserver/api/v1/pi/sessions/attach-child/attach-gateway",
         })
         self.assertEqual(interactive.status_code, 200, interactive.text)
         self.assertEqual(interactive.json(), {
@@ -296,9 +304,93 @@ class PiSessionsApiTests(unittest.TestCase):
             "transport": "direct-interactive-websocket",
             "protocol_version": 2,
             "websocket_url": "ws://100.64.0.2:27888/v1/sessions/interactive-terminal/attach",
+            "direct_websocket_url": "ws://100.64.0.2:27888/v1/sessions/interactive-terminal/attach",
+            "gateway_websocket_url": "ws://testserver/api/v1/pi/sessions/interactive-terminal/attach-gateway",
         })
         self.assertFalse(unavailable.json()["attachable"])
         self.assertIn("host relay", unavailable.json()["reason"])
+
+    def test_gateway_url_dimensions_preserve_existing_query(self):
+        self.assertEqual(
+            _terminal_url_with_dimensions("ws://relay/attach?token=x", 52, 188),
+            "ws://relay/attach?token=x&rows=52&cols=188",
+        )
+
+    def test_gateway_pump_preserves_binary_and_text_frames(self):
+        class Client:
+            def __init__(self):
+                self.incoming = [
+                    {"type": "websocket.receive", "bytes": b"client-bytes"},
+                    {"type": "websocket.receive", "text": '{"type":"resize"}'},
+                    {"type": "websocket.disconnect"},
+                ]
+                self.sent = []
+
+            async def receive(self):
+                await asyncio.sleep(0)
+                return self.incoming.pop(0)
+
+            async def send_bytes(self, data):
+                self.sent.append(data)
+
+            async def send_text(self, data):
+                self.sent.append(data)
+
+        class Upstream:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, data):
+                self.sent.append(data)
+
+            def __aiter__(self):
+                async def messages():
+                    yield b"upstream-bytes"
+                    yield '{"type":"status"}'
+                    await asyncio.Event().wait()
+                return messages()
+
+        async def run():
+            client = Client()
+            upstream = Upstream()
+            await _pump_terminal_gateway(client, upstream, send_timeout=1)
+            return client, upstream
+
+        client, upstream = asyncio.run(run())
+        self.assertEqual(upstream.sent, [b"client-bytes", '{"type":"resize"}'])
+        self.assertEqual(client.sent, [b"upstream-bytes", '{"type":"status"}'])
+
+    def test_gateway_reports_unavailable_upstream(self):
+        asyncio.run(self.db.insert_pi_session(PiSession(
+            id="gateway-child",
+            worker_id="archdome",
+            session_type=PiSessionType.DELEGATED,
+            state=PiSessionState.IDLE,
+        )))
+
+        class FailingConnection:
+            async def __aenter__(self):
+                raise OSError("relay offline")
+
+            async def __aexit__(self, *_args):
+                return False
+
+        with patch("worker_harness.heartbeat.websocket_connect", return_value=FailingConnection()):
+            with TestClient(self.app) as client:
+                with client.websocket_connect(
+                    "/api/v1/pi/sessions/gateway-child/attach-gateway?rows=52&cols=188"
+                ) as websocket:
+                    self.assertEqual(
+                        websocket.receive_json(),
+                        {
+                            "type": "error",
+                            "code": "upstream_unavailable",
+                            "detail": "relay offline",
+                        },
+                    )
+                    with self.assertRaises(WebSocketDisconnect) as closed:
+                        websocket.receive_text()
+                    self.assertEqual(getattr(closed.exception, "code", None), 1011)
 
     def test_pi_session_sse_replays_from_durable_cursor(self):
         session_id = "stream-session"

@@ -299,13 +299,24 @@ def attach(
                     raise RuntimeError(
                         f"unsupported Pi terminal protocol {info.get('protocol_version')!r}; expected 2"
                     )
-                websocket_url = str(info.get("websocket_url") or "")
+                websocket_url = str(
+                    info.get("direct_websocket_url") or info.get("websocket_url") or ""
+                )
+                gateway_websocket_url = str(info.get("gateway_websocket_url") or "") or None
                 direction = await attach_terminal(
                     websocket_url,
+                    fallback_websocket_url=gateway_websocket_url,
                     cycle_requests=cycle_requests,
                 )
                 if direction is None:
                     return
+                if direction == "select":
+                    _mark_attach_pane(None)
+                    candidates = _attach_candidates(
+                        await _request("GET", "/api/v1/pi/sessions")
+                    )
+                    selected = _pick_session(await _attachable_candidates(candidates))
+                    continue
                 selected = await _cycle_session(session_id, direction)
         finally:
             _mark_attach_pane(None)

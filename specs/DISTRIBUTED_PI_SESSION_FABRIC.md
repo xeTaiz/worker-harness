@@ -195,7 +195,7 @@ Detailed implementation TODOs:
 
 1. **Common policy:** allow at most eight live attachments per Pi session on both host and worker relays. Reject the ninth with a typed `attachment_limit` error and a stable WebSocket close code. Expose active counts in relay health/metrics.
 2. **Per-connection identity:** allocate an in-memory attachment ID for exact cleanup. Never key cleanup solely by session ID.
-3. **One-hour inactivity:** track application activity per attachment. Terminal input, output, and resize frames refresh activity; WebSocket ping/pong alone does not. After more than 3600 seconds without application activity, send `{type:"status", state:"idle-timeout"}`, close only that attachment, and leave Pi/tmux running.
+3. **One-hour inactivity:** track client-originated application activity per attachment. Terminal input and changed resize frames refresh activity; PTY output and WebSocket ping/pong do not, because tmux status redraws would otherwise keep abandoned clients alive forever. After more than 3600 seconds without client activity, send `{type:"status", state:"idle-timeout"}`, close only that attachment, and leave Pi/tmux running. Passive viewers may therefore be detached after one hour and can immediately reattach.
 4. **Worker relay:** add an async-safe per-session reservation/count around `_relay_terminal`; release in `finally`; add a watchdog task to each PTY/WebSocket pair; make limits/timeouts configurable for tests while defaulting to `8` and `3600`.
 5. **Interactive host relay:** replace `Map<sessionId, Attachment>` with per-session attachment-ID sets/maps and reserve capacity during WebSocket upgrade so simultaneous opens cannot exceed the cap.
 6. **Shared tmux window state:** snapshot/unzoom/zoom once for the first attachment to a pane, reference-count subsequent attachments, and restore the operator's original active pane/zoom only after the final attachment closes and only when the relay-applied state still matches. Concurrent relay attachment to two different target panes in one shared tmux window must fail explicitly rather than corrupting zoom state.
@@ -204,7 +204,7 @@ Detailed implementation TODOs:
 9. **Native UX:** direct attach remains first choice; an idle-timeout status restores the local TTY and returns the fullscreen attachment window to the attachable-agent selector. `Ctrl-]`, `Ctrl-a x`, and cycling remain immediate clean detach paths.
 10. **PWA UX:** idle timeout closes the terminal socket and returns to the session selector/list. Manual reconnect creates a fresh ordinary attachment; no ownership recovery state is required.
 11. **Compatibility:** keep protocol v2 framing and legacy `websocket_url`. Add fields/status codes compatibly; no database migration or protocol-v3 lease rollout is required.
-12. **Tests:** cover two simultaneous read-write clients, cap/release races, one-hour timeout with a short test clock, input/output/resize activity refresh, source-session survival, final-only zoom restoration, route teardown, and current tmux sizing behavior.
+12. **Tests:** cover two simultaneous read-write clients, cap/release races, one-hour timeout with a short test clock, input/resize activity refresh, output-not-activity behavior, source-session survival, final-only zoom restoration, route teardown, and current tmux sizing behavior.
 
 ### 6.4 Orchestrator gateway fallback — follows multi-attach hardening
 

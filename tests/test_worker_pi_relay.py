@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import os
 import subprocess
 import sqlite3
@@ -98,10 +99,12 @@ class PiRelayTests(unittest.TestCase):
             with TestClient(app) as client:
                 health = client.get("/healthz")
                 self.assertEqual(health.status_code, 200)
-                self.assertEqual(
-                    health.json(),
-                    {"status": "healthy", "protocol_version": 2, "session_count": 0},
-                )
+                self.assertEqual(health.json()["status"], "healthy")
+                self.assertEqual(health.json()["protocol_version"], 2)
+                self.assertEqual(health.json()["session_count"], 0)
+                self.assertEqual(health.json()["attachment_count"], 0)
+                self.assertEqual(health.json()["attachments_by_session"], {})
+                self.assertEqual(health.json()["max_attachments_per_session"], 8)
 
                 created = client.post(
                     "/v1/sessions",
@@ -112,8 +115,11 @@ class PiRelayTests(unittest.TestCase):
                 self.assertEqual(client.get("/v1/sessions").json()[0]["session_id"], "delegate-1")
 
                 with client.websocket_connect("/v1/sessions/delegate-1/attach") as websocket:
+                    attached = websocket.receive_json()
+                    attachment_id = attached.pop("attachment_id")
+                    self.assertTrue(attachment_id)
                     self.assertEqual(
-                        websocket.receive_json(),
+                        attached,
                         {
                             "type": "status",
                             "session_id": "delegate-1",
@@ -142,6 +148,98 @@ class PiRelayTests(unittest.TestCase):
                     with self.assertRaises(WebSocketDisconnect) as closed:
                         websocket.receive_text()
                     self.assertEqual(closed.exception.code, 4404)
+
+    def test_attachment_reservations_are_bounded_and_released_exactly(self):
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                state = self.relay.RelayState(
+                    root=Path(tmp),
+                    command="/bin/sh",
+                    default_cwd=Path(tmp),
+                    max_attachments_per_session=2,
+                )
+                first = await state.reserve_attachment("child")
+                second = await state.reserve_attachment("child")
+                self.assertTrue(first)
+                self.assertTrue(second)
+                self.assertIsNone(await state.reserve_attachment("child"))
+                total, per_session = await state.attachment_counts()
+                self.assertEqual((total, per_session), (2, {"child": 2}))
+                await state.release_attachment("child", str(first))
+                replacement = await state.reserve_attachment("child")
+                self.assertTrue(replacement)
+                await state.release_attachment("child", str(second))
+                await state.release_attachment("child", str(replacement))
+                await state.release_attachment("child", str(replacement))
+                self.assertEqual(await state.attachment_counts(), (0, {}))
+
+        asyncio.run(run())
+
+    def test_worker_relay_rejects_ninth_style_attachment_without_stopping_pi(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self.relay.RelayState(
+                root=Path(tmp) / "sessions",
+                command="/bin/sh",
+                default_cwd=Path(tmp),
+                max_attachments_per_session=1,
+            )
+            app = self.relay.create_relay_app(state)
+            with TestClient(app) as client:
+                created = client.post("/v1/sessions", json={"session_id": "bounded"})
+                self.assertEqual(created.status_code, 201)
+                with client.websocket_connect("/v1/sessions/bounded/attach") as first:
+                    self.assertEqual(first.receive_json()["type"], "status")
+                    with client.websocket_connect("/v1/sessions/bounded/attach") as second:
+                        self.assertEqual(
+                            second.receive_json(),
+                            {"type": "error", "code": "attachment_limit", "limit": 1},
+                        )
+                        with self.assertRaises(WebSocketDisconnect) as closed:
+                            second.receive_text()
+                        self.assertEqual(closed.exception.code, 4429)
+                    health = client.get("/healthz").json()
+                    self.assertEqual(health["attachments_by_session"], {"bounded": 1})
+                self.assertEqual(client.get("/v1/sessions").json()[0]["state"], "working")
+                self.assertEqual(client.get("/healthz").json()["attachment_count"], 0)
+                client.post("/v1/sessions/bounded:cancel")
+
+    def test_worker_relay_detaches_idle_client_but_preserves_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self.relay.RelayState(
+                root=Path(tmp) / "sessions",
+                command="/bin/sh",
+                default_cwd=Path(tmp),
+                attach_idle_seconds=0.1,
+            )
+            app = self.relay.create_relay_app(state)
+            session_id = f"idle-attach-{time.time_ns()}"
+            with TestClient(app) as client:
+                client.post("/v1/sessions", json={"session_id": session_id})
+                with client.websocket_connect(f"/v1/sessions/{session_id}/attach") as websocket:
+                    self.assertEqual(websocket.receive_json()["type"], "status")
+                    time.sleep(0.06)
+                    refreshed_at = time.monotonic()
+                    websocket.send_json({"type": "resize", "rows": 30, "cols": 100})
+                    deadline = time.monotonic() + 3
+                    idle_status = None
+                    while time.monotonic() < deadline:
+                        message = websocket.receive()
+                        if message.get("text"):
+                            payload = json.loads(message["text"])
+                            if payload.get("state") == "idle-timeout":
+                                idle_status = payload
+                                break
+                    self.assertEqual(
+                        idle_status,
+                        {"type": "status", "state": "idle-timeout", "reason": "attachment inactive"},
+                    )
+                    self.assertGreaterEqual(time.monotonic() - refreshed_at, 0.08)
+                    with self.assertRaises(WebSocketDisconnect) as closed:
+                        websocket.receive_text()
+                    self.assertEqual(closed.exception.code, 4408)
+                self.assertEqual(client.get("/v1/sessions").json()[0]["state"], "working")
+                self.assertEqual(client.get("/healthz").json()["attachment_count"], 0)
+                client.post(f"/v1/sessions/{session_id}:cancel")
 
     def test_relay_injects_only_trusted_child_job_identity(self):
         async def run() -> None:

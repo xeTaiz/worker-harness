@@ -11,14 +11,16 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, Literal, TypeVar
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
+from websockets.asyncio.client import connect as websocket_connect
+from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .cache import TTLCache
 from .data import (
@@ -306,6 +308,67 @@ async def stream_pi_session_events(
         await asyncio.sleep(0.25)
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _terminal_dimension(value: str | None, fallback: int) -> int:
+    try:
+        parsed = int(value or fallback)
+    except (TypeError, ValueError):
+        parsed = fallback
+    return max(1, min(1000, parsed))
+
+
+def _terminal_url_with_dimensions(url: str, rows: int, cols: int) -> str:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.update({"rows": str(rows), "cols": str(cols)})
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+async def _pump_terminal_gateway(
+    client: WebSocket,
+    upstream: Any,
+    *,
+    send_timeout: float = 10.0,
+) -> None:
+    """Pump terminal frames without buffering or touching persistent state."""
+
+    async def client_to_upstream() -> None:
+        while True:
+            message = await client.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
+            data = message.get("bytes")
+            if data is None:
+                data = message.get("text")
+            if data is not None:
+                await asyncio.wait_for(upstream.send(data), timeout=send_timeout)
+
+    async def upstream_to_client() -> None:
+        async for data in upstream:
+            if isinstance(data, bytes):
+                await asyncio.wait_for(client.send_bytes(data), timeout=send_timeout)
+            else:
+                await asyncio.wait_for(client.send_text(data), timeout=send_timeout)
+
+    tasks = {
+        asyncio.create_task(client_to_upstream(), name="pi-gateway-client-upstream"),
+        asyncio.create_task(upstream_to_client(), name="pi-gateway-upstream-client"),
+    }
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    for task in done:
+        task.result()
+
+
 def create_app(db: Database) -> FastAPI:
     """Create the privileged control API (kept as the public test factory)."""
     app = FastAPI(title="Worker Harness Control API", lifespan=lifespan)
@@ -318,13 +381,32 @@ def create_app(db: Database) -> FastAPI:
     app.state.rate_limiter = AgentRateLimiter(capacity=10, refill_rate=1.0)
     app.state.metrics = Metrics()
     app.state.tunnels = TunnelRegistry()
+    app.state.pi_gateway_lock = asyncio.Lock()
+    app.state.pi_gateway_counts = Counter()
+    app.state.pi_gateway_refused_total = 0
+    app.state.pi_gateway_close_reasons = Counter()
+    app.state.pi_gateway_max_per_session = _positive_int_env(
+        "WH_PI_MAX_ATTACHMENTS", 8
+    )
     set_global_metrics(app.state.metrics)
     set_lanes(app.state.lanes)
 
     @app.get("/health")
     async def health():
         """Control-plane liveness endpoint (separate from registration)."""
-        return {"status": "healthy", "ts": datetime.now(timezone.utc).isoformat()}
+        async with app.state.pi_gateway_lock:
+            gateway_by_session = dict(app.state.pi_gateway_counts)
+            gateway_close_reasons = dict(app.state.pi_gateway_close_reasons)
+            gateway_refused_total = app.state.pi_gateway_refused_total
+        return {
+            "status": "healthy",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "pi_gateway_attachment_count": sum(gateway_by_session.values()),
+            "pi_gateway_attachments_by_session": gateway_by_session,
+            "pi_gateway_max_per_session": app.state.pi_gateway_max_per_session,
+            "pi_gateway_refused_total": gateway_refused_total,
+            "pi_gateway_close_reasons": gateway_close_reasons,
+        }
 
     @app.middleware("http")
     async def metrics_middleware(request: Request, call_next):
@@ -514,8 +596,7 @@ def create_app(db: Database) -> FastAPI:
             raise HTTPException(status_code=404, detail="Pi session not found")
         return session.model_dump(mode="json")
 
-    @app.get("/api/v1/pi/sessions/{session_id}/attach-info")
-    async def pi_session_attach_info(session_id: str):
+    async def resolve_pi_attach_info(session_id: str) -> dict[str, Any]:
         session = await db.get_pi_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Pi session not found")
@@ -532,15 +613,17 @@ def create_app(db: Database) -> FastAPI:
                     "attachable": False,
                     "reason": "Interactive session is not running inside tmux or its host relay is unavailable",
                 }
+            direct_url = (
+                f"ws://{session.terminal_host}:{session.terminal_port}"
+                f"/v1/sessions/{quote(session.id, safe='')}/attach"
+            )
             return {
                 "session_id": session.id,
                 "attachable": True,
                 "transport": "direct-interactive-websocket",
                 "protocol_version": session.terminal_protocol_version,
-                "websocket_url": (
-                    f"ws://{session.terminal_host}:{session.terminal_port}"
-                    f"/v1/sessions/{quote(session.id, safe='')}/attach"
-                ),
+                "websocket_url": direct_url,
+                "direct_websocket_url": direct_url,
             }
         if session.session_type != PiSessionType.DELEGATED or not session.worker_id:
             return {"session_id": session.id, "attachable": False, "reason": "Session has no terminal transport"}
@@ -559,16 +642,102 @@ def create_app(db: Database) -> FastAPI:
                 "attachable": False,
                 "reason": "Worker does not advertise a Pi relay",
             }
+        direct_url = (
+            f"ws://{worker.worker_ip}:{worker.pi_relay_port}"
+            f"/v1/sessions/{quote(session.id, safe='')}/attach"
+        )
         return {
             "session_id": session.id,
             "attachable": True,
             "transport": "direct-worker-websocket",
             "protocol_version": worker.pi_relay_protocol_version,
-            "websocket_url": (
-                f"ws://{worker.worker_ip}:{worker.pi_relay_port}"
-                f"/v1/sessions/{quote(session.id, safe='')}/attach"
-            ),
+            "websocket_url": direct_url,
+            "direct_websocket_url": direct_url,
         }
+
+    @app.get("/api/v1/pi/sessions/{session_id}/attach-info")
+    async def pi_session_attach_info(session_id: str, request: Request):
+        info = await resolve_pi_attach_info(session_id)
+        if info.get("attachable"):
+            forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+            scheme = "wss" if (forwarded_proto or request.url.scheme) == "https" else "ws"
+            info["gateway_websocket_url"] = (
+                f"{scheme}://{request.url.netloc}/api/v1/pi/sessions/"
+                f"{quote(session_id, safe='')}/attach-gateway"
+            )
+        return info
+
+    @app.websocket("/api/v1/pi/sessions/{session_id}/attach-gateway")
+    async def pi_session_attach_gateway(websocket: WebSocket, session_id: str) -> None:
+        await websocket.accept()
+        try:
+            info = await resolve_pi_attach_info(session_id)
+        except HTTPException as exc:
+            await websocket.send_json({"type": "error", "code": "session_not_found", "detail": exc.detail})
+            await websocket.close(code=4404, reason="session not found")
+            return
+        if not info.get("attachable"):
+            await websocket.send_json({"type": "error", "code": "session_not_attachable", "detail": info.get("reason")})
+            await websocket.close(code=4409, reason=str(info.get("reason") or "session not attachable")[:120])
+            return
+
+        rejected = False
+        async with app.state.pi_gateway_lock:
+            active = app.state.pi_gateway_counts[session_id]
+            if active >= app.state.pi_gateway_max_per_session:
+                app.state.pi_gateway_refused_total += 1
+                rejected = True
+            else:
+                app.state.pi_gateway_counts[session_id] += 1
+        if rejected:
+            await websocket.send_json({
+                "type": "error",
+                "code": "attachment_limit",
+                "limit": app.state.pi_gateway_max_per_session,
+            })
+            await websocket.close(code=4429, reason="gateway attachment limit reached")
+            return
+
+        rows = _terminal_dimension(websocket.query_params.get("rows"), 24)
+        cols = _terminal_dimension(websocket.query_params.get("cols"), 80)
+        upstream_url = _terminal_url_with_dimensions(info["direct_websocket_url"], rows, cols)
+        close_reason = "completed"
+        try:
+            async with websocket_connect(
+                upstream_url,
+                max_size=None,
+                max_queue=4,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=2,
+            ) as upstream:
+                await _pump_terminal_gateway(websocket, upstream)
+        except ConnectionClosed as exc:
+            close_reason = f"upstream-{exc.code}"
+            try:
+                await websocket.close(
+                    code=exc.code if 1000 <= exc.code <= 4999 else 1011,
+                    reason=(exc.reason or "upstream terminal closed")[:120],
+                )
+            except RuntimeError:
+                pass
+        except (OSError, WebSocketException, asyncio.TimeoutError, ValueError) as exc:
+            close_reason = "upstream-unavailable"
+            try:
+                await websocket.send_json({
+                    "type": "error",
+                    "code": "upstream_unavailable",
+                    "detail": str(exc),
+                })
+                await websocket.close(code=1011, reason="upstream terminal unavailable")
+            except RuntimeError:
+                pass
+        finally:
+            async with app.state.pi_gateway_lock:
+                app.state.pi_gateway_close_reasons[close_reason] += 1
+                app.state.pi_gateway_counts[session_id] -= 1
+                if app.state.pi_gateway_counts[session_id] <= 0:
+                    del app.state.pi_gateway_counts[session_id]
 
     @app.get("/api/v1/pi/sessions/{session_id}/events")
     async def pi_session_events(

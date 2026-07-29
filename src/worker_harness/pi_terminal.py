@@ -156,7 +156,7 @@ async def _send_resizes(websocket: Any, stdout_fd: int, changed: asyncio.Event) 
         changed.clear()
 
 
-async def _receive_output(websocket: Any, stdout_fd: int) -> None:
+async def _receive_output(websocket: Any, stdout_fd: int) -> str | None:
     async for message in websocket:
         if isinstance(message, bytes):
             os.write(stdout_fd, message)
@@ -167,8 +167,12 @@ async def _receive_output(websocket: Any, stdout_fd: int) -> None:
             os.write(stdout_fd, message.encode())
             continue
         if frame.get("type") == "error":
-            raise RuntimeError(str(frame.get("detail") or "terminal relay reported an error"))
-        # Status frames are protocol metadata; tmux's binary redraw is the UI.
+            detail = frame.get("detail") or frame.get("code") or "terminal relay reported an error"
+            raise RuntimeError(str(detail))
+        if frame.get("type") == "status" and frame.get("state") == "idle-timeout":
+            return "select"
+        # Other status frames are protocol metadata; tmux's binary redraw is the UI.
+    return None
 
 
 def terminal_url(websocket_url: str, rows: int, cols: int) -> str:
@@ -183,6 +187,7 @@ def terminal_url(websocket_url: str, rows: int, cols: int) -> str:
 async def attach_terminal(
     websocket_url: str,
     *,
+    fallback_websocket_url: str | None = None,
     stdin_fd: int | None = None,
     stdout_fd: int | None = None,
     cycle_requests: asyncio.Queue[str] | None = None,
@@ -191,11 +196,14 @@ async def attach_terminal(
 
     stdin_fd = sys.stdin.fileno() if stdin_fd is None else stdin_fd
     stdout_fd = sys.stdout.fileno() if stdout_fd is None else stdout_fd
-    if not websocket_url.startswith(("ws://", "wss://")):
+    websocket_urls = [websocket_url]
+    if fallback_websocket_url and fallback_websocket_url != websocket_url:
+        websocket_urls.append(fallback_websocket_url)
+    if any(not url.startswith(("ws://", "wss://")) for url in websocket_urls):
         raise RuntimeError("attach-info returned an invalid WebSocket URL")
 
     initial_rows, initial_cols = terminal_size(stdout_fd)
-    websocket_url = terminal_url(websocket_url, initial_rows, initial_cols)
+    websocket_urls = [terminal_url(url, initial_rows, initial_cols) for url in websocket_urls]
 
     resize_changed = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -207,34 +215,53 @@ async def attach_terminal(
         pass
 
     try:
-        async with connect(
-            websocket_url,
-            max_size=None,
-            ping_interval=20,
-            ping_timeout=20,
-            close_timeout=2,
-        ) as websocket:
-            with raw_terminal(stdin_fd):
-                tasks = {
-                    asyncio.create_task(_send_input(websocket, stdin_fd), name="pi-attach-input"),
-                    asyncio.create_task(_receive_output(websocket, stdout_fd), name="pi-attach-output"),
-                    asyncio.create_task(_send_resizes(websocket, stdout_fd, resize_changed), name="pi-attach-resize"),
-                }
-                cycle_task: asyncio.Task[str] | None = None
-                if cycle_requests is not None:
-                    cycle_task = asyncio.create_task(cycle_requests.get(), name="pi-attach-cycle")
-                    tasks.add(cycle_task)
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                direction = cycle_task.result() if cycle_task in done else None
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-                for task in done:
-                    if task is not cycle_task:
-                        task.result()
-                return direction
-    except (OSError, WebSocketException, asyncio.TimeoutError) as exc:
-        raise RuntimeError(f"terminal relay unavailable: {exc}") from exc
+        last_error: BaseException | None = None
+        for index, candidate_url in enumerate(websocket_urls):
+            try:
+                async with connect(
+                    candidate_url,
+                    max_size=None,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=2,
+                ) as websocket:
+                    with raw_terminal(stdin_fd):
+                        input_task = asyncio.create_task(
+                            _send_input(websocket, stdin_fd), name="pi-attach-input"
+                        )
+                        output_task = asyncio.create_task(
+                            _receive_output(websocket, stdout_fd), name="pi-attach-output"
+                        )
+                        resize_task = asyncio.create_task(
+                            _send_resizes(websocket, stdout_fd, resize_changed), name="pi-attach-resize"
+                        )
+                        tasks = {input_task, output_task, resize_task}
+                        cycle_task: asyncio.Task[str] | None = None
+                        if cycle_requests is not None:
+                            cycle_task = asyncio.create_task(cycle_requests.get(), name="pi-attach-cycle")
+                            tasks.add(cycle_task)
+                        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                        for task in pending:
+                            task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        if cycle_task in done:
+                            direction = cycle_task.result()
+                        elif output_task in done:
+                            direction = output_task.result()
+                        else:
+                            direction = None
+                        for task in done:
+                            if task not in {cycle_task, output_task}:
+                                task.result()
+                        return direction
+            except (OSError, WebSocketException, asyncio.TimeoutError) as exc:
+                last_error = exc
+                if index + 1 < len(websocket_urls):
+                    continue
+                raise RuntimeError(f"terminal relay unavailable: {exc}") from exc
+        if last_error is not None:
+            raise RuntimeError(f"terminal relay unavailable: {last_error}") from last_error
+        return None
     finally:
         if signal_installed:
             loop.remove_signal_handler(signal.SIGWINCH)

@@ -29,6 +29,20 @@ class FakeWebSocket:
         return messages()
 
 
+class FakeConnection:
+    def __init__(self, websocket=None, error=None):
+        self.websocket = websocket
+        self.error = error
+
+    async def __aenter__(self):
+        if self.error:
+            raise self.error
+        return self.websocket
+
+    async def __aexit__(self, *_args):
+        return False
+
+
 class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_ctrl_right_bracket_detaches_without_forwarding_suffix(self):
         websocket = FakeWebSocket()
@@ -41,6 +55,36 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(pi_terminal, "_stdin_chunks", chunks):
             await pi_terminal._send_input(websocket, 0)
         self.assertEqual(websocket.sent, [b"hello", b"before"])
+
+    async def test_attach_falls_back_to_gateway_and_returns_selector_on_idle(self):
+        direct = "ws://direct/attach"
+        gateway = "ws://gateway/attach"
+        connections = []
+
+        def fake_connect(url, **_kwargs):
+            connections.append(url)
+            if url.startswith(direct):
+                return FakeConnection(error=OSError("direct unavailable"))
+            return FakeConnection(FakeWebSocket([
+                '{"type":"status","state":"idle-timeout","reason":"attachment inactive"}',
+            ]))
+
+        master_fd, slave_fd = pty.openpty()
+        try:
+            with patch.object(pi_terminal, "connect", side_effect=fake_connect):
+                result = await pi_terminal.attach_terminal(
+                    direct,
+                    fallback_websocket_url=gateway,
+                    stdin_fd=slave_fd,
+                    stdout_fd=slave_fd,
+                )
+            self.assertEqual(result, "select")
+            self.assertEqual(len(connections), 2)
+            self.assertTrue(connections[0].startswith(direct))
+            self.assertTrue(connections[1].startswith(gateway))
+        finally:
+            os.close(master_fd)
+            os.close(slave_fd)
 
     async def test_resize_poll_detects_nested_tmux_size_change_without_signal(self):
         websocket = FakeWebSocket()
@@ -74,6 +118,12 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
             os.close(read_fd)
             if write_fd >= 0:
                 os.close(write_fd)
+
+    async def test_receive_output_returns_to_selector_after_idle_timeout(self):
+        websocket = FakeWebSocket([
+            '{"type":"status","state":"idle-timeout","reason":"attachment inactive"}',
+        ])
+        self.assertEqual(await pi_terminal._receive_output(websocket, 1), "select")
 
     async def test_receive_output_surfaces_relay_error(self):
         websocket = FakeWebSocket(['{"type":"error","detail":"already attached"}'])
