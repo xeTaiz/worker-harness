@@ -674,6 +674,7 @@ async def _relay_terminal(
                     "state": "replaced",
                     "reason": "attachment capacity reclaimed by a newer client",
                 })
+                await asyncio.sleep(0)
                 await websocket.close(code=4410, reason="replaced by newer attachment")
             except RuntimeError:
                 pass

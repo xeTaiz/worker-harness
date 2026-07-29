@@ -17,7 +17,7 @@ from typing import Any, AsyncIterator
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from websockets.asyncio.client import connect
-from websockets.exceptions import WebSocketException
+from websockets.exceptions import ConnectionClosed, WebSocketException
 
 DETACH_BYTE = b"\x1d"  # Ctrl-]
 
@@ -157,21 +157,26 @@ async def _send_resizes(websocket: Any, stdout_fd: int, changed: asyncio.Event) 
 
 
 async def _receive_output(websocket: Any, stdout_fd: int) -> str | None:
-    async for message in websocket:
-        if isinstance(message, bytes):
-            os.write(stdout_fd, message)
-            continue
-        try:
-            frame = json.loads(message)
-        except json.JSONDecodeError:
-            os.write(stdout_fd, message.encode())
-            continue
-        if frame.get("type") == "error":
-            detail = frame.get("detail") or frame.get("code") or "terminal relay reported an error"
-            raise RuntimeError(str(detail))
-        if frame.get("type") == "status" and frame.get("state") in {"idle-timeout", "replaced"}:
+    try:
+        async for message in websocket:
+            if isinstance(message, bytes):
+                os.write(stdout_fd, message)
+                continue
+            try:
+                frame = json.loads(message)
+            except json.JSONDecodeError:
+                os.write(stdout_fd, message.encode())
+                continue
+            if frame.get("type") == "error":
+                detail = frame.get("detail") or frame.get("code") or "terminal relay reported an error"
+                raise RuntimeError(str(detail))
+            if frame.get("type") == "status" and frame.get("state") in {"idle-timeout", "replaced"}:
+                return "select"
+            # Other status frames are protocol metadata; tmux's binary redraw is the UI.
+    except ConnectionClosed as exc:
+        if exc.rcvd is not None and exc.rcvd.code in {4408, 4410}:
             return "select"
-        # Other status frames are protocol metadata; tmux's binary redraw is the UI.
+        raise
     return None
 
 

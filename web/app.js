@@ -508,6 +508,14 @@ function connectTerminal() {
         tryCandidate(index + 1);
         return;
       }
+      if (event.code === 4408 || event.code === 4410) {
+        terminalStatus.textContent = event.code === 4410
+          ? "Detached to make room for a newer attachment"
+          : "Detached after 1 hour of inactivity";
+        terminalStatus.className = "";
+        setTimeout(closeDetail, 0);
+        return;
+      }
       terminalStatus.textContent = event.code === 1000 ? "Disconnected" : `Disconnected · code ${event.code}`;
       terminalStatus.className = "";
     });

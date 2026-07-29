@@ -793,6 +793,7 @@ def create_app(db: Database) -> FastAPI:
                     "state": "replaced",
                     "reason": "attachment capacity reclaimed by a newer client",
                 })
+                await asyncio.sleep(0)
                 await websocket.close(code=4410, reason="replaced by newer attachment")
                 return
             async with websocket_connect(
@@ -813,6 +814,7 @@ def create_app(db: Database) -> FastAPI:
                         "state": "replaced",
                         "reason": "attachment capacity reclaimed by a newer client",
                     })
+                    await asyncio.sleep(0)
                     await websocket.close(code=4410, reason="replaced by newer attachment")
         except ConnectionClosed as exc:
             close_reason = f"upstream-{exc.code}"

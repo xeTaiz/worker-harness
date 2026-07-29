@@ -11,6 +11,9 @@ import termios
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
+
 from worker_harness import pi_terminal
 
 
@@ -130,6 +133,20 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
             '{"type":"status","state":"replaced","reason":"capacity reclaimed"}',
         ])
         self.assertEqual(await pi_terminal._receive_output(websocket, 1), "select")
+
+    async def test_receive_output_uses_replacement_close_code_if_status_is_lost(self):
+        class ClosedWebSocket:
+            def __aiter__(self):
+                async def messages():
+                    raise ConnectionClosedError(
+                        Close(4410, "replaced by newer attachment"),
+                        Close(4410, "replaced by newer attachment"),
+                        True,
+                    )
+                    yield  # pragma: no cover
+                return messages()
+
+        self.assertEqual(await pi_terminal._receive_output(ClosedWebSocket(), 1), "select")
 
     async def test_receive_output_surfaces_relay_error(self):
         websocket = FakeWebSocket(['{"type":"error","detail":"already attached"}'])
