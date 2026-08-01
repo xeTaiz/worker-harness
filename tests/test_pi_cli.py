@@ -79,6 +79,45 @@ class PiCliTests(unittest.TestCase):
             ["first", "third"],
         )
 
+    def test_zellij_cycle_finds_original_pane_suppressed_by_in_place_helper(self):
+        panes = [
+            {"id": 7, "is_plugin": False, "is_suppressed": True, "tab_id": 3},
+            {"id": 8, "is_plugin": False, "is_suppressed": False, "tab_id": 3},
+            {"id": 9, "is_plugin": False, "is_suppressed": True, "tab_id": 4},
+        ]
+        completed = subprocess.CompletedProcess([], 0, json.dumps(panes), "")
+        with (
+            patch.dict(pi.os.environ, {
+                "ZELLIJ_SESSION_NAME": "Pi", "ZELLIJ_PANE_ID": "8",
+            }, clear=True),
+            patch.object(pi.subprocess, "run", return_value=completed),
+        ):
+            self.assertEqual(pi._zellij_cycle_source_panes(), ["terminal_7"])
+
+    def test_zellij_cycle_signals_existing_stream_process(self):
+        origin = AsyncMock(return_value=("first", 1234))
+        with (
+            patch.object(pi, "_zellij_cycle_origin", new=origin),
+            patch.object(pi.os, "kill") as kill,
+        ):
+            result = self.runner.invoke(pi.app, ["cycle", "next"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        kill.assert_called_once_with(1234, pi.signal.SIGUSR1)
+
+    def test_zellij_cycle_execs_normal_attach_from_local_source_pane(self):
+        second = {**self._session(), "id": "second"}
+        with (
+            patch.object(pi, "_zellij_cycle_origin", new=AsyncMock(return_value=("first", None))),
+            patch.object(pi, "_cycle_session", new=AsyncMock(return_value=second)),
+            patch.object(pi.shutil, "which", return_value="/usr/bin/wh"),
+            patch.object(pi.os, "execvp") as execute,
+        ):
+            result = self.runner.invoke(pi.app, ["cycle", "previous"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        execute.assert_called_once_with(
+            "/usr/bin/wh", ["/usr/bin/wh", "pi", "attach", "second"]
+        )
+
     def test_attach_picker_filters_non_attachable_sessions(self):
         rows = [self._session(), {**self._session(), "id": "offline"}]
         request = AsyncMock(side_effect=[

@@ -65,10 +65,11 @@ picker, `Ctrl-a Ctrl-j/Ctrl-l` cycles next, `Ctrl-a Ctrl-h/Ctrl-k` cycles
 previous, and `Ctrl-a x` detaches. Zellij provides both a direct `Alt-a` picker
 (which focuses local Zellij panes when possible) and a prefix-mode streaming
 cycler: `Ctrl-a Ctrl-a` opens `wh pi attach --stream`, the same Ctrl-j/l and
-Ctrl-h/k pairs cycle, and `Ctrl-a x` detaches. Inside any native streaming
-attachment, `Ctrl-^` and `Ctrl-_` are direct next/previous shortcuts and are
-consumed locally rather than sent to the source PTY. Zellij keeps its existing
-`Ctrl-b` tmux-emulation mode entry as well.
+Ctrl-h/k pairs cycle, and `Ctrl-a x` detaches a stream. `Alt-u` cycles next and
+`Alt-y` cycles previous directly from either an original local Pi pane or a
+streamed attachment. Inside a native stream, `Ctrl-^` and `Ctrl-_` are additional
+direct next/previous shortcuts consumed locally rather than sent to the source
+PTY. Zellij keeps its existing `Ctrl-b` tmux-emulation mode entry as well.
 
 Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 

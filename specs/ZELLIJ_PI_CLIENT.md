@@ -134,11 +134,12 @@ Two access styles must coexist.
 Initial collision-free defaults:
 
 - `Alt a`: open the attachable-session picker with local-focus optimization;
-- `Ctrl-^` (`0x1e`): next agent while in a native streaming attachment;
-- `Ctrl-_` (`0x1f`): previous agent while in a native streaming attachment;
-- `Ctrl-]` (`0x1d`): detach.
+- `Alt u`: next agent from either an original local Zellij Pi pane or a stream;
+- `Alt y`: previous agent from either source;
+- `Ctrl-^` (`0x1e`) / `Ctrl-_` (`0x1f`): additional next/previous controls while in a native stream;
+- `Ctrl-]` (`0x1d`): detach a native stream.
 
-The three control bytes are consumed by `wh pi attach` and never reach the source PTY. Existing lowercase `Alt h/j/k/l` pane navigation remains untouched.
+`Alt h/j/k/l` remain ordinary pane navigation and are not reused. Stream control bytes are consumed by `wh pi attach` and never reach the source PTY.
 
 ### 7.2 Prefix/input-mode bindings
 
@@ -153,9 +154,9 @@ The built-in status bar therefore exposes the active input mode and available ke
 
 ### 7.3 Cycling control
 
-The stream client accepts dedicated local control bytes for next/previous in addition to the existing SIGUSR path, so KDL can act on the focused attachment without process discovery. These bytes are consumed locally and never reach the remote PTY. Direct bindings that could write control bytes are scoped to the Worker Harness attachment/prefix flow; they must not inject control bytes into an ordinary shell or Pi pane.
+The stream client accepts dedicated local control bytes for next/previous in addition to the existing SIGUSR path. These bytes are consumed locally and never reach the remote PTY.
 
-For a directly focused original Zellij Pi pane, cycling uses the host relay's reverse locator/session mapping or an equivalent small local control helper. It must not depend on tmux pane options or process-tree guessing.
+`Alt-y/u` and the prefix-mode cycle keys launch a short in-place `wh pi cycle` helper. Zellij exposes the original pane as suppressed while the helper is active. For a streamed pane, a mode-0600 runtime marker maps that original pane to the active `wh` PID and the helper sends the existing SIGUSR direction before exiting; the original stream resumes and reconnects in the same process. For a directly focused local Pi pane, the helper asks host-relay revision 9 to reverse-resolve `(Zellij session, pane)` to the Worker Harness session ID, then attaches the relative target normally. This avoids process-tree guessing, control-byte injection into ordinary Pi, duplicate stream slots, and recursive local Zellij streaming.
 
 ## 8. Files and rollout
 

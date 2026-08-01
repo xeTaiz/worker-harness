@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
 import signal
 import subprocess
+import sys
 from pathlib import Path
 from urllib.parse import quote
 
@@ -179,26 +181,113 @@ def _current_multiplexer() -> str:
     return ""
 
 
+def _zellij_marker_path(session_name: str, pane_id: str) -> Path:
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/worker-harness-{os.getuid()}"
+    digest = hashlib.sha256(f"{session_name}\0{pane_id}".encode()).hexdigest()
+    return Path(runtime) / "worker-harness" / "zellij-attachments" / f"{digest}.json"
+
+
 def _mark_attach_pane(session_id: str | None) -> None:
-    """Expose streamed attachment state to the dedicated tmux key table."""
+    """Expose streamed attachment state to tmux/Zellij shortcut helpers."""
 
     pane = os.environ.get("TMUX_PANE")
-    if not pane:
+    if pane:
+        values = {
+            "@wh_pi_attach_session": session_id,
+            "@wh_pi_attach_mode": "stream" if session_id else None,
+        }
+        for option, value in values.items():
+            command = ["tmux", "set-option", "-p", "-t", pane]
+            command.extend([option, value] if value else ["-u", option])
+            subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+
+    zellij_session = os.environ.get("ZELLIJ_SESSION_NAME", "")
+    zellij_pane = os.environ.get("ZELLIJ_PANE_ID", "")
+    if not zellij_session or not zellij_pane:
         return
-    values = {
-        "@wh_pi_attach_session": session_id,
-        "@wh_pi_attach_mode": "stream" if session_id else None,
-    }
-    for option, value in values.items():
-        command = ["tmux", "set-option", "-p", "-t", pane]
-        command.extend([option, value] if value else ["-u", option])
-        subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+    marker = _zellij_marker_path(zellij_session, f"terminal_{zellij_pane}")
+    if not session_id:
+        marker.unlink(missing_ok=True)
+        return
+    marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = marker.with_suffix(f".{os.getpid()}.tmp")
+    temporary.write_text(json.dumps({
+        "session_id": session_id,
+        "pid": os.getpid(),
+        "mode": "stream",
+    }), encoding="utf8")
+    temporary.chmod(0o600)
+    temporary.replace(marker)
+
+
+def _zellij_cycle_source_panes() -> list[str]:
+    """Return the original pane(s) suppressed by an in-place shortcut helper."""
+
+    session_name = os.environ.get("ZELLIJ_SESSION_NAME", "")
+    pane_id = os.environ.get("ZELLIJ_PANE_ID", "")
+    if not session_name or not pane_id:
+        return []
+    result = subprocess.run(
+        ["zellij", "action", "list-panes", "--json", "--all"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    try:
+        panes = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    current = next((pane for pane in panes if (
+        not pane.get("is_plugin") and str(pane.get("id")) == pane_id
+    )), None)
+    if not current:
+        return []
+    candidates = [pane for pane in panes if (
+        not pane.get("is_plugin")
+        and pane.get("is_suppressed")
+        and pane.get("tab_id") == current.get("tab_id")
+    )]
+    return [f"terminal_{pane.get('id')}" for pane in reversed(candidates)]
+
+
+async def _zellij_cycle_origin() -> tuple[str, int | None]:
+    from worker_harness.pi_terminal import _relay_request
+
+    session_name = os.environ.get("ZELLIJ_SESSION_NAME", "")
+    for pane_id in _zellij_cycle_source_panes():
+        marker = _zellij_marker_path(session_name, pane_id)
+        try:
+            payload = json.loads(marker.read_text(encoding="utf8"))
+            session_id = str(payload.get("session_id") or "")
+            pid = int(payload.get("pid") or 0)
+            if session_id and pid > 0:
+                return session_id, pid
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+        try:
+            located = await _relay_request({
+                "action": "locate",
+                "multiplexer": "zellij",
+                "zellij_session_name": session_name,
+                "zellij_pane_id": pane_id,
+            })
+        except (OSError, asyncio.TimeoutError, RuntimeError, json.JSONDecodeError):
+            continue
+        session_id = str(located.get("session_id") or "")
+        if session_id:
+            return session_id, None
+    raise RuntimeError("current Zellij pane is not a Worker Harness Pi attachment")
 
 
 def _pick_session(rows: list[dict]) -> dict:
@@ -346,6 +435,32 @@ def attach(
         raise
     except (RuntimeError, KeyboardInterrupt) as exc:
         console.print(f"[red]{exc or 'attachment interrupted'}[/]")
+        raise typer.Exit(1) from exc
+
+
+@app.command("cycle", hidden=True)
+def cycle(direction: str = typer.Argument(..., help="next or previous")):
+    """Cycle from the current Zellij Pi pane or streamed attachment."""
+
+    async def run() -> None:
+        if direction not in {"next", "previous"}:
+            raise RuntimeError("cycle direction must be next or previous")
+        current_session_id, stream_pid = await _zellij_cycle_origin()
+        if stream_pid is not None:
+            signum = signal.SIGUSR1 if direction == "next" else signal.SIGUSR2
+            try:
+                os.kill(stream_pid, signum)
+            except ProcessLookupError as exc:
+                raise RuntimeError("the streamed Pi attachment is no longer running") from exc
+            return
+        selected = await _cycle_session(current_session_id, direction)
+        executable = shutil.which("wh") or sys.argv[0]
+        os.execvp(executable, [executable, "pi", "attach", str(selected.get("id") or "")])
+
+    try:
+        asyncio.run(run())
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/]")
         raise typer.Exit(1) from exc
 
 
