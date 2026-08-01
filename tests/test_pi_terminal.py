@@ -261,7 +261,10 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
             "zellij_pane_id": "terminal_8",
         }
         with (
-            patch.dict(os.environ, {"TMUX": "/tmp/current/default,123,0"}, clear=True),
+            patch.dict(os.environ, {
+                "TMUX": "/tmp/current/default,123,0",
+                "ZELLIJ_SESSION_NAME": "outer-zellij",
+            }, clear=True),
             patch.object(pi_terminal, "_relay_request", new=AsyncMock(return_value=route)),
             patch.object(pi_terminal.subprocess, "run") as run,
         ):

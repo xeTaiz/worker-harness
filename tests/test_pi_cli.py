@@ -153,6 +153,7 @@ class PiCliTests(unittest.TestCase):
         with (
             patch.object(pi, "_request", new=request),
             patch.object(pi, "_mark_attach_pane"),
+            patch.object(pi, "_current_multiplexer", return_value="tmux"),
             patch("worker_harness.pi_terminal.attach_terminal", new=terminal),
         ):
             result = self.runner.invoke(pi.app, ["attach", "first", "--stream"])
@@ -177,6 +178,7 @@ class PiCliTests(unittest.TestCase):
             patch.object(pi, "_request", new=request),
             patch.object(pi, "_mark_attach_pane"),
             patch.object(pi, "_pick_session", return_value=second),
+            patch.object(pi, "_current_multiplexer", return_value="tmux"),
             patch("worker_harness.pi_terminal.attach_terminal", new=terminal),
         ):
             result = self.runner.invoke(pi.app, ["attach", "first", "--stream"])
@@ -216,6 +218,22 @@ class PiCliTests(unittest.TestCase):
         ):
             result = self.runner.invoke(pi.app, ["attach", "repo-agent"])
         self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_awaited_once_with("GET", "/api/v1/pi/sessions")
+        terminal.assert_not_awaited()
+
+    def test_stream_flag_still_focuses_local_zellij_to_prevent_recursive_render(self):
+        request = AsyncMock(return_value=[self._session()])
+        focus = AsyncMock(return_value=True)
+        terminal = AsyncMock(return_value=None)
+        with (
+            patch.object(pi, "_request", new=request),
+            patch.object(pi, "_current_multiplexer", return_value="zellij"),
+            patch("worker_harness.pi_terminal.focus_local_session", new=focus),
+            patch("worker_harness.pi_terminal.attach_terminal", new=terminal),
+        ):
+            result = self.runner.invoke(pi.app, ["attach", "repo-agent", "--stream"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        focus.assert_awaited_once_with("interactive-session-id")
         request.assert_awaited_once_with("GET", "/api/v1/pi/sessions")
         terminal.assert_not_awaited()
 

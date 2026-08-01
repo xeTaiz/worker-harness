@@ -169,6 +169,16 @@ async def _cycle_session(current_session_id: str, direction: str) -> dict:
     return available[0]
 
 
+def _current_multiplexer() -> str:
+    """Return the immediate client multiplexer, preferring nested tmux."""
+
+    if os.environ.get("TMUX"):
+        return "tmux"
+    if os.environ.get("ZELLIJ_SESSION_NAME"):
+        return "zellij"
+    return ""
+
+
 def _mark_attach_pane(session_id: str | None) -> None:
     """Expose streamed attachment state to the dedicated tmux key table."""
 
@@ -288,7 +298,14 @@ def attach(
             while True:
                 session_id = str(selected.get("id") or "")
                 _mark_attach_pane(session_id)
-                if not stream and await focus_local_session(session_id):
+                # Streaming a local Zellij session back into a pane of the same
+                # Zellij client recursively renders the multiplexer inside
+                # itself. Always use exact local focus for Zellij; `--stream`
+                # remains authoritative for tmux and all remote targets.
+                if (
+                    (not stream or _current_multiplexer() == "zellij")
+                    and await focus_local_session(session_id)
+                ):
                     return
                 info = await _request(
                     "GET", f"/api/v1/pi/sessions/{quote(session_id, safe='')}/attach-info"

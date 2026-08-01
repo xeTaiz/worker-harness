@@ -65,7 +65,9 @@ async def focus_local_session(session_id: str) -> bool:
 
     multiplexer = str(route.get("multiplexer") or ("tmux" if route.get("tmux_socket") else ""))
     if multiplexer == "zellij":
-        if not current_zellij:
+        # Tmux nested inside Zellij is still a tmux client. Switching the outer
+        # Zellij client would violate cross-multiplexer streaming semantics.
+        if current_tmux or not current_zellij:
             return False
         target_session = str(route.get("zellij_session_name") or "")
         target_pane = str(route.get("zellij_pane_id") or "")
