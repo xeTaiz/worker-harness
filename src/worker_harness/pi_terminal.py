@@ -20,6 +20,8 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 DETACH_BYTE = b"\x1d"  # Ctrl-]
+NEXT_BYTE = b"\x1e"  # Ctrl-^, consumed locally by Zellij/native attachments
+PREVIOUS_BYTE = b"\x1f"  # Ctrl-_, consumed locally by Zellij/native attachments
 
 
 def _relay_socket_path() -> Path:
@@ -50,14 +52,46 @@ async def _relay_request(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 async def focus_local_session(session_id: str) -> bool:
-    """Switch the invoking tmux client when the requested Pi pane is local."""
+    """Focus an exact local tmux or Zellij pane for the invoking client."""
 
     current_tmux = os.environ.get("TMUX", "").split(",", 1)[0]
-    if not current_tmux:
+    current_zellij = os.environ.get("ZELLIJ_SESSION_NAME", "")
+    if not current_tmux and not current_zellij:
         return False
     try:
         route = await _relay_request({"action": "describe", "session_id": session_id})
     except (OSError, asyncio.TimeoutError, RuntimeError, json.JSONDecodeError):
+        return False
+
+    multiplexer = str(route.get("multiplexer") or ("tmux" if route.get("tmux_socket") else ""))
+    if multiplexer == "zellij":
+        if not current_zellij:
+            return False
+        target_session = str(route.get("zellij_session_name") or "")
+        target_pane = str(route.get("zellij_pane_id") or "")
+        if not target_session or not target_pane.startswith("terminal_"):
+            return False
+        command = ["zellij", "action"]
+        if target_session == current_zellij:
+            command.extend(["focus-pane-id", target_pane])
+        else:
+            command.extend([
+                "switch-session", target_session, "--pane-id", target_pane,
+            ])
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"could not focus local Zellij pane: {result.stderr.strip()}")
+        return True
+
+    if multiplexer != "tmux" or not current_tmux:
         return False
     route_socket = str(route.get("tmux_socket") or "")
     if not route_socket or os.path.realpath(route_socket) != os.path.realpath(current_tmux):
@@ -129,14 +163,24 @@ async def _stdin_chunks(fd: int) -> AsyncIterator[bytes]:
         loop.remove_reader(fd)
 
 
-async def _send_input(websocket: Any, stdin_fd: int) -> None:
+async def _send_input(websocket: Any, stdin_fd: int) -> str | None:
     async for chunk in _stdin_chunks(stdin_fd):
-        detach = chunk.find(DETACH_BYTE)
-        if detach >= 0:
-            if detach:
-                await websocket.send(chunk[:detach])
-            return
+        controls = [
+            (index, direction)
+            for byte, direction in (
+                (DETACH_BYTE, None),
+                (NEXT_BYTE, "next"),
+                (PREVIOUS_BYTE, "previous"),
+            )
+            if (index := chunk.find(byte)) >= 0
+        ]
+        if controls:
+            index, direction = min(controls, key=lambda item: item[0])
+            if index:
+                await websocket.send(chunk[:index])
+            return direction
         await websocket.send(chunk)
+    return None
 
 
 async def _send_resizes(websocket: Any, stdout_fd: int, changed: asyncio.Event) -> None:
@@ -253,10 +297,12 @@ async def attach_terminal(
                             direction = cycle_task.result()
                         elif output_task in done:
                             direction = output_task.result()
+                        elif input_task in done:
+                            direction = input_task.result()
                         else:
                             direction = None
                         for task in done:
-                            if task not in {cycle_task, output_task}:
+                            if task not in {cycle_task, output_task, input_task}:
                                 task.result()
                         return direction
             except (OSError, WebSocketException, asyncio.TimeoutError) as exc:

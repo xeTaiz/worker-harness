@@ -56,8 +56,23 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
             yield b"unreachable"
 
         with patch.object(pi_terminal, "_stdin_chunks", chunks):
-            await pi_terminal._send_input(websocket, 0)
+            direction = await pi_terminal._send_input(websocket, 0)
+        self.assertIsNone(direction)
         self.assertEqual(websocket.sent, [b"hello", b"before"])
+
+    async def test_zellij_control_bytes_cycle_without_reaching_remote_pty(self):
+        for byte, expected in ((b"\x1e", "next"), (b"\x1f", "previous")):
+            with self.subTest(expected):
+                websocket = FakeWebSocket()
+
+                async def chunks(_fd, control=byte):
+                    yield b"before" + control + b"after"
+                    yield b"unreachable"
+
+                with patch.object(pi_terminal, "_stdin_chunks", chunks):
+                    direction = await pi_terminal._send_input(websocket, 0)
+                self.assertEqual(direction, expected)
+                self.assertEqual(websocket.sent, [b"before"])
 
     async def test_attach_falls_back_to_gateway_and_returns_selector_on_idle(self):
         direct = "ws://direct/attach"
@@ -180,13 +195,73 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_focus_local_session_ignores_different_tmux_server(self):
         route = {
             "ok": True,
+            "multiplexer": "tmux",
             "tmux_socket": "/tmp/other/default",
             "tmux_session": "work",
             "window_index": "1",
             "pane_index": "1",
         }
         with (
-            patch.dict(os.environ, {"TMUX": "/tmp/current/default,123,0"}),
+            patch.dict(os.environ, {"TMUX": "/tmp/current/default,123,0"}, clear=True),
+            patch.object(pi_terminal, "_relay_request", new=AsyncMock(return_value=route)),
+            patch.object(pi_terminal.subprocess, "run") as run,
+        ):
+            focused = await pi_terminal.focus_local_session("session-1")
+        self.assertFalse(focused)
+        run.assert_not_called()
+
+    async def test_focus_local_zellij_pane_in_current_session(self):
+        route = {
+            "ok": True,
+            "multiplexer": "zellij",
+            "zellij_session_name": "Pi",
+            "zellij_pane_id": "terminal_8",
+        }
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            patch.dict(os.environ, {"ZELLIJ_SESSION_NAME": "Pi"}, clear=True),
+            patch.object(pi_terminal, "_relay_request", new=AsyncMock(return_value=route)),
+            patch.object(pi_terminal.subprocess, "run", return_value=completed) as run,
+        ):
+            focused = await pi_terminal.focus_local_session("session-1")
+        self.assertTrue(focused)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["zellij", "action", "focus-pane-id", "terminal_8"],
+        )
+
+    async def test_focus_local_zellij_pane_switches_session_and_client(self):
+        route = {
+            "ok": True,
+            "multiplexer": "zellij",
+            "zellij_session_name": "Research",
+            "zellij_pane_id": "terminal_12",
+        }
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            patch.dict(os.environ, {"ZELLIJ_SESSION_NAME": "Pi"}, clear=True),
+            patch.object(pi_terminal, "_relay_request", new=AsyncMock(return_value=route)),
+            patch.object(pi_terminal.subprocess, "run", return_value=completed) as run,
+        ):
+            focused = await pi_terminal.focus_local_session("session-1")
+        self.assertTrue(focused)
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "zellij", "action", "switch-session", "Research",
+                "--pane-id", "terminal_12",
+            ],
+        )
+
+    async def test_focus_local_session_streams_across_multiplexers(self):
+        route = {
+            "ok": True,
+            "multiplexer": "zellij",
+            "zellij_session_name": "Pi",
+            "zellij_pane_id": "terminal_8",
+        }
+        with (
+            patch.dict(os.environ, {"TMUX": "/tmp/current/default,123,0"}, clear=True),
             patch.object(pi_terminal, "_relay_request", new=AsyncMock(return_value=route)),
             patch.object(pi_terminal.subprocess, "run") as run,
         ):

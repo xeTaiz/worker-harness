@@ -419,11 +419,11 @@ Sync wait/result behavior, truthful cancellation/timeout handling, direct worker
 
 **Gate:** attach to a running delegated child from a second device, inspect its command logs, cancel it, and observe terminal/session/job convergence; then rerun through the gateway after M3c.
 
-### M7 — Zellij adapter — after M3c
+### M7 — Zellij adapter — implementation started
 
-Implement Zellij registration metadata, exact local focus where supported, remote PTY attachment, resize/detach, and the same cross-agent cycling UX. Reuse protocol v2 multi-attach and gateway fallback; do not invent a second attachment control plane.
+The implementation contract is `specs/ZELLIJ_PI_CLIENT.md`. Zellij registration metadata, exact same-host client focus, multiplexer-neutral relay routes, and disposable remote Zellij clients reuse protocol v2 multi-attach and gateway fallback; delegated workers remain tmux-backed. CLI/fzf plus KDL bindings ship before any optional WASM dashboard.
 
-**Gate:** Zellij focuses an existing local Pi pane or opens a remote attachment, then cycles between local/remote/delegated agents with the same behavior as tmux.
+**Gate:** Zellij focuses an existing local Pi pane or opens a remote attachment, then cycles between local/remote/delegated agents with the same behavior as tmux. A second Zellij client must focus the requested pane without moving or terminating the source client.
 
 ### M8 — PWA attachment hardening
 
@@ -447,7 +447,7 @@ Remaining work, in order:
 2. **Multi-attach prototype:** eight concurrent clients to one delegated and one interactive session; ninth attach replaces the longest-idle client; victim selector return; activity-refresh and short-clock idle timeout; shared zoom final-only restore; underlying Pi survives every detach.
 3. **Gateway backpressure:** direct upstream relay plus deliberately slow downstream client; prove frame fidelity, bounded memory, send watchdog, close propagation, and coexistence with direct clients.
 4. **Native/PWA fallback:** force direct connection failure, confirm gateway selection, idle-timeout return to selector, and immediate reattach.
-5. **Zellij adapter spike:** stable session/tab/pane identity, exact local focus command, second-client PTY behavior, resize semantics, and detach cleanup before production integration.
+5. **Zellij adapter closure:** stable session/pane identity and client-specific exact focus are proven on Zellij 0.44.2; finish mixed-client resize semantics, direct/prefix shortcut acceptance, fleet rollout, and source-session survival after relay cleanup.
 6. **PWA HTTPS:** choose Tailnet HTTPS publication and validate service-worker installation/update behavior.
 
 ## 13. Explicit non-goals

@@ -22,13 +22,13 @@ Pi-session webapp is served from the control service root, for example
 `http://<orchestrator-tailnet-name>:12889/`, and uses the same Tailnet trust
 boundary—there is no separate browser credential. Working/idle delegated
 sessions expose a **Terminal preview** tab through the worker relay on port
-`27888`. Ordinary interactive Pi sessions launched inside tmux expose the same
-tab through an auto-started host relay on the host's Tailnet port `27888`; random
-terminals and Zellij are reported non-attachable for now. The host relay binds
-only to loopback and uses Tailscale Serve, so grant the local operator permission
-once on each interactive host. Interactive terminal attachment additionally
-requires `tmux` and Bun; missing Bun leaves semantic registration available but
-marks raw terminal attachment unavailable.
+`27888`. Ordinary interactive Pi sessions launched inside tmux or Zellij expose
+the same tab through an auto-started host relay on the host's Tailnet port
+`27888`; random terminals remain non-attachable. The host relay binds only to
+loopback and uses Tailscale Serve, so grant the local operator permission once
+on each interactive host. Interactive terminal attachment additionally requires
+Bun plus the source multiplexer (`tmux`, or Zellij 0.44.2+); missing prerequisites
+leave semantic registration available but mark raw terminal attachment unavailable.
 
 ```bash
 bun --version
@@ -53,15 +53,22 @@ wh pi attach                         # interactive fzf picker
 wh pi attach <id-prefix-or-name>     # select directly
 ```
 
-Press `Ctrl-]` to detach. When invoked from tmux, the client switches directly
-to an original pane in the same local tmux server; remote/delegated sessions
-stream their raw PTY into the current terminal. Pass `--stream` to force the
-relay path even for a local pane. The companion dotfiles reserve `Ctrl-a` as a
-secondary Worker Harness prefix while leaving tmux's normal `Ctrl-b` prefix
-unchanged: `Ctrl-a Ctrl-a` opens the attachment picker (switching directly to
-same-server panes), `Ctrl-a Ctrl-j/Ctrl-l` cycles to the next attachable Pi
-agent, `Ctrl-a Ctrl-h/Ctrl-k` cycles to the previous one, and `Ctrl-a x`
-disconnects a stream or leaves a directly focused local agent.
+Press `Ctrl-]` to detach. When invoked from the same source multiplexer, the
+client switches directly to the exact original pane (`tmux` socket/pane or
+Zellij session/pane); remote, delegated, and cross-multiplexer sessions stream
+their raw PTY into the current terminal. Pass `--stream` to force the relay path
+even for a local pane.
+
+The companion tmux dotfiles reserve `Ctrl-a` as a Worker Harness prefix while
+leaving tmux's normal `Ctrl-b` prefix unchanged: `Ctrl-a Ctrl-a` opens the
+picker, `Ctrl-a Ctrl-j/Ctrl-l` cycles next, `Ctrl-a Ctrl-h/Ctrl-k` cycles
+previous, and `Ctrl-a x` detaches. Zellij provides both a direct `Alt-a` picker
+(which focuses local Zellij panes when possible) and a prefix-mode streaming
+cycler: `Ctrl-a Ctrl-a` opens `wh pi attach --stream`, the same Ctrl-j/l and
+Ctrl-h/k pairs cycle, and `Ctrl-a x` detaches. Inside any native streaming
+attachment, `Ctrl-^` and `Ctrl-_` are direct next/previous shortcuts and are
+consumed locally rather than sent to the source PTY. Zellij keeps its existing
+`Ctrl-b` tmux-emulation mode entry as well.
 
 Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 
