@@ -209,7 +209,7 @@ Recommended defaults:
 ## 12. Acceptance gates
 
 1. Start a new managed Pi from Zellij; it appears in the same pane, has no inner tmux status bar, resizes continuously, detaches with `Ctrl-]`, and survives detach.
-2. Start from an outer tmux with its status bar enabled; the outer status remains visible while the managed Pi stream runs in the pane, and detach returns to the original shell/window without switching the outer client into the hidden server.
+2. Start from an outer tmux with its status bar enabled; exactly the outer bar remains visible, no inner `wh-pi`/`wh_attach_*` bar appears or leaks into later Zellij attachments, and detach returns to the original shell/window without switching the outer client into the hidden server. This gate was reopened by the user's live two-bar report; the P0 diagnosis/fix is specified in `specs/PI_ATTACH_UX_NEXT.md`.
 3. Start from a bare terminal with the same attach/resize/detach behavior.
 4. Start at least three Pi sessions concurrently; each occupies one managed window/pane, registers under its generated UUID and requested/default name, and can be independently attached/stopped.
 5. Connect from a remote Zellij and remote tmux client; initial size and changed resizes redraw Pi correctly.
@@ -228,7 +228,7 @@ Recommended defaults:
 2. **Implemented:** relay environment sanitization for nested tmux; host relay revision 11 removes inherited `TMUX`/`TMUX_PANE` and explicitly configures grouped relay sessions.
 3. **Implemented:** new-session identity/name handling, argv-safe detached window lifecycle, and explicit rejection of resume/continue/fork conflicts.
 4. **Implemented:** exact local UDS route wait plus loopback native attach and `--no-attach`.
-5. **Partially accepted live:** bare-PTY and unrelated-outer-tmux starts attached over loopback, detached cleanly, preserved the hidden Pi source, and left the outer tmux session/status intact; Zellij remains pending.
+5. **Partially accepted, status gate reopened:** bare-PTY and unrelated-outer-tmux loopback attach/detach/source-survival passed, but the user subsequently observed a second inner status bar after attaching from outer tmux and then in later Zellij attachments. Resolve the P0 in `specs/PI_ATTACH_UX_NEXT.md` before declaring invisible-backend acceptance.
 6. **Pending live matrix:** run remote tmux/Zellij, multi-attach, idle, replacement, and resize acceptance.
 7. Keep plain `pi` documented throughout rollout.
 8. Only after acceptance consider a `pi` shell alias or making the managed launcher the preferred default.

@@ -454,8 +454,9 @@ Remaining work, in order:
 3. **Gateway backpressure:** direct upstream relay plus deliberately slow downstream client; prove frame fidelity, bounded memory, send watchdog, close propagation, and coexistence with direct clients.
 4. **Native/PWA fallback:** force direct connection failure, confirm gateway selection, idle-timeout return to selector, and immediate reattach.
 5. **Zellij adapter closure:** stable session/pane identity and client-specific exact focus are proven on Zellij 0.44.2; finish mixed-client resize semantics, direct/prefix shortcut acceptance, fleet rollout, and source-session survival after relay cleanup.
-6. **Hidden tmux managed launcher:** prototype `wh pi start` from Zellij, an unrelated outer tmux, and a bare terminal using the dedicated backend/socket in `specs/HIDDEN_TMUX_PI_RUNTIME.md`; prove invisible status, local loopback attach, resize, detach survival, generated identity, and nested-environment sanitization.
-7. **PWA HTTPS:** choose Tailnet HTTPS publication and validate service-worker installation/update behavior.
+6. **Pi attach UX next slice:** execute `specs/PI_ATTACH_UX_NEXT.md` in order: diagnose/fix the reopened managed-tmux inner-status-bar regression; add the floating Zellij picker and dedicated/reused `π` tabs; group the picker by source machine; then add SSE-driven working/idle/error tab glyphs.
+7. **Hidden tmux managed launcher matrix:** finish remote Zellij/tmux, cap/idle/replacement, mixed-size, and fleet acceptance after the P0 invisible-status fix.
+8. **PWA HTTPS:** choose Tailnet HTTPS publication and validate service-worker installation/update behavior.
 
 ## 13. Explicit non-goals
 

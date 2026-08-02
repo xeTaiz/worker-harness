@@ -161,6 +161,10 @@ The stream client accepts dedicated local control bytes for next/previous in add
 
 `Alt-y/u` and the prefix-mode cycle keys launch a short in-place `wh pi cycle` helper. Zellij exposes the original pane as suppressed while the helper is active. For a streamed pane, a mode-0600 runtime marker maps that original pane to the active `wh` PID and the helper sends the existing SIGUSR direction before exiting; the original stream resumes and reconnects in the same process. For a directly focused local Pi pane, the helper asks host-relay revision 11 to reverse-resolve `(Zellij session, pane)` to the Worker Harness session ID, then attaches the relative target normally. This avoids process-tree guessing, control-byte injection into ordinary Pi, duplicate stream slots, and recursive local Zellij streaming.
 
+### 7.4 Planned attachment-tab UX
+
+The next UX slice is specified in `specs/PI_ATTACH_UX_NEXT.md`: picker bindings move from an in-place suppressed pane to a floating pane; managed/remote/delegated streams open or focus one dedicated `π <state> <name>` tab per session; `Ctrl-]` closes the one-pane attachment tab; plugin-free state glyphs follow durable lifecycle events; and picker rows group by source machine. Same-client plain Zellij sources continue to exact-focus their original pane. Per-tab background colors remain a later WASM tab-bar milestone.
+
 ## 8. Files and rollout
 
 Expected implementation files:
