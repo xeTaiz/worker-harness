@@ -134,6 +134,10 @@ def _session_exists(socket: Path) -> bool:
 def _configure_managed_server(socket: Path) -> None:
     for key in ("ZELLIJ", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID"):
         _run_tmux(socket, "set-environment", "-g", "-u", key, check=False)
+    # This server is exclusively Worker Harness-owned. Keep the global default
+    # off so every future grouped relay session starts without backend chrome,
+    # then reinforce it on the owner session itself.
+    _run_tmux(socket, "set-option", "-g", "status", "off")
     _run_tmux(socket, "set-option", "-t", MANAGED_TMUX_SESSION, "status", "off")
     _run_tmux(
         socket,

@@ -128,6 +128,21 @@ class PiRuntimeTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[1].args[1], "new-window")
         configure.assert_called_once_with(socket)
 
+    def test_managed_server_disables_global_and_owner_status(self):
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with patch.object(pi_runtime, "_run_tmux", return_value=completed) as run:
+            pi_runtime._configure_managed_server(Path("/tmp/pi.sock"))
+        commands = [call.args[1:] for call in run.call_args_list]
+        self.assertIn(("set-option", "-g", "status", "off"), commands)
+        self.assertIn(
+            ("set-option", "-t", pi_runtime.MANAGED_TMUX_SESSION, "status", "off"),
+            commands,
+        )
+        self.assertIn(
+            ("set-option", "-t", pi_runtime.MANAGED_TMUX_SESSION, "window-size", "latest"),
+            commands,
+        )
+
     def test_tmux_command_ignores_user_configuration(self):
         command = pi_runtime._tmux_command(Path("/tmp/pi.sock"), "has-session")
         self.assertEqual(command[:5], [
