@@ -2,7 +2,7 @@
 title: Zellij Pi Session Client and Host-Relay Adapter
 status: active
 created: 2026-08-01
-updated: 2026-08-01
+updated: 2026-08-02
 owner: Worker Harness
 milestone: M7
 ---
@@ -107,7 +107,8 @@ Retain current behavior unchanged: stable pane resolution, linked disposable ses
 - Remote/cross-multiplexer attachment: create a unique disposable bootstrap Zellij session/client in `Bun.Terminal`, then switch that client to the registered target session and pane.
 - Client-specific focus proof: compare `list-clients` before and after bootstrap; the newly added client must report the target pane while pre-existing clients retain their focused panes.
 - Suppress bootstrap-shell output until the target client is confirmed; then forward target redraw bytes and send protocol `connected` status.
-- Resize only the disposable client PTY. The source session and other clients must remain alive and retain focus.
+- Initialize the disposable client PTY from the attaching terminal's `rows`/`cols` and apply later protocol-v2 resize frames only to that disposable PTY. This gives the remote Zellij client the attaching device's dimensions rather than inheriting the source machine's physical terminal size. It does not by itself override Zellij's internal multi-client layout/viewport policy; mixed-size clients remain a Z5 acceptance item.
+- The source session and other clients must remain alive and retain focus.
 - Cleanup closes the disposable PTY/client and kills only the unique bootstrap session. It never kills the source Zellij session or target pane.
 - Strip inherited `ZELLIJ*` variables from relay-spawned Zellij CLI/client environments so a relay launched from inside Zellij cannot accidentally act as the source client.
 
@@ -145,10 +146,12 @@ Initial collision-free defaults:
 
 `Ctrl-a` enters Zellij's existing prefix-like `tmux` input mode, while the existing `Ctrl-b` entry remains available. Add:
 
-- `Ctrl-a Ctrl-a`: open the picker with `--stream` so the cycling process remains active;
+- `Ctrl-a Ctrl-a`: open the picker with `--stream`; local Zellij targets are still exact-focused instead of recursively streaming the same Zellij session;
 - `Ctrl-a Ctrl-j` / `Ctrl-a Ctrl-l`: next;
 - `Ctrl-a Ctrl-h` / `Ctrl-a Ctrl-k`: previous;
-- `Ctrl-a x`: detach/return.
+- `Ctrl-a x`: detach a native stream.
+
+A directly focused original local Zellij pane is not a Worker Harness stream, so `Ctrl-a x` cannot restore a universal previous-pane stack there; ordinary Zellij tab/session navigation remains the current return path.
 
 The built-in status bar therefore exposes the active input mode and available keys. It may label the fixed mode `TMUX`; a custom `WH-PI` label requires a status-bar/plugin follow-up and does not block v1.
 
@@ -156,7 +159,7 @@ The built-in status bar therefore exposes the active input mode and available ke
 
 The stream client accepts dedicated local control bytes for next/previous in addition to the existing SIGUSR path. These bytes are consumed locally and never reach the remote PTY.
 
-`Alt-y/u` and the prefix-mode cycle keys launch a short in-place `wh pi cycle` helper. Zellij exposes the original pane as suppressed while the helper is active. For a streamed pane, a mode-0600 runtime marker maps that original pane to the active `wh` PID and the helper sends the existing SIGUSR direction before exiting; the original stream resumes and reconnects in the same process. For a directly focused local Pi pane, the helper asks host-relay revision 9 to reverse-resolve `(Zellij session, pane)` to the Worker Harness session ID, then attaches the relative target normally. This avoids process-tree guessing, control-byte injection into ordinary Pi, duplicate stream slots, and recursive local Zellij streaming.
+`Alt-y/u` and the prefix-mode cycle keys launch a short in-place `wh pi cycle` helper. Zellij exposes the original pane as suppressed while the helper is active. For a streamed pane, a mode-0600 runtime marker maps that original pane to the active `wh` PID and the helper sends the existing SIGUSR direction before exiting; the original stream resumes and reconnects in the same process. For a directly focused local Pi pane, the helper asks host-relay revision 10 to reverse-resolve `(Zellij session, pane)` to the Worker Harness session ID, then attaches the relative target normally. This avoids process-tree guessing, control-byte injection into ordinary Pi, duplicate stream slots, and recursive local Zellij streaming.
 
 ## 8. Files and rollout
 
@@ -170,7 +173,7 @@ Expected implementation files:
 - dotfiles `zellij/.config/zellij/config.kdl`;
 - README and the parent distributed-session spec status.
 
-No orchestrator image, SQLite migration, or worker SIF rebuild is expected. Operator hosts require updated dotfiles/CLI, host-relay revision restart, Pi `/reload`, and a fresh/reloaded Zellij configuration.
+No orchestrator image, SQLite migration, or worker SIF rebuild is required. Operator hosts require updated dotfiles/CLI, host-relay restart, Pi `/reload`, and a fresh/reloaded Zellij configuration. The current live relay is revision 10; it additionally removes stale inherited `TMPDIR` values before spawning Zellij so a long-lived relay cannot fail after a temporary launch directory disappears.
 
 ## 9. Implementation slices
 
@@ -182,28 +185,32 @@ No orchestrator image, SQLite migration, or worker SIF rebuild is expected. Oper
 - mixed-client resize acceptance remains part of Z5;
 - the discriminated route contract and cleanup invariant are recorded here.
 
-### Z2 — bridge, route, and local focus
+### Z2 — bridge, route, and local focus — completed
 
 - add Zellij locator discovery/registration;
 - add relay route union, liveness, describe, and re-key cleanup;
 - add Python local-focus adapter;
 - preserve tmux compatibility tests.
 
-### Z3 — remote Zellij attachment
+### Z3 — remote Zellij attachment — completed in code; isolated live smoke passed
 
 - implement disposable bootstrap client;
 - exact target confirmation, startup timeout, suppressed bootstrap output;
 - resize/input/output/cleanup;
 - common cap/idle/replacement behavior.
 
-### Z4 — picker/cycle/detach KDL UX
+### Z4 — picker/cycle/detach KDL UX — implemented; operator acceptance pending
 
 - direct bindings and `Ctrl-a` input-mode bindings;
 - stream-local next/previous controls;
 - directly focused local-session cycle/return helper;
 - config validation and operator documentation.
 
-### Z5 — live acceptance
+### Z5 — live acceptance — partial
+
+Completed in isolation: exact disposable attachment at `31x101`, exact client/pane confirmation, cleanup to zero without source termination, cap-two longest-idle replacement, local recursive-stream prevention, reverse-locator smoke, and revision-10 relay/config validation.
+
+Still required:
 
 - source/client matrix across local, remote, interactive, and delegated sessions;
 - mixed tmux/Zellij routes on one host;
@@ -220,8 +227,9 @@ No orchestrator image, SQLite migration, or worker SIF rebuild is expected. Oper
 5. A Zellij client attaches to delegated worker tmux with no worker changes.
 6. The disposable Zellij client has an independent client ID and target pane; the original client's focused pane does not change.
 7. Closing/replacing/idling a remote attachment removes only the disposable client/bootstrap session; source Zellij and Pi survive.
-8. Direct and prefix-mode picker/cycle/detach bindings work without breaking existing lowercase Alt pane movement or normal `Ctrl-b` behavior.
-9. Existing tmux and full non-live Worker Harness regressions remain green.
+8. Direct and prefix-mode picker/cycle/detach bindings work without breaking existing lowercase Alt pane movement or normal `Ctrl-b` behavior. `Alt-y/u` provide collision-free previous/next cycling; `Alt-h/j/k/l` remain pane movement.
+9. Initial and changed dimensions from each attaching client are applied to its disposable PTY; mixed-size Zellij clients render acceptably without moving other clients or corrupting the source layout.
+10. Existing tmux and full non-live Worker Harness regressions remain green.
 
 ## 11. Non-goals
 
