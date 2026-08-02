@@ -169,6 +169,8 @@ pi.sendUserMessage(message, { deliverAs: "steer" | "followUp" })
 
 The operator continues to run plain `pi` inside tmux or Zellij; no mandatory `wh pi start` wrapper is introduced.
 
+An optional managed-launcher proposal is specified in `specs/HIDDEN_TMUX_PI_RUNTIME.md`: `wh pi start` would run interactive Pi in a dedicated, invisible tmux server (one Pi per single-pane window, status off, `window-size latest`) and present it through the ordinary native attachment client inside Zellij, an unrelated outer tmux, or a bare terminal. It remains proposed until nested-environment sanitization, resume semantics, local loopback attach, and live acceptance land; plain Pi compatibility remains authoritative throughout rollout.
+
 The tmux implementation is feature-complete. The bridge captures stable tmux socket and pane identity, and the host relay resolves mutable session/window/pane indices. `wh pi attach` switches directly to the original pane when it belongs to the invoking tmux server; otherwise it starts a disposable linked tmux client in a PTY and streams it through the relay. Native attachment supports fullscreen rendering, upgrade-time dimensions, resize polling, raw input/output, `Ctrl-]` detach, and agent cycling across local and remote sessions. The companion dotfiles reserve `Ctrl-a` as a Worker Harness prefix while leaving tmux's normal prefix unchanged.
 
 The remaining tmux work is rollout and acceptance across all hosts, not new attachment architecture. Attachments created before pane-marker support must be reopened once before cycling.
@@ -452,7 +454,8 @@ Remaining work, in order:
 3. **Gateway backpressure:** direct upstream relay plus deliberately slow downstream client; prove frame fidelity, bounded memory, send watchdog, close propagation, and coexistence with direct clients.
 4. **Native/PWA fallback:** force direct connection failure, confirm gateway selection, idle-timeout return to selector, and immediate reattach.
 5. **Zellij adapter closure:** stable session/pane identity and client-specific exact focus are proven on Zellij 0.44.2; finish mixed-client resize semantics, direct/prefix shortcut acceptance, fleet rollout, and source-session survival after relay cleanup.
-6. **PWA HTTPS:** choose Tailnet HTTPS publication and validate service-worker installation/update behavior.
+6. **Hidden tmux managed launcher:** prototype `wh pi start` from Zellij, an unrelated outer tmux, and a bare terminal using the dedicated backend/socket in `specs/HIDDEN_TMUX_PI_RUNTIME.md`; prove invisible status, local loopback attach, resize, detach survival, generated identity, and nested-environment sanitization.
+7. **PWA HTTPS:** choose Tailnet HTTPS publication and validate service-worker installation/update behavior.
 
 ## 13. Explicit non-goals
 
