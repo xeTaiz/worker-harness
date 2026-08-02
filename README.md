@@ -67,14 +67,16 @@ back to the orchestrator gateway. `--stream` remains as a compatibility no-op.
 The companion tmux dotfiles reserve `Ctrl-a` as a Worker Harness prefix while
 leaving tmux's normal `Ctrl-b` prefix unchanged: `Ctrl-a Ctrl-a` opens the
 picker, `Ctrl-a Ctrl-j/Ctrl-l` cycles next, `Ctrl-a Ctrl-h/Ctrl-k` cycles
-previous, and `Ctrl-a x` detaches. Zellij provides both a direct `Alt-a` picker
-(which focuses local Zellij panes when possible) and a prefix-mode streaming
-cycler: `Ctrl-a Ctrl-a` opens `wh pi attach`, the same Ctrl-j/l and
-Ctrl-h/k pairs cycle, and `Ctrl-a x` detaches a stream. `Alt-u` cycles next and
-`Alt-y` cycles previous directly from either an original local Pi pane or a
-streamed attachment. Inside a native stream, `Ctrl-^` and `Ctrl-_` are additional
-direct next/previous shortcuts consumed locally rather than sent to the source
-PTY. Zellij keeps its existing `Ctrl-b` tmux-emulation mode entry as well.
+previous, and `Ctrl-a x` detaches. In Zellij, `Alt-a` and `Ctrl-a Ctrl-a` open
+the picker in a floating pane. A managed/remote/delegated selection opens one
+single-pane tab (`π ● name` working, `π ✓ name` idle, `π ! name` error, `π ?
+name` disconnected), while reopening that session focuses its existing tab.
+`Ctrl-]` closes the attachment tab without stopping Pi. Same-client plain
+Zellij sources still focus their original pane. Picker order is Global, Local
+(initial selection; Up selects Global), remote interactive machines, then
+delegated workers. `Alt-u/y`, prefix Ctrl-j/l/h/k, and in-stream `Ctrl-^`/
+`Ctrl-_` cycle through that same order. Zellij keeps its existing `Ctrl-b`
+tmux-emulation mode entry as well.
 
 Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 

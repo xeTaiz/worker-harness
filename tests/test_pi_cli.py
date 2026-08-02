@@ -20,9 +20,17 @@ from worker_harness.cli.app import _state
 class PiCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.runner = CliRunner()
+        self.multiplexer_environment = patch.dict(pi.os.environ, {
+            "TMUX": "",
+            "TMUX_PANE": "",
+            "ZELLIJ_SESSION_NAME": "",
+            "ZELLIJ_PANE_ID": "",
+        })
+        self.multiplexer_environment.start()
         _state.clear()
 
     def tearDown(self) -> None:
+        self.multiplexer_environment.stop()
         _state.clear()
 
     @staticmethod
@@ -79,6 +87,47 @@ class PiCliTests(unittest.TestCase):
             [row["id"] for row in pi._cycle_order(rows, "second", "previous")],
             ["first", "third"],
         )
+
+    def test_attach_candidates_order_global_local_remote_then_delegated(self):
+        rows = [
+            {**self._session(), "id": "remote", "host": "zeta", "updated_at": 5},
+            {**self._session(), "id": "delegated", "session_type": "delegated",
+             "host": "", "worker_id": "worker-1", "updated_at": 9},
+            {**self._session(), "id": "local-idle", "host": "local", "updated_at": 8},
+            {**self._session(), "id": "local-working", "host": "local",
+             "state": "working", "updated_at": 1},
+            {**self._session(), "id": "global", "session_type": "global-router",
+             "host": "router", "updated_at": 1},
+            {**self._session(), "id": "alpha", "host": "alpha", "updated_at": 3},
+        ]
+        candidates = pi._attach_candidates(
+            rows, [{"id": "worker-1", "name": "GPU Box"}], local_host="local"
+        )
+        self.assertEqual([row["id"] for row in candidates], [
+            "global", "local-working", "local-idle", "alpha", "remote", "delegated",
+        ])
+        self.assertEqual(candidates[0]["_machine_cell"], "Global")
+        self.assertEqual(candidates[1]["_machine_cell"], "Local · local")
+        self.assertEqual(candidates[2]["_machine_cell"], "╎")
+        self.assertEqual(candidates[-1]["_machine_cell"], "Delegated · GPU Box")
+
+    def test_picker_starts_on_first_local_with_global_one_step_up(self):
+        rows = pi._attach_candidates([
+            {**self._session(), "id": "global", "session_type": "global-router", "host": "router"},
+            {**self._session(), "id": "local", "host": "local"},
+            {**self._session(), "id": "remote", "host": "remote"},
+        ], local_host="local")
+        chosen = subprocess.CompletedProcess([], 0, "local\tlocal\tidle\tinteractive\tLocal · local\trepo-agent\t/repo\n", "")
+        with (
+            patch.object(pi.shutil, "which", return_value="/usr/bin/fzf"),
+            patch.object(pi.subprocess, "run", return_value=chosen) as run,
+        ):
+            selected = pi._pick_session(rows)
+        self.assertEqual(selected["id"], "local")
+        self.assertIn("--bind=load:pos(2)", run.call_args.args[0])
+        picker_input = run.call_args.kwargs["input"].splitlines()
+        self.assertTrue(picker_input[0].startswith("global\tglobal router\t"))
+        self.assertTrue(picker_input[1].startswith("local\tlocal\t"))
 
     def test_zellij_cycle_finds_original_pane_suppressed_by_in_place_helper(self):
         panes = [
@@ -163,9 +212,33 @@ class PiCliTests(unittest.TestCase):
             result = self.runner.invoke(pi.app, ["start", "--name", "research"])
         self.assertEqual(result.exit_code, 0, result.output)
         attach_loop.assert_awaited_once_with(
-            {"id": "generated-id", "name": "research"},
+            {"id": "generated-id", "name": "research", "state": "idle"},
             initial_websocket_url="ws://127.0.0.1:27890/v1/sessions/generated-id/attach",
         )
+
+    def test_start_in_zellij_opens_dedicated_loopback_tab(self):
+        managed = pi_runtime.ManagedPiSession(
+            "generated-id", "research", Path("/run/user/1000/worker-harness/pi-tmux.sock"), "%7"
+        )
+        opener = AsyncMock(return_value=None)
+        with (
+            patch.dict(pi.os.environ, {
+                "ZELLIJ_SESSION_NAME": "Pi", "ZELLIJ_PANE_ID": "8", "TMUX": "",
+            }),
+            patch("worker_harness.pi_runtime.start_managed_pi", return_value=managed),
+            patch(
+                "worker_harness.pi_runtime.wait_for_managed_route",
+                new=AsyncMock(return_value={"multiplexer": "tmux"}),
+            ),
+            patch.object(pi, "_open_in_zellij", new=opener),
+            patch.object(pi, "_run_attach_loop", new=AsyncMock()) as attach_loop,
+        ):
+            result = self.runner.invoke(pi.app, ["start", "--name", "research"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        opener.assert_awaited_once_with({
+            "id": "generated-id", "name": "research", "state": "idle",
+        }, loopback=True)
+        attach_loop.assert_not_awaited()
 
     def test_attach_picker_filters_non_attachable_sessions(self):
         rows = [self._session(), {**self._session(), "id": "offline"}]
@@ -186,6 +259,50 @@ class PiCliTests(unittest.TestCase):
         ):
             selected = pi._pick_session(rows)
         self.assertEqual(selected["id"], "second")
+
+    def test_attach_in_zellij_opens_or_focuses_dedicated_tab(self):
+        opener = AsyncMock(return_value=None)
+        with (
+            patch.dict(pi.os.environ, {
+                "ZELLIJ_SESSION_NAME": "Pi", "ZELLIJ_PANE_ID": "8", "TMUX": "",
+            }),
+            patch.object(pi, "_request", new=AsyncMock(return_value=[self._session()])),
+            patch.object(pi, "_open_in_zellij", new=opener),
+            patch.object(pi, "_run_attach_loop", new=AsyncMock()) as attach_loop,
+        ):
+            result = self.runner.invoke(pi.app, ["attach", "repo-agent"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        opener.assert_awaited_once()
+        self.assertEqual(opener.await_args.args[0]["id"], "interactive-session-id")
+        attach_loop.assert_not_awaited()
+
+    def test_attach_here_loopback_skips_inventory_and_runs_in_tab(self):
+        attach_loop = AsyncMock(return_value=None)
+        relay = AsyncMock(return_value={"ok": True, "multiplexer": "tmux"})
+        with (
+            patch.dict(pi.os.environ, {
+                "ZELLIJ_SESSION_NAME": "Pi", "ZELLIJ_PANE_ID": "8", "TMUX": "",
+            }),
+            patch("worker_harness.pi_terminal._relay_request", new=relay),
+            patch(
+                "worker_harness.pi_runtime.local_relay_websocket_url",
+                return_value="ws://127.0.0.1:27890/v1/sessions/session-1/attach",
+            ),
+            patch.object(pi, "_run_attach_loop", new=attach_loop),
+            patch.object(pi, "_request", new=AsyncMock()) as request,
+        ):
+            result = self.runner.invoke(pi.app, [
+                "attach", "--here", "--loopback", "--session-name", "research",
+                "--session-state", "idle", "session-1",
+            ])
+        self.assertEqual(result.exit_code, 0, result.output)
+        request.assert_not_awaited()
+        relay.assert_awaited_once_with({"action": "describe", "session_id": "session-1"})
+        attach_loop.assert_awaited_once_with(
+            {"id": "session-1", "name": "research", "state": "idle"},
+            initial_websocket_url="ws://127.0.0.1:27890/v1/sessions/session-1/attach",
+            zellij_tab=True,
+        )
 
     def test_attach_resolves_prefix_and_streams_protocol_v2(self):
         request = AsyncMock(side_effect=[

@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -103,18 +104,69 @@ def sessions(
         raise typer.Exit(1) from exc
 
 
-def _attach_candidates(rows: list[dict]) -> list[dict]:
-    candidates = [row for row in rows if row.get("state") in _ACTIVE_STATES]
+def _attach_candidates(
+    rows: list[dict],
+    workers: list[dict] | None = None,
+    *,
+    local_host: str | None = None,
+) -> list[dict]:
+    """Return active sessions in global/local/remote/delegated picker order."""
+
+    worker_names = {
+        str(worker.get("id") or ""): str(worker.get("name") or worker.get("id") or "")
+        for worker in workers or []
+    }
+    local = (local_host or socket.gethostname()).casefold()
     state_order = {"working": 0, "idle": 1}
-    type_order = {"interactive": 0, "delegated": 1}
-    return sorted(
-        candidates,
-        key=lambda row: (
-            state_order.get(str(row.get("state")), 9),
-            type_order.get(str(row.get("session_type")), 9),
-            -int(row.get("updated_at") or 0),
-        ),
-    )
+    candidates: list[dict] = []
+    for source in rows:
+        if source.get("state") not in _ACTIVE_STATES:
+            continue
+        row = dict(source)
+        session_type = str(row.get("session_type") or "")
+        host = str(row.get("host") or "").strip()
+        if session_type == "global-router":
+            rank, label, search = 0, "Global", "global router"
+        elif session_type == "delegated":
+            worker_id = str(row.get("worker_id") or "").strip()
+            machine = worker_names.get(worker_id) or worker_id or "Unknown worker"
+            rank, label, search = 3, f"Delegated · {machine}", machine
+        elif host and host.casefold() == local:
+            rank, label, search = 1, f"Local · {host}", host
+        else:
+            machine = host or "Unknown machine"
+            rank, label, search = 2, machine, machine
+        row.update({
+            "_machine_rank": rank,
+            "_machine_label": label,
+            "_machine_search": search,
+            "_machine_group": f"{rank}:{label.casefold()}",
+        })
+        candidates.append(row)
+    candidates.sort(key=lambda row: (
+        int(row["_machine_rank"]),
+        str(row["_machine_label"]).casefold(),
+        state_order.get(str(row.get("state")), 9),
+        -int(row.get("updated_at") or 0),
+        str(row.get("id") or ""),
+    ))
+    previous_group = ""
+    for row in candidates:
+        group = str(row["_machine_group"])
+        row["_machine_cell"] = row["_machine_label"] if group != previous_group else "╎"
+        previous_group = group
+    return candidates
+
+
+async def _candidate_inventory() -> list[dict]:
+    rows = await _request("GET", "/api/v1/pi/sessions")
+    workers: list[dict] = []
+    if any(str(row.get("session_type") or "") == "delegated" for row in rows):
+        try:
+            workers = await _request("GET", "/api/v1/workers")
+        except RuntimeError:
+            pass
+    return _attach_candidates(rows, workers)
 
 
 def _resolve_session(rows: list[dict], target: str) -> dict:
@@ -162,13 +214,20 @@ async def _attachable_candidates(rows: list[dict]) -> list[dict]:
 
 
 async def _cycle_session(current_session_id: str, direction: str) -> dict:
-    candidates = _attach_candidates(await _request("GET", "/api/v1/pi/sessions"))
-    available = await _attachable_candidates(
-        _cycle_order(candidates, current_session_id, direction)
+    candidates = _cycle_order(
+        await _candidate_inventory(), current_session_id, direction
     )
-    if not available:
-        raise RuntimeError("no other attachable Pi sessions are registered")
-    return available[0]
+    for candidate in candidates:
+        session_id = str(candidate.get("id") or "")
+        try:
+            info = await _request(
+                "GET", f"/api/v1/pi/sessions/{quote(session_id, safe='')}/attach-info"
+            )
+        except RuntimeError:
+            continue
+        if info.get("attachable"):
+            return candidate
+    raise RuntimeError("no other attachable Pi sessions are registered")
 
 
 def _zellij_marker_path(session_name: str, pane_id: str) -> Path:
@@ -201,10 +260,27 @@ def _mark_attach_pane(session_id: str | None) -> None:
     zellij_pane = os.environ.get("ZELLIJ_PANE_ID", "")
     if not zellij_session or not zellij_pane:
         return
-    marker = _zellij_marker_path(zellij_session, f"terminal_{zellij_pane}")
+    from worker_harness.pi_zellij import mark_current_attachment, unmark_attachment
+
+    normalized_zellij_pane = (
+        zellij_pane if zellij_pane.startswith("terminal_") else f"terminal_{zellij_pane}"
+    )
+    marker = _zellij_marker_path(zellij_session, normalized_zellij_pane)
+    try:
+        previous = json.loads(marker.read_text(encoding="utf8"))
+    except (OSError, json.JSONDecodeError):
+        previous = {}
+    previous_session = str(previous.get("session_id") or "")
+    previous_pid = int(previous.get("pid") or 0)
     if not session_id:
+        if previous_pid not in {0, os.getpid()}:
+            return
+        if previous_session:
+            unmark_attachment(previous_session, pid=os.getpid())
         marker.unlink(missing_ok=True)
         return
+    if previous_session and previous_session != session_id:
+        unmark_attachment(previous_session, pid=previous_pid)
     marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = marker.with_suffix(f".{os.getpid()}.tmp")
     temporary.write_text(json.dumps({
@@ -214,6 +290,7 @@ def _mark_attach_pane(session_id: str | None) -> None:
     }), encoding="utf8")
     temporary.chmod(0o600)
     temporary.replace(marker)
+    mark_current_attachment(session_id)
 
 
 def _zellij_cycle_source_panes() -> list[str]:
@@ -283,6 +360,8 @@ async def _zellij_cycle_origin() -> tuple[str, int | None]:
 def _pick_session(rows: list[dict]) -> dict:
     if not rows:
         raise RuntimeError("no working or idle Pi sessions are registered")
+    if any("_machine_rank" not in row for row in rows):
+        rows = _attach_candidates(rows)
     fzf = shutil.which("fzf")
     if not fzf:
         if len(rows) == 1:
@@ -293,30 +372,38 @@ def _pick_session(rows: list[dict]) -> dict:
     for row in rows:
         session_id = str(row.get("id", ""))
         label = str(row.get("name") or row.get("task") or "-").replace("\t", " ")
-        location = str(row.get("host") or row.get("worker_id") or "-").replace("\t", " ")
         cwd = str(row.get("cwd") or "-").replace("\t", " ")
-        lines.append(
-            "\t".join((
-                session_id,
-                str(row.get("state") or ""),
-                str(row.get("session_type") or ""),
-                label,
-                location,
-                cwd,
-            ))
-        )
+        lines.append("\t".join((
+            session_id,
+            str(row.get("_machine_search") or ""),
+            str(row.get("state") or ""),
+            str(row.get("session_type") or ""),
+            str(row.get("_machine_cell") or ""),
+            label,
+            cwd,
+        )))
+    command = [
+        fzf,
+        "--no-tmux",
+        "--height=100%",
+        "--layout=reverse",
+        "--border",
+        "--sync",
+        "--no-sort",
+        "--delimiter=\\t",
+        "--with-nth=3..",
+        "--nth=2,6..",
+        "--header=STATE  TYPE  MACHINE  NAME/TASK  CWD",
+        "--prompt=Pi session> ",
+    ]
+    local_position = next((
+        index + 1 for index, row in enumerate(rows)
+        if int(row.get("_machine_rank") or -1) == 1
+    ), 1)
+    if local_position > 1:
+        command.append(f"--bind=load:pos({local_position})")
     result = subprocess.run(
-        [
-            fzf,
-            "--no-tmux",
-            "--height=100%",
-            "--layout=reverse",
-            "--border",
-            "--delimiter=\\t",
-            "--with-nth=2..",
-            "--header=STATE  TYPE  NAME/TASK  HOST/WORKER  CWD",
-            "--prompt=Pi session> ",
-        ],
+        command,
         input="\n".join(lines) + "\n",
         text=True,
         stdout=subprocess.PIPE,
@@ -336,10 +423,13 @@ async def _run_attach_loop(
     selected: dict,
     *,
     initial_websocket_url: str | None = None,
+    zellij_tab: bool = False,
 ) -> None:
     """Run the native attachment/cycling loop for one selected session."""
 
     from worker_harness.pi_terminal import attach_terminal, focus_local_zellij_session
+    from worker_harness.pi_zellij import current_tab_context, rename_tab
+    from worker_harness.pi_zellij_state import watch_session_state
 
     cycle_requests: asyncio.Queue[str] = asyncio.Queue()
     loop = asyncio.get_running_loop()
@@ -354,47 +444,80 @@ async def _run_attach_loop(
     try:
         while True:
             session_id = str(selected.get("id") or "")
+            name = str(selected.get("name") or selected.get("task") or "Pi")
             _mark_attach_pane(session_id)
             # A Zellij source in this same immediate Zellij client must be
             # focused directly to avoid recursively rendering that client.
             # Tmux sources always stream, including on their source host.
             if await focus_local_zellij_session(session_id):
                 return
-            if initial_websocket_url is not None:
-                websocket_url = initial_websocket_url
-                gateway_websocket_url = None
-                initial_websocket_url = None
-            else:
-                info = await _request(
-                    "GET", f"/api/v1/pi/sessions/{quote(session_id, safe='')}/attach-info"
+            state_watcher: asyncio.Task[None] | None = None
+            if zellij_tab and (tab_context := current_tab_context()) is not None:
+                tab_id, _pane_id = tab_context
+
+                async def update_tab(state: str, *, target_tab: int = tab_id, label: str = name) -> None:
+                    await asyncio.to_thread(rename_tab, target_tab, label, state)
+
+                state_watcher = asyncio.create_task(
+                    watch_session_state(
+                        _base_url(),
+                        session_id,
+                        str(selected.get("state") or "disconnected"),
+                        update_tab,
+                    ),
+                    name=f"pi-tab-state-{session_id[:12]}",
                 )
-                if not info.get("attachable"):
-                    raise RuntimeError(str(info.get("reason") or "Pi session is not attachable"))
-                if int(info.get("protocol_version") or 0) != 2:
-                    raise RuntimeError(
-                        f"unsupported Pi terminal protocol {info.get('protocol_version')!r}; expected 2"
+            try:
+                if initial_websocket_url is not None:
+                    websocket_url = initial_websocket_url
+                    gateway_websocket_url = None
+                    initial_websocket_url = None
+                else:
+                    info = await _request(
+                        "GET", f"/api/v1/pi/sessions/{quote(session_id, safe='')}/attach-info"
                     )
-                websocket_url = str(
-                    info.get("direct_websocket_url") or info.get("websocket_url") or ""
+                    if not info.get("attachable"):
+                        raise RuntimeError(str(info.get("reason") or "Pi session is not attachable"))
+                    if int(info.get("protocol_version") or 0) != 2:
+                        raise RuntimeError(
+                            f"unsupported Pi terminal protocol {info.get('protocol_version')!r}; expected 2"
+                        )
+                    websocket_url = str(
+                        info.get("direct_websocket_url") or info.get("websocket_url") or ""
+                    )
+                    gateway_websocket_url = str(info.get("gateway_websocket_url") or "") or None
+                direction = await attach_terminal(
+                    websocket_url,
+                    fallback_websocket_url=gateway_websocket_url,
+                    cycle_requests=cycle_requests,
                 )
-                gateway_websocket_url = str(info.get("gateway_websocket_url") or "") or None
-            direction = await attach_terminal(
-                websocket_url,
-                fallback_websocket_url=gateway_websocket_url,
-                cycle_requests=cycle_requests,
-            )
+            finally:
+                if state_watcher is not None:
+                    state_watcher.cancel()
+                    await asyncio.gather(state_watcher, return_exceptions=True)
             if direction is None:
                 return
             if direction == "select":
                 _mark_attach_pane(None)
-                candidates = _attach_candidates(await _request("GET", "/api/v1/pi/sessions"))
-                selected = _pick_session(await _attachable_candidates(candidates))
+                selected = _pick_session(await _attachable_candidates(await _candidate_inventory()))
                 continue
             selected = await _cycle_session(session_id, direction)
     finally:
         _mark_attach_pane(None)
         for signum in installed_signals:
             loop.remove_signal_handler(signum)
+
+
+async def _open_in_zellij(selected: dict, *, loopback: bool = False) -> None:
+    """Focus a plain local Zellij source or open/reuse an attachment tab."""
+
+    from worker_harness.pi_terminal import focus_local_zellij_session
+    from worker_harness.pi_zellij import open_or_focus_attachment_tab
+
+    session_id = str(selected.get("id") or "")
+    if await focus_local_zellij_session(session_id):
+        return
+    await asyncio.to_thread(open_or_focus_attachment_tab, selected, loopback=loopback)
 
 
 @app.command(
@@ -450,8 +573,17 @@ def start(
                         f"([dim]{managed.session_id}[/])"
                     )
                 return
+            selected = {
+                "id": managed.session_id,
+                "name": managed.name,
+                "state": "idle",
+            }
+            from worker_harness.pi_zellij import is_immediate_zellij
+            if is_immediate_zellij():
+                await _open_in_zellij(selected, loopback=True)
+                return
             await _run_attach_loop(
-                {"id": managed.session_id, "name": managed.name},
+                selected,
                 initial_websocket_url=local_relay_websocket_url(managed.session_id),
             )
 
@@ -477,23 +609,50 @@ def attach(
         help="Select the next or previous attachable session relative to TARGET",
         hidden=True,
     ),
+    here: bool = typer.Option(False, "--here", hidden=True),
+    loopback: bool = typer.Option(False, "--loopback", hidden=True),
+    session_name: str | None = typer.Option(None, "--session-name", hidden=True),
+    session_state: str | None = typer.Option(None, "--session-state", hidden=True),
 ):
     """Attach this terminal to a discovered Pi session; press Ctrl-] to detach."""
 
     async def run() -> None:
+        from worker_harness.pi_zellij import is_immediate_zellij
+
         _ = stream  # retained for compatibility with existing shortcuts/scripts
         if relative:
             if relative not in {"next", "previous"} or not target:
                 raise RuntimeError("--relative requires TARGET and either next or previous")
             selected = await _cycle_session(target, relative)
+        elif here and target and session_name is not None:
+            selected = {
+                "id": target,
+                "name": session_name,
+                "state": session_state or "disconnected",
+            }
         else:
-            candidates = _attach_candidates(await _request("GET", "/api/v1/pi/sessions"))
+            candidates = await _candidate_inventory()
             selected = (
                 _resolve_session(candidates, target)
                 if target
                 else _pick_session(await _attachable_candidates(candidates))
             )
-        await _run_attach_loop(selected)
+        if is_immediate_zellij() and not here:
+            await _open_in_zellij(selected)
+            return
+        initial_url: str | None = None
+        if loopback:
+            from worker_harness.pi_runtime import local_relay_websocket_url
+            from worker_harness.pi_terminal import _relay_request
+
+            session_id = str(selected.get("id") or "")
+            await _relay_request({"action": "describe", "session_id": session_id})
+            initial_url = local_relay_websocket_url(session_id)
+        await _run_attach_loop(
+            selected,
+            initial_websocket_url=initial_url,
+            zellij_tab=here and is_immediate_zellij(),
+        )
 
     try:
         asyncio.run(run())

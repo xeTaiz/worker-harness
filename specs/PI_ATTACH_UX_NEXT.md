@@ -1,6 +1,6 @@
 ---
 title: Pi Attach UX Next Slice
-status: planned
+status: implemented-pending-final-user-acceptance
 created: 2026-08-02
 updated: 2026-08-02
 owner: Worker Harness
@@ -32,16 +32,16 @@ This slice must preserve the existing protocol-v2 terminal stream, direct/gatewa
 The following choices are fixed for this slice:
 
 - The Zellij picker runs in a floating pane. Zellij 0.44.2 and the current KDL support `Run { floating true }`; current configuration already uses the same property elsewhere.
-- A streamed attachment owns one single-pane tab named from the selected session. The initial neutral form is `π ◌ <name>`.
+- A streamed attachment owns one single-pane tab named from the selected session. The initial disconnected form is `π ? <name>`.
 - Reopening the same session in the same Zellij session focuses the existing tab by stable tab ID instead of creating a duplicate.
 - `Ctrl-]` ends the child attachment; `new-tab --close-on-exit` closes its one-pane tab and Zellij naturally returns to the previously focused tab.
 - A same-client, plain Zellij-hosted source keeps exact focus of its original pane/tab rather than creating a redundant attachment tab. Managed hidden-tmux, delegated, remote, and cross-multiplexer sources use dedicated tabs.
 - Cycle ordering follows the machine-grouped picker order so picker and next/previous navigation share one model.
 - Error state is sticky through `agent-settled` and clears on the next `agent-start`.
-- State titles use text glyphs first: `π ● <name>` working, `π ○ <name>` idle, `π ✕ <name>` error, and `π ◌ <name>` neutral/disconnected. A stopped Pi exits the child and closes the tab instead of retaining a detached tab.
+- State titles use text glyphs first: `π ● <name>` working, `π ✓ <name>` idle, `π ! <name>` error, and `π ? <name>` disconnected. A stopped Pi exits the child and closes the tab instead of retaining a detached tab.
 - Stock Zellij per-tab background colors are out of scope. They require a custom/forked WASM tab-bar renderer and follow only after the text-title workflow is accepted.
 
-## 3. Commit 1 — P0 inner tmux status-bar regression
+## 3. Commit 1 — P0 inner tmux status-bar regression — implemented
 
 ### 3.1 Reproduction before modification
 
@@ -111,7 +111,7 @@ If instrumentation reveals a different concrete mutation, fix that root cause as
 - An unmanaged tmux source retains its own status configuration.
 - Source Pi survives both attachments and detach paths.
 
-## 4. Commit 2 — floating picker and dedicated/reused Zellij tab
+## 4. Commit 2 — floating picker and dedicated/reused Zellij tab — implemented
 
 ### 4.1 Outer/inner attachment split
 
@@ -130,7 +130,7 @@ Outside Zellij, `wh pi attach` remains in the invoking terminal as today.
 
 ```bash
 zellij action new-tab \
-  --name "π ◌ <session-name>" \
+  --name "π ? <session-name>" \
   --cwd <session-or-picker-cwd> \
   --close-on-exit \
   -- wh pi attach <session-id> --here
@@ -196,7 +196,7 @@ Optionally set an 80% width and 70% height after a live visual check. Keep short
 - `wh pi start` in Zellij uses `--here --loopback` and performs no initial orchestrator attach lookup.
 - Tmux/bare attachment behavior is unchanged.
 
-## 5. Commit 3 — machine-grouped picker
+## 5. Commit 3 — machine-grouped picker — implemented
 
 ### 5.1 Machine identity
 
@@ -207,19 +207,20 @@ Build one session inventory from `/api/v1/pi/sessions` plus a best-effort `/api/
 - global router: dedicated `Global router` group;
 - missing location: `Unknown machine`.
 
-Failure to fetch workers must not block the picker; use IDs as fallback. Compare interactive hosts case-insensitively with `socket.gethostname()` and place the local machine first.
+Failure to fetch workers must not block the picker; use IDs as fallback. Compare interactive hosts case-insensitively with `socket.gethostname()`; order the global router first, the local machine second, remote interactive machines next, and delegated workers last.
 
 ### 5.2 Ordering
 
 Sort candidates by:
 
-1. local-machine group first;
-2. remaining machine labels alphabetically, case-insensitive;
-3. global router last;
-4. within a machine: working before idle, then most recently updated;
-5. deterministic final session-ID tie-break.
+1. global router first;
+2. local-machine group second;
+3. remote interactive machine labels alphabetically, case-insensitive;
+4. delegated worker groups at the bottom, alphabetically by worker name/ID;
+5. within a group: working before idle, then most recently updated;
+6. deterministic final session-ID tie-break.
 
-Use this same ordered inventory for next/previous cycling.
+Use this same ordered inventory for next/previous cycling. In fzf, automatically place the initial cursor on the first local session; pressing Up selects the global entry immediately above it. If there is no local session, keep the first available row selected.
 
 ### 5.3 One-stage fzf presentation
 
@@ -245,15 +246,15 @@ When a query filters out a group's first row, continuation glyphs may remain; th
 - Searching/selection still maps the complete fzf row to the correct session.
 - Next/previous cycles across the exact grouped order and wraps.
 
-## 6. Commit 4 — live plugin-free state glyphs
+## 6. Commit 4 — live plugin-free state glyphs — implemented
 
 ### 6.1 Initial state
 
 Create the tab with the selected projection state:
 
 - `working` → `π ● <name>`;
-- `idle` → `π ○ <name>`;
-- unknown/startup → `π ◌ <name>`.
+- `idle` → `π ✓ <name>`;
+- disconnected/unknown → `π ? <name>`.
 
 ### 6.2 SSE watcher
 
@@ -312,7 +313,7 @@ When an in-tab attachment cycles to another Pi:
 | 8 | `Ctrl-]` in attachment tab | Tab closes and prior tab regains focus; Pi survives |
 | 9 | `wh pi start` inside Zellij | Dedicated tab uses exact local loopback initial attach |
 | 10 | Two differently sized Zellij attachment tabs | Latest resize behavior remains live and source survives |
-| 11 | Picker with at least two machines and a delegated worker | Correct machine groups, local first, searchable by machine |
+| 11 | Picker with global, local, at least two remote machines, and a delegated worker | Global first, initial cursor on first Local with Up→Global, remote below, delegated bottom, searchable by machine |
 | 12 | Next/previous cycling | Follows displayed machine-group order and wraps |
 | 13 | Agent working/settled/error | Tab glyph updates live with sticky-error semantics |
 | 14 | Orchestrator unavailable after local start | Terminal remains usable; glyph watcher retries harmlessly |

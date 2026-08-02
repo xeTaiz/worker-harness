@@ -225,10 +225,10 @@ Recommended defaults:
 ## 13. Rollout
 
 1. **Implemented:** dedicated socket/session manager and pure command construction tests.
-2. **Implemented:** relay environment sanitization for nested tmux; host relay revision 11 removes inherited `TMUX`/`TMUX_PANE` and explicitly configures grouped relay sessions.
+2. **Implemented and hardened in relay revision 12:** nested tmux/Zellij environment sanitization, managed-runtime route metadata, managed-server global `status off`, and fail-closed grouped-session `status off` verification.
 3. **Implemented:** new-session identity/name handling, argv-safe detached window lifecycle, and explicit rejection of resume/continue/fork conflicts.
 4. **Implemented:** exact local UDS route wait plus loopback native attach and `--no-attach`.
-5. **Partially accepted, status gate reopened:** bare-PTY and unrelated-outer-tmux loopback attach/detach/source-survival passed, but the user subsequently observed a second inner status bar after attaching from outer tmux and then in later Zellij attachments. Resolve the P0 in `specs/PI_ATTACH_UX_NEXT.md` before declaring invisible-backend acceptance.
+5. **Revision-12 fix live; final user confirmation pending:** the reopened two-status-bar gate now enforces global and owner `status off` on the managed server plus grouped-session verification in the relay. Live outer-tmux instrumentation showed the outer session `on` while global, `wh-pi`, and active `wh_attach_*` were all `off`; the user should repeat the original visual sequence.
 6. **Pending live matrix:** run remote tmux/Zellij, multi-attach, idle, replacement, and resize acceptance.
 7. Keep plain `pi` documented throughout rollout.
 8. Only after acceptance consider a `pi` shell alias or making the managed launcher the preferred default.

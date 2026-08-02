@@ -159,11 +159,11 @@ The built-in status bar therefore exposes the active input mode and available ke
 
 The stream client accepts dedicated local control bytes for next/previous in addition to the existing SIGUSR path. These bytes are consumed locally and never reach the remote PTY.
 
-`Alt-y/u` and the prefix-mode cycle keys launch a short in-place `wh pi cycle` helper. Zellij exposes the original pane as suppressed while the helper is active. For a streamed pane, a mode-0600 runtime marker maps that original pane to the active `wh` PID and the helper sends the existing SIGUSR direction before exiting; the original stream resumes and reconnects in the same process. For a directly focused local Pi pane, the helper asks host-relay revision 11 to reverse-resolve `(Zellij session, pane)` to the Worker Harness session ID, then attaches the relative target normally. This avoids process-tree guessing, control-byte injection into ordinary Pi, duplicate stream slots, and recursive local Zellij streaming.
+`Alt-y/u` and the prefix-mode cycle keys launch a short in-place `wh pi cycle` helper. Zellij exposes the original pane as suppressed while the helper is active. For a streamed pane, a mode-0600 runtime marker maps that original pane to the active `wh` PID and the helper sends the existing SIGUSR direction before exiting; the original stream resumes and reconnects in the same process. For a directly focused local Pi pane, the helper asks host-relay revision 12 to reverse-resolve `(Zellij session, pane)` to the Worker Harness session ID, then attaches the relative target normally. This avoids process-tree guessing, control-byte injection into ordinary Pi, duplicate stream slots, and recursive local Zellij streaming.
 
-### 7.4 Planned attachment-tab UX
+### 7.4 Attachment-tab UX — implemented; final shortcut/state acceptance pending
 
-The next UX slice is specified in `specs/PI_ATTACH_UX_NEXT.md`: picker bindings move from an in-place suppressed pane to a floating pane; managed/remote/delegated streams open or focus one dedicated `π <state> <name>` tab per session; `Ctrl-]` closes the one-pane attachment tab; plugin-free state glyphs follow durable lifecycle events; and picker rows group by source machine. Same-client plain Zellij sources continue to exact-focus their original pane. Per-tab background colors remain a later WASM tab-bar milestone.
+`specs/PI_ATTACH_UX_NEXT.md` is implemented: picker bindings use a floating pane; managed/remote/delegated streams open or focus one dedicated state-named tab per session (`π ● name` working, `π ✓ name` idle, `π ! name` error, `π ? name` disconnected); `Ctrl-]` closes the one-pane attachment tab; and picker/cycle order is Global, Local, remote interactive machines, then delegated workers. Same-client plain Zellij sources continue to exact-focus their original pane. Per-tab background colors remain a later WASM tab-bar milestone.
 
 ## 8. Files and rollout
 
@@ -177,7 +177,7 @@ Expected implementation files:
 - dotfiles `zellij/.config/zellij/config.kdl`;
 - README and the parent distributed-session spec status.
 
-No orchestrator image, SQLite migration, or worker SIF rebuild is required. Operator hosts require updated dotfiles/CLI, host-relay restart, Pi `/reload`, and a fresh/reloaded Zellij configuration. The live relay is revision 11. It retains stale-`TMPDIR` cleanup for Zellij, removes inherited `TMUX`/`TMUX_PANE` from tmux relay clients, and explicitly enforces `status off` plus `window-size latest` on grouped tmux attachment sessions.
+No orchestrator image, SQLite migration, or worker SIF rebuild is required. Operator hosts require updated dotfiles/CLI, host-relay restart, Pi `/reload`, and a fresh/reloaded Zellij configuration. The live relay is revision 12. It retains environment/TMPDIR hardening, adds managed-runtime route metadata, reinforces the managed server's global `status off`, and fails closed unless each grouped tmux attachment session has `status off` plus `window-size latest`.
 
 ## 9. Implementation slices
 

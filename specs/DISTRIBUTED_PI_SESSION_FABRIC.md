@@ -175,7 +175,7 @@ The tmux implementation is feature-complete. The bridge captures stable tmux soc
 
 The remaining tmux work is rollout and acceptance across all hosts, not new attachment architecture. Attachments created before pane-marker support must be reopened once before cycling.
 
-The Zellij adapter is implemented in Worker Harness `81b411b`, `c5445b0`, and `a9dbe48` plus the companion dotfiles relay/config commits through relay revision 11. It provides exact local-pane focus, remote PTY attachment through a disposable client, initial/dynamic resize, source-safe cleanup, multi-attach behavior, and local/streamed cycling. A full plugin remains optional. The remaining Zellij work is the mixed tmux/Zellij local/remote/delegated live matrix, mixed-size client acceptance, gateway fallback, shortcut acceptance, and a refined return UX after directly focusing an original local pane.
+The Zellij adapter is implemented in Worker Harness `81b411b`, `c5445b0`, and `a9dbe48` plus the attachment-tab UX and companion dotfiles through relay revision 12. It provides exact local-pane focus, remote PTY attachment through a disposable client, initial/dynamic resize, source-safe cleanup, multi-attach behavior, and local/streamed cycling. A full plugin remains optional. The remaining Zellij work is the mixed tmux/Zellij local/remote/delegated live matrix, mixed-size client acceptance, gateway fallback, shortcut acceptance, and a refined return UX after directly focusing an original local pane.
 
 ### 6.2 Terminal protocol
 
@@ -369,7 +369,7 @@ Semantic transcript events share the durable `pi_session_events` log. SQLite ass
 - Direct protocol-v2 terminal relays are implemented for delegated worker sessions and ordinary tmux/Zellij interactive sessions. The native CLI supports attachable-only discovery, exact local-pane focus, remote fullscreen streaming, reliable initial/dynamic sizing, `Ctrl-]`, and cross-agent cycling. Tmux is feature-complete; fleet rollout and a local/remote/delegated cycling matrix remain.
 - Bounded multi-attachment/idle cleanup and the orchestrator gateway are implemented and deployed. Corrected direct-relay live acceptance opened eight draining clients, refreshed one, and proved that the ninth replaced the true longest-idle client with status `replaced` plus close `4410`, kept the count at eight, and preserved the source Pi. Full interactive/delegated/direct/gateway/backpressure acceptance remains.
 - Zellij registration, exact local focus, disposable remote attachment, cap/idle/replacement reuse, recursive-local-stream prevention, and local/streamed cycling are implemented. Isolated exact-client and cap-two tests passed; the mixed tmux/Zellij source/client matrix, mixed-size semantics, gateway fallback, shortcut acceptance, and direct-focus return UX remain.
-- Fresh non-live validation at this revision reports 131 tests plus 2 subtests passing, Python compile and diff checks clean, and the revision-10 Bun relay and active Zellij KDL configuration valid. The global router remains a separate orthogonal milestone.
+- Fresh non-live validation reports 161 tests plus 19 subtests passing, Python compile/diff checks clean, revision-12 Bun relay/bridge builds valid, and the floating-picker Zellij KDL configuration valid. The global router remains a separate orthogonal milestone.
 
 ### M0 — contracts and schema — complete
 
@@ -427,7 +427,7 @@ Sync wait/result behavior, truthful cancellation/timeout handling, direct worker
 
 ### M7 — Zellij adapter — implemented; live acceptance pending
 
-The implementation contract is `specs/ZELLIJ_PI_CLIENT.md`. Zellij registration metadata, exact same-host client focus, multiplexer-neutral relay routes, disposable remote Zellij clients, resize/cleanup, recursive-local-stream prevention, and local/streamed cycling reuse protocol v2 multi-attach and gateway fallback; delegated workers remain tmux-backed. CLI/fzf plus KDL bindings ship without requiring a WASM dashboard. The live host relay is revision 11. Bare-PTY and unrelated-outer-tmux managed-launcher smoke tests passed with loopback attachment, clean detach, source survival, and preserved outer tmux status/session; Zellij and the broader remote/multi-client matrix remain.
+The implementation contract is `specs/ZELLIJ_PI_CLIENT.md` plus `specs/PI_ATTACH_UX_NEXT.md`. Zellij registration metadata, exact same-host client focus, floating machine-grouped picker, dedicated/reused state-named tabs, multiplexer-neutral relay routes, resize/cleanup, recursive-local-stream prevention, and grouped-order cycling reuse protocol v2 multi-attach and gateway fallback; delegated workers remain tmux-backed. The live host relay is revision 12. Managed Zellij tab creation/reuse/close-on-detach and outer-tmux global/owner/grouped status-off invariants passed live; final user shortcut/state-transition confirmation and the broader remote/multi-client matrix remain.
 
 **Gate:** Zellij focuses an existing local Pi pane or opens a remote attachment, then cycles between local/remote/delegated agents with the same behavior as tmux. A second Zellij client must focus the requested pane without moving or terminating the source client.
 
