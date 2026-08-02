@@ -171,16 +171,6 @@ async def _cycle_session(current_session_id: str, direction: str) -> dict:
     return available[0]
 
 
-def _current_multiplexer() -> str:
-    """Return the immediate client multiplexer, preferring nested tmux."""
-
-    if os.environ.get("TMUX"):
-        return "tmux"
-    if os.environ.get("ZELLIJ_SESSION_NAME"):
-        return "zellij"
-    return ""
-
-
 def _zellij_marker_path(session_name: str, pane_id: str) -> Path:
     runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/worker-harness-{os.getuid()}"
     digest = hashlib.sha256(f"{session_name}\0{pane_id}".encode()).hexdigest()
@@ -342,60 +332,39 @@ def _pick_session(rows: list[dict]) -> dict:
     return by_id[session_id]
 
 
-@app.command("attach")
-def attach(
-    target: str | None = typer.Argument(None, help="Session ID, unique ID prefix, or exact session name"),
-    stream: bool = typer.Option(
-        False,
-        "--stream",
-        help="Stream through the relay even when the original pane is in this local tmux server",
-    ),
-    relative: str | None = typer.Option(
-        None,
-        "--relative",
-        help="Select the next or previous attachable session relative to TARGET",
-        hidden=True,
-    ),
-):
-    """Attach this terminal to a discovered Pi session; press Ctrl-] to detach."""
+async def _run_attach_loop(
+    selected: dict,
+    *,
+    initial_websocket_url: str | None = None,
+) -> None:
+    """Run the native attachment/cycling loop for one selected session."""
 
-    async def run() -> None:
-        from worker_harness.pi_terminal import attach_terminal, focus_local_session
+    from worker_harness.pi_terminal import attach_terminal, focus_local_zellij_session
 
-        if relative:
-            if relative not in {"next", "previous"} or not target:
-                raise RuntimeError("--relative requires TARGET and either next or previous")
-            selected = await _cycle_session(target, relative)
-        else:
-            candidates = _attach_candidates(await _request("GET", "/api/v1/pi/sessions"))
-            selected = (
-                _resolve_session(candidates, target)
-                if target
-                else _pick_session(await _attachable_candidates(candidates))
-            )
-        cycle_requests: asyncio.Queue[str] = asyncio.Queue()
-        loop = asyncio.get_running_loop()
-        installed_signals: list[signal.Signals] = []
-        for signum, direction in ((signal.SIGUSR1, "next"), (signal.SIGUSR2, "previous")):
-            try:
-                loop.add_signal_handler(signum, cycle_requests.put_nowait, direction)
-                installed_signals.append(signum)
-            except (NotImplementedError, RuntimeError):
-                pass
-
+    cycle_requests: asyncio.Queue[str] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    installed_signals: list[signal.Signals] = []
+    for signum, direction in ((signal.SIGUSR1, "next"), (signal.SIGUSR2, "previous")):
         try:
-            while True:
-                session_id = str(selected.get("id") or "")
-                _mark_attach_pane(session_id)
-                # Streaming a local Zellij session back into a pane of the same
-                # Zellij client recursively renders the multiplexer inside
-                # itself. Always use exact local focus for Zellij; `--stream`
-                # remains authoritative for tmux and all remote targets.
-                if (
-                    (not stream or _current_multiplexer() == "zellij")
-                    and await focus_local_session(session_id)
-                ):
-                    return
+            loop.add_signal_handler(signum, cycle_requests.put_nowait, direction)
+            installed_signals.append(signum)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    try:
+        while True:
+            session_id = str(selected.get("id") or "")
+            _mark_attach_pane(session_id)
+            # A Zellij source in this same immediate Zellij client must be
+            # focused directly to avoid recursively rendering that client.
+            # Tmux sources always stream, including on their source host.
+            if await focus_local_zellij_session(session_id):
+                return
+            if initial_websocket_url is not None:
+                websocket_url = initial_websocket_url
+                gateway_websocket_url = None
+                initial_websocket_url = None
+            else:
                 info = await _request(
                     "GET", f"/api/v1/pi/sessions/{quote(session_id, safe='')}/attach-info"
                 )
@@ -409,25 +378,122 @@ def attach(
                     info.get("direct_websocket_url") or info.get("websocket_url") or ""
                 )
                 gateway_websocket_url = str(info.get("gateway_websocket_url") or "") or None
-                direction = await attach_terminal(
-                    websocket_url,
-                    fallback_websocket_url=gateway_websocket_url,
-                    cycle_requests=cycle_requests,
-                )
-                if direction is None:
-                    return
-                if direction == "select":
-                    _mark_attach_pane(None)
-                    candidates = _attach_candidates(
-                        await _request("GET", "/api/v1/pi/sessions")
+            direction = await attach_terminal(
+                websocket_url,
+                fallback_websocket_url=gateway_websocket_url,
+                cycle_requests=cycle_requests,
+            )
+            if direction is None:
+                return
+            if direction == "select":
+                _mark_attach_pane(None)
+                candidates = _attach_candidates(await _request("GET", "/api/v1/pi/sessions"))
+                selected = _pick_session(await _attachable_candidates(candidates))
+                continue
+            selected = await _cycle_session(session_id, direction)
+    finally:
+        _mark_attach_pane(None)
+        for signum in installed_signals:
+            loop.remove_signal_handler(signum)
+
+
+@app.command(
+    "start",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def start(
+    ctx: typer.Context,
+    name: str | None = typer.Option(None, "--name", "-n", help="Human-facing Pi session name"),
+    attach_after_start: bool = typer.Option(
+        True,
+        "--attach/--no-attach",
+        help="Attach this terminal after the managed Pi route is ready",
+    ),
+    timeout: float = typer.Option(
+        10.0,
+        "--timeout",
+        min=0.1,
+        help="Seconds to wait for the local Pi terminal route",
+    ),
+):
+    """Start a new Pi in the hidden managed tmux backend."""
+
+    from worker_harness.pi_runtime import (
+        local_relay_websocket_url,
+        start_managed_pi,
+        wait_for_managed_route,
+    )
+
+    try:
+        size = shutil.get_terminal_size(fallback=(80, 24))
+        managed = start_managed_pi(
+            name=name,
+            pi_args=list(ctx.args),
+            rows=size.lines,
+            cols=size.columns,
+        )
+
+        async def run() -> None:
+            await wait_for_managed_route(managed, timeout=timeout)
+            if not attach_after_start:
+                result = {
+                    "session_id": managed.session_id,
+                    "name": managed.name,
+                    "tmux_socket": str(managed.tmux_socket),
+                    "tmux_pane_id": managed.tmux_pane_id,
+                }
+                if _output_mode() == "json":
+                    console.print(json.dumps(result, indent=2))
+                else:
+                    console.print(
+                        f"[green]Started Pi[/] {managed.name} "
+                        f"([dim]{managed.session_id}[/])"
                     )
-                    selected = _pick_session(await _attachable_candidates(candidates))
-                    continue
-                selected = await _cycle_session(session_id, direction)
-        finally:
-            _mark_attach_pane(None)
-            for signum in installed_signals:
-                loop.remove_signal_handler(signum)
+                return
+            await _run_attach_loop(
+                {"id": managed.session_id, "name": managed.name},
+                initial_websocket_url=local_relay_websocket_url(managed.session_id),
+            )
+
+        asyncio.run(run())
+    except typer.Abort:
+        raise
+    except (RuntimeError, KeyboardInterrupt) as exc:
+        console.print(f"[red]{exc or 'Pi startup interrupted'}[/]")
+        raise typer.Exit(1) from exc
+
+
+@app.command("attach")
+def attach(
+    target: str | None = typer.Argument(None, help="Session ID, unique ID prefix, or exact session name"),
+    stream: bool = typer.Option(
+        False,
+        "--stream",
+        help="Compatibility flag; tmux sessions always stream",
+    ),
+    relative: str | None = typer.Option(
+        None,
+        "--relative",
+        help="Select the next or previous attachable session relative to TARGET",
+        hidden=True,
+    ),
+):
+    """Attach this terminal to a discovered Pi session; press Ctrl-] to detach."""
+
+    async def run() -> None:
+        _ = stream  # retained for compatibility with existing shortcuts/scripts
+        if relative:
+            if relative not in {"next", "previous"} or not target:
+                raise RuntimeError("--relative requires TARGET and either next or previous")
+            selected = await _cycle_session(target, relative)
+        else:
+            candidates = _attach_candidates(await _request("GET", "/api/v1/pi/sessions"))
+            selected = (
+                _resolve_session(candidates, target)
+                if target
+                else _pick_session(await _attachable_candidates(candidates))
+            )
+        await _run_attach_loop(selected)
 
     try:
         asyncio.run(run())

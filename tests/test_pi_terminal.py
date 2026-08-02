@@ -168,46 +168,24 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "already attached"):
             await pi_terminal._receive_output(websocket, 1)
 
-    async def test_focus_local_session_switches_exact_registered_pane(self):
+    async def test_local_tmux_client_never_uses_direct_focus(self):
         route = {
             "ok": True,
+            "multiplexer": "tmux",
             "tmux_socket": "/tmp/tmux-test/default",
             "tmux_session": "work",
             "window_index": "3",
             "pane_index": "2",
         }
-        completed = subprocess.CompletedProcess([], 0, "", "")
+        relay = AsyncMock(return_value=route)
         with (
-            patch.dict(os.environ, {"TMUX": "/tmp/tmux-test/default,123,0"}),
-            patch.object(pi_terminal, "_relay_request", new=AsyncMock(return_value=route)),
-            patch.object(pi_terminal.subprocess, "run", return_value=completed) as run,
-        ):
-            focused = await pi_terminal.focus_local_session("session-1")
-        self.assertTrue(focused)
-        self.assertEqual(run.call_args.args[0], [
-            "tmux", "-S", "/tmp/tmux-test/default",
-            "set-option", "-p", "-t", "work:3.2", "@wh_pi_attach_session", "session-1", ";",
-            "set-option", "-p", "-t", "work:3.2", "@wh_pi_attach_mode", "local", ";",
-            "switch-client", "-t", "work:3.2", ";",
-            "select-pane", "-t", "work:3.2",
-        ])
-
-    async def test_focus_local_session_ignores_different_tmux_server(self):
-        route = {
-            "ok": True,
-            "multiplexer": "tmux",
-            "tmux_socket": "/tmp/other/default",
-            "tmux_session": "work",
-            "window_index": "1",
-            "pane_index": "1",
-        }
-        with (
-            patch.dict(os.environ, {"TMUX": "/tmp/current/default,123,0"}, clear=True),
-            patch.object(pi_terminal, "_relay_request", new=AsyncMock(return_value=route)),
+            patch.dict(os.environ, {"TMUX": "/tmp/tmux-test/default,123,0"}, clear=True),
+            patch.object(pi_terminal, "_relay_request", new=relay),
             patch.object(pi_terminal.subprocess, "run") as run,
         ):
-            focused = await pi_terminal.focus_local_session("session-1")
+            focused = await pi_terminal.focus_local_zellij_session("session-1")
         self.assertFalse(focused)
+        relay.assert_not_awaited()
         run.assert_not_called()
 
     async def test_focus_local_zellij_pane_in_current_session(self):
@@ -223,7 +201,7 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
             patch.object(pi_terminal, "_relay_request", new=AsyncMock(return_value=route)),
             patch.object(pi_terminal.subprocess, "run", return_value=completed) as run,
         ):
-            focused = await pi_terminal.focus_local_session("session-1")
+            focused = await pi_terminal.focus_local_zellij_session("session-1")
         self.assertTrue(focused)
         self.assertEqual(
             run.call_args.args[0],
@@ -243,7 +221,7 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
             patch.object(pi_terminal, "_relay_request", new=AsyncMock(return_value=route)),
             patch.object(pi_terminal.subprocess, "run", return_value=completed) as run,
         ):
-            focused = await pi_terminal.focus_local_session("session-1")
+            focused = await pi_terminal.focus_local_zellij_session("session-1")
         self.assertTrue(focused)
         self.assertEqual(
             run.call_args.args[0],
@@ -253,7 +231,7 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_focus_local_session_streams_across_multiplexers(self):
+    async def test_local_zellij_focus_streams_across_multiplexers(self):
         route = {
             "ok": True,
             "multiplexer": "zellij",
@@ -268,7 +246,7 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
             patch.object(pi_terminal, "_relay_request", new=AsyncMock(return_value=route)),
             patch.object(pi_terminal.subprocess, "run") as run,
         ):
-            focused = await pi_terminal.focus_local_session("session-1")
+            focused = await pi_terminal.focus_local_zellij_session("session-1")
         self.assertFalse(focused)
         run.assert_not_called()
 

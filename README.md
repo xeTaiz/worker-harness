@@ -49,22 +49,27 @@ pick a session:
 
 ```bash
 uv tool install --editable ~/Dev/worker-harness
+wh pi start --name research          # new Pi in the hidden managed tmux backend
 wh pi attach                         # interactive fzf picker
 wh pi attach <id-prefix-or-name>     # select directly
 ```
 
-Press `Ctrl-]` to detach. When invoked from the same source multiplexer, the
-client switches directly to the exact original pane (`tmux` socket/pane or
-Zellij session/pane); remote, delegated, and cross-multiplexer sessions stream
-their raw PTY into the current terminal. Pass `--stream` to force the relay path
-even for a local pane.
+`wh pi start` generates the internal Pi session ID, creates one single-pane
+window in a dedicated status-free tmux server, waits for its exact local route,
+and attaches over loopback; `--name` is only the human-facing label. Press
+`Ctrl-]` to detach without stopping Pi. Tmux sources always stream through a
+disposable relay client, including on the source host, so an unrelated outer
+tmux keeps its own status and navigation. A same-client local Zellij source is
+the sole direct-focus exception because streaming it recursively would render
+Zellij inside itself. Remote clients prefer the direct Tailnet relay and fall
+back to the orchestrator gateway. `--stream` remains as a compatibility no-op.
 
 The companion tmux dotfiles reserve `Ctrl-a` as a Worker Harness prefix while
 leaving tmux's normal `Ctrl-b` prefix unchanged: `Ctrl-a Ctrl-a` opens the
 picker, `Ctrl-a Ctrl-j/Ctrl-l` cycles next, `Ctrl-a Ctrl-h/Ctrl-k` cycles
 previous, and `Ctrl-a x` detaches. Zellij provides both a direct `Alt-a` picker
 (which focuses local Zellij panes when possible) and a prefix-mode streaming
-cycler: `Ctrl-a Ctrl-a` opens `wh pi attach --stream`, the same Ctrl-j/l and
+cycler: `Ctrl-a Ctrl-a` opens `wh pi attach`, the same Ctrl-j/l and
 Ctrl-h/k pairs cycle, and `Ctrl-a x` detaches a stream. `Alt-u` cycles next and
 `Alt-y` cycles previous directly from either an original local Pi pane or a
 streamed attachment. Inside a native stream, `Ctrl-^` and `Ctrl-_` are additional

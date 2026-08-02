@@ -26,7 +26,7 @@ This is a client/host-relay milestone. It must not introduce a second registry, 
 
 1. **Delegated workers stay on tmux.** A Zellij operator pane runs `wh pi attach` and renders the worker relay's disposable tmux client. No worker runtime conversion is required.
 2. **Source and client multiplexers are independent.** A tmux client attaching to a Zellij-hosted Pi, or a Zellij client attaching to a tmux-hosted Pi, uses terminal streaming.
-3. **Direct local focus is same-multiplexer only.** Tmux keeps socket/pane switching. Zellij uses its client-aware pane actions.
+3. **Direct local focus is Zellij-only.** All tmux sources stream through a disposable relay client, including on the source host. Zellij retains client-aware pane actions only to prevent recursive same-client rendering.
 4. **Zellij 0.44.2 is the initial compatibility floor.** The adapter relies on `ZELLIJ_SESSION_NAME`, `ZELLIJ_PANE_ID`, `zellij action list-panes --json --all`, `focus-pane-id`, `switch-session --pane-id`, and `list-clients`.
 5. **No WASM plugin in v1.** The existing native CLI/fzf picker plus KDL bindings are sufficient. A custom dashboard/status-bar plugin is optional follow-up work.
 6. **Protocol v2 is unchanged.** Direct/gateway framing, close codes, capacity eight, one-hour idle timeout, and longest-idle replacement remain authoritative.
@@ -37,7 +37,7 @@ This is a client/host-relay milestone. It must not introduce a second registry, 
 | Source Pi | Operator client | Path |
 |---|---|---|
 | delegated tmux worker | Zellij | direct relay, gateway fallback |
-| interactive tmux, same tmux server | tmux | exact local pane focus |
+| interactive tmux, same or remote tmux server | tmux | host-relay stream |
 | interactive tmux | Zellij or remote tmux | host-relay stream |
 | interactive Zellij, same Zellij host | Zellij | exact client-local session/pane focus |
 | interactive Zellij | tmux or remote Zellij | host-relay stream through a disposable Zellij client |
@@ -116,13 +116,13 @@ If exact client targeting cannot be confirmed within a bounded startup timeout, 
 
 ## 6. Native CLI behavior
 
-`focus_local_session()` becomes multiplexer-aware:
+`focus_local_zellij_session()` is intentionally narrow:
 
-- tmux route + matching current tmux socket: existing exact switch;
-- Zellij route + current Zellij client:
+- any tmux route: return false so the ordinary direct/gateway streaming path runs;
+- Zellij route + current immediate Zellij client:
   - same session: `zellij action focus-pane-id terminal_N`;
   - different session: `zellij action switch-session SESSION --pane-id terminal_N`;
-- cross-multiplexer: return false so the ordinary direct/gateway streaming path runs.
+- nested tmux or any cross-multiplexer client: return false and stream.
 
 Picker ordering, attach-info, raw terminal mode, direct-first/gateway fallback, close-code handling, and cycle ordering remain shared.
 
@@ -146,7 +146,7 @@ Initial collision-free defaults:
 
 `Ctrl-a` enters Zellij's existing prefix-like `tmux` input mode, while the existing `Ctrl-b` entry remains available. Add:
 
-- `Ctrl-a Ctrl-a`: open the picker with `--stream`; local Zellij targets are still exact-focused instead of recursively streaming the same Zellij session;
+- `Ctrl-a Ctrl-a`: open the picker; local Zellij targets are still exact-focused instead of recursively streaming the same Zellij session;
 - `Ctrl-a Ctrl-j` / `Ctrl-a Ctrl-l`: next;
 - `Ctrl-a Ctrl-h` / `Ctrl-a Ctrl-k`: previous;
 - `Ctrl-a x`: detach a native stream.
@@ -159,7 +159,7 @@ The built-in status bar therefore exposes the active input mode and available ke
 
 The stream client accepts dedicated local control bytes for next/previous in addition to the existing SIGUSR path. These bytes are consumed locally and never reach the remote PTY.
 
-`Alt-y/u` and the prefix-mode cycle keys launch a short in-place `wh pi cycle` helper. Zellij exposes the original pane as suppressed while the helper is active. For a streamed pane, a mode-0600 runtime marker maps that original pane to the active `wh` PID and the helper sends the existing SIGUSR direction before exiting; the original stream resumes and reconnects in the same process. For a directly focused local Pi pane, the helper asks host-relay revision 10 to reverse-resolve `(Zellij session, pane)` to the Worker Harness session ID, then attaches the relative target normally. This avoids process-tree guessing, control-byte injection into ordinary Pi, duplicate stream slots, and recursive local Zellij streaming.
+`Alt-y/u` and the prefix-mode cycle keys launch a short in-place `wh pi cycle` helper. Zellij exposes the original pane as suppressed while the helper is active. For a streamed pane, a mode-0600 runtime marker maps that original pane to the active `wh` PID and the helper sends the existing SIGUSR direction before exiting; the original stream resumes and reconnects in the same process. For a directly focused local Pi pane, the helper asks host-relay revision 11 to reverse-resolve `(Zellij session, pane)` to the Worker Harness session ID, then attaches the relative target normally. This avoids process-tree guessing, control-byte injection into ordinary Pi, duplicate stream slots, and recursive local Zellij streaming.
 
 ## 8. Files and rollout
 
@@ -173,7 +173,7 @@ Expected implementation files:
 - dotfiles `zellij/.config/zellij/config.kdl`;
 - README and the parent distributed-session spec status.
 
-No orchestrator image, SQLite migration, or worker SIF rebuild is required. Operator hosts require updated dotfiles/CLI, host-relay restart, Pi `/reload`, and a fresh/reloaded Zellij configuration. The current live relay is revision 10; it additionally removes stale inherited `TMPDIR` values before spawning Zellij so a long-lived relay cannot fail after a temporary launch directory disappears.
+No orchestrator image, SQLite migration, or worker SIF rebuild is required. Operator hosts require updated dotfiles/CLI, host-relay restart, Pi `/reload`, and a fresh/reloaded Zellij configuration. The live relay is revision 11. It retains stale-`TMPDIR` cleanup for Zellij, removes inherited `TMUX`/`TMUX_PANE` from tmux relay clients, and explicitly enforces `status off` plus `window-size latest` on grouped tmux attachment sessions.
 
 ## 9. Implementation slices
 
@@ -190,7 +190,7 @@ No orchestrator image, SQLite migration, or worker SIF rebuild is required. Oper
 - add Zellij locator discovery/registration;
 - add relay route union, liveness, describe, and re-key cleanup;
 - add Python local-focus adapter;
-- preserve tmux compatibility tests.
+- preserve tmux streaming compatibility tests; remove obsolete same-server `switch-client` coverage.
 
 ### Z3 — remote Zellij attachment — completed in code; isolated live smoke passed
 

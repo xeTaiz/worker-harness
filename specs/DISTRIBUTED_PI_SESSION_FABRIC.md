@@ -169,13 +169,13 @@ pi.sendUserMessage(message, { deliverAs: "steer" | "followUp" })
 
 The operator continues to run plain `pi` inside tmux or Zellij; no mandatory `wh pi start` wrapper is introduced.
 
-An optional managed-launcher proposal is specified in `specs/HIDDEN_TMUX_PI_RUNTIME.md`: `wh pi start` would run interactive Pi in a dedicated, invisible tmux server (one Pi per single-pane window, status off, `window-size latest`) and present it through the ordinary native attachment client inside Zellij, an unrelated outer tmux, or a bare terminal. It remains proposed until nested-environment sanitization, resume semantics, local loopback attach, and live acceptance land; plain Pi compatibility remains authoritative throughout rollout.
+The managed launcher in `specs/HIDDEN_TMUX_PI_RUNTIME.md` is implemented pending the live matrix: `wh pi start` runs a new interactive Pi in a dedicated, invisible tmux server (one Pi per single-pane window, status off, `window-size latest`) and presents it through the ordinary native attachment client inside Zellij, an unrelated outer tmux, or a bare terminal. It generates the private session ID, uses `--name` only as the human label, waits for the exact local UDS route, and attaches over loopback. Resume/continue/fork remain explicitly rejected in v1; plain Pi compatibility remains authoritative throughout rollout.
 
-The tmux implementation is feature-complete. The bridge captures stable tmux socket and pane identity, and the host relay resolves mutable session/window/pane indices. `wh pi attach` switches directly to the original pane when it belongs to the invoking tmux server; otherwise it starts a disposable linked tmux client in a PTY and streams it through the relay. Native attachment supports fullscreen rendering, upgrade-time dimensions, resize polling, raw input/output, `Ctrl-]` detach, and agent cycling across local and remote sessions. The companion dotfiles reserve `Ctrl-a` as a Worker Harness prefix while leaving tmux's normal prefix unchanged.
+The tmux implementation is feature-complete. The bridge captures stable tmux socket and pane identity, and the host relay resolves mutable session/window/pane indices. All tmux sources now start a disposable linked tmux client in a PTY and stream through the relay, including on the source host; the obsolete same-server `switch-client` path has been removed. Native attachment supports fullscreen rendering, upgrade-time dimensions, resize polling, raw input/output, `Ctrl-]` detach, and agent cycling across local and remote sessions. The companion dotfiles reserve `Ctrl-a` as a Worker Harness prefix while leaving tmux's normal prefix unchanged.
 
 The remaining tmux work is rollout and acceptance across all hosts, not new attachment architecture. Attachments created before pane-marker support must be reopened once before cycling.
 
-The Zellij adapter is implemented in Worker Harness `81b411b`, `c5445b0`, and `a9dbe48` plus the companion dotfiles relay/config commits through relay revision 10. It provides exact local-pane focus, remote PTY attachment through a disposable client, initial/dynamic resize, source-safe cleanup, multi-attach behavior, and local/streamed cycling. A full plugin remains optional. The remaining Zellij work is the mixed tmux/Zellij local/remote/delegated live matrix, mixed-size client acceptance, gateway fallback, shortcut acceptance, and a refined return UX after directly focusing an original local pane.
+The Zellij adapter is implemented in Worker Harness `81b411b`, `c5445b0`, and `a9dbe48` plus the companion dotfiles relay/config commits through relay revision 11. It provides exact local-pane focus, remote PTY attachment through a disposable client, initial/dynamic resize, source-safe cleanup, multi-attach behavior, and local/streamed cycling. A full plugin remains optional. The remaining Zellij work is the mixed tmux/Zellij local/remote/delegated live matrix, mixed-size client acceptance, gateway fallback, shortcut acceptance, and a refined return UX after directly focusing an original local pane.
 
 ### 6.2 Terminal protocol
 
@@ -391,7 +391,7 @@ Implement direct bridge registration/liveness/event upload, session list/events 
 
 ### M3a — tmux relay and direct attach — feature-complete
 
-The host relay, native terminal client, direct local focus, remote PTY stream, fullscreen sizing, resize, detach, and cross-agent cycling are implemented.
+The host relay, native terminal client, Zellij-only direct local focus, universal tmux PTY streaming, fullscreen sizing, resize, detach, and cross-agent cycling are implemented.
 
 **Remaining gate:** deploy current Worker Harness/dotfiles to every operator and interactive host; validate local→local, local→remote, remote→local, and delegated cycling plus reconnect and clean detach.
 
@@ -427,7 +427,7 @@ Sync wait/result behavior, truthful cancellation/timeout handling, direct worker
 
 ### M7 — Zellij adapter — implemented; live acceptance pending
 
-The implementation contract is `specs/ZELLIJ_PI_CLIENT.md`. Zellij registration metadata, exact same-host client focus, multiplexer-neutral relay routes, disposable remote Zellij clients, resize/cleanup, recursive-local-stream prevention, and local/streamed cycling reuse protocol v2 multi-attach and gateway fallback; delegated workers remain tmux-backed. CLI/fzf plus KDL bindings ship without requiring a WASM dashboard. The live host relay is revision 10.
+The implementation contract is `specs/ZELLIJ_PI_CLIENT.md`. Zellij registration metadata, exact same-host client focus, multiplexer-neutral relay routes, disposable remote Zellij clients, resize/cleanup, recursive-local-stream prevention, and local/streamed cycling reuse protocol v2 multi-attach and gateway fallback; delegated workers remain tmux-backed. CLI/fzf plus KDL bindings ship without requiring a WASM dashboard. The live host relay is revision 11. Bare-PTY and unrelated-outer-tmux managed-launcher smoke tests passed with loopback attachment, clean detach, source survival, and preserved outer tmux status/session; Zellij and the broader remote/multi-client matrix remain.
 
 **Gate:** Zellij focuses an existing local Pi pane or opens a remote attachment, then cycles between local/remote/delegated agents with the same behavior as tmux. A second Zellij client must focus the requested pane without moving or terminating the source client.
 

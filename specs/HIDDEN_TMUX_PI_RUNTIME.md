@@ -1,6 +1,6 @@
 ---
 title: Hidden tmux Pi Runtime and wh pi start
-status: proposed
+status: implemented-pending-live-acceptance
 created: 2026-08-02
 updated: 2026-08-02
 owner: Worker Harness
@@ -56,7 +56,7 @@ Remote client
     -> exact Pi window/pane
 ```
 
-The outer tmux and hidden tmux are truly nested only in the terminal data path. They are different servers/sockets. Because the route socket differs from the outer client's `TMUX` socket, existing same-server `switch-client` optimization does not fire; the managed Pi is streamed into the current outer pane. This preserves the outer status bar and makes outer tmux, Zellij, and a bare terminal follow the same attachment UX.
+The outer tmux and hidden tmux are truly nested only in the terminal data path. They are different servers/sockets. Tmux direct-focus/`switch-client` support has been removed, so the managed Pi is streamed into the current outer pane regardless of socket identity. This preserves the outer status bar and makes outer tmux, Zellij, and a bare terminal follow the same attachment UX.
 
 ## 4. Identity: generated ID plus optional human name
 
@@ -122,17 +122,17 @@ A bounded startup wait must show a clear `Starting Pi…` state. Normal local re
 
 ### 6.2 Invocation from the managed backend itself
 
-This is not a primary operator path. If a client is already attached to the same managed tmux socket, exact `switch-client` remains legal, but no UX depends on it.
+This is not a primary operator path. Tmux direct-focus/`switch-client` logic has been removed from the native client; even a client on the managed socket uses the ordinary terminal stream. This keeps attachment, detach, cycling, replacement, and sizing behavior uniform and prevents backend tmux state from becoming operator UI.
 
 ### 6.3 Existing unmanaged local sessions
 
-`wh pi attach` keeps its current behavior:
+`wh pi attach` now uses:
 
-- same tmux server -> exact `switch-client`;
-- same Zellij host/session -> exact client-local focus;
+- any tmux source, including the same tmux server -> native stream;
+- same immediate Zellij client -> exact client-local focus to prevent recursive rendering;
 - cross-host or cross-multiplexer -> native stream.
 
-The managed launcher does not remove compatibility with existing plain Pi sessions.
+The managed launcher does not remove compatibility with existing plain Pi sessions, but unmanaged tmux Pi panes no longer receive a direct `switch-client` optimization.
 
 ## 7. Resize behavior
 
@@ -224,20 +224,18 @@ Recommended defaults:
 
 ## 13. Rollout
 
-1. Implement the dedicated socket/session manager and pure command construction tests.
-2. Harden relay environment sanitization for nested tmux.
-3. Implement new-session identity/name handling and detached window lifecycle.
-4. Implement exact local UDS route wait plus loopback native attach.
-5. Validate Zellij, outer tmux, and bare-terminal start paths in isolation.
-6. Run remote tmux/Zellij, multi-attach, idle, replacement, and resize acceptance.
+1. **Implemented:** dedicated socket/session manager and pure command construction tests.
+2. **Implemented:** relay environment sanitization for nested tmux; host relay revision 11 removes inherited `TMUX`/`TMUX_PANE` and explicitly configures grouped relay sessions.
+3. **Implemented:** new-session identity/name handling, argv-safe detached window lifecycle, and explicit rejection of resume/continue/fork conflicts.
+4. **Implemented:** exact local UDS route wait plus loopback native attach and `--no-attach`.
+5. **Partially accepted live:** bare-PTY and unrelated-outer-tmux starts attached over loopback, detached cleanly, preserved the hidden Pi source, and left the outer tmux session/status intact; Zellij remains pending.
+6. **Pending live matrix:** run remote tmux/Zellij, multi-attach, idle, replacement, and resize acceptance.
 7. Keep plain `pi` documented throughout rollout.
 8. Only after acceptance consider a `pi` shell alias or making the managed launcher the preferred default.
 
 ## 14. Open decisions
 
-- Exact managed socket path and owner session naming across Linux/macOS runtime-directory conventions.
-- Real Pi executable resolution and recursion-proof alias behavior.
-- Resume/continue/fork mapping and whether v1 intentionally supports new sessions only.
-- Whether `--no-attach` waits for local route only or also orchestrator registration.
+- Portability validation for the selected `$XDG_RUNTIME_DIR/worker-harness/pi-tmux.sock` path and `wh-pi` owner session on macOS.
+- Resume/continue/fork mapping; v1 intentionally supports new sessions only and rejects conflicting flags.
 - Garbage collection for dead windows/session metadata after abnormal Pi exits.
-- Whether local loopback attach is implemented inside `wh pi start` only or generalized to all same-host cross-multiplexer `wh pi attach` calls.
+- Whether the implemented `wh pi start` loopback optimization should later be generalized to ordinary same-host `wh pi attach` calls.

@@ -51,65 +51,34 @@ async def _relay_request(payload: dict[str, Any]) -> dict[str, Any]:
         await writer.wait_closed()
 
 
-async def focus_local_session(session_id: str) -> bool:
-    """Focus an exact local tmux or Zellij pane for the invoking client."""
+async def focus_local_zellij_session(session_id: str) -> bool:
+    """Focus an exact local Zellij pane without recursively streaming Zellij."""
 
     current_tmux = os.environ.get("TMUX", "").split(",", 1)[0]
     current_zellij = os.environ.get("ZELLIJ_SESSION_NAME", "")
-    if not current_tmux and not current_zellij:
+    # Tmux nested inside Zellij is an immediate tmux client. Never switch its
+    # outer Zellij client; every tmux source now uses the terminal relay.
+    if current_tmux or not current_zellij:
         return False
     try:
         route = await _relay_request({"action": "describe", "session_id": session_id})
     except (OSError, asyncio.TimeoutError, RuntimeError, json.JSONDecodeError):
         return False
-
-    multiplexer = str(route.get("multiplexer") or ("tmux" if route.get("tmux_socket") else ""))
-    if multiplexer == "zellij":
-        # Tmux nested inside Zellij is still a tmux client. Switching the outer
-        # Zellij client would violate cross-multiplexer streaming semantics.
-        if current_tmux or not current_zellij:
-            return False
-        target_session = str(route.get("zellij_session_name") or "")
-        target_pane = str(route.get("zellij_pane_id") or "")
-        if not target_session or not target_pane.startswith("terminal_"):
-            return False
-        command = ["zellij", "action"]
-        if target_session == current_zellij:
-            command.extend(["focus-pane-id", target_pane])
-        else:
-            command.extend([
-                "switch-session", target_session, "--pane-id", target_pane,
-            ])
-        result = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"could not focus local Zellij pane: {result.stderr.strip()}")
-        return True
-
-    if multiplexer != "tmux" or not current_tmux:
+    if str(route.get("multiplexer") or "") != "zellij":
         return False
-    route_socket = str(route.get("tmux_socket") or "")
-    if not route_socket or os.path.realpath(route_socket) != os.path.realpath(current_tmux):
+    target_session = str(route.get("zellij_session_name") or "")
+    target_pane = str(route.get("zellij_pane_id") or "")
+    if not target_session or not target_pane.startswith("terminal_"):
         return False
-    target = (
-        f"{route.get('tmux_session')}:{route.get('window_index')}"
-        f".{route.get('pane_index')}"
-    )
+    command = ["zellij", "action"]
+    if target_session == current_zellij:
+        command.extend(["focus-pane-id", target_pane])
+    else:
+        command.extend([
+            "switch-session", target_session, "--pane-id", target_pane,
+        ])
     result = subprocess.run(
-        [
-            "tmux", "-S", route_socket,
-            "set-option", "-p", "-t", target, "@wh_pi_attach_session", session_id, ";",
-            "set-option", "-p", "-t", target, "@wh_pi_attach_mode", "local", ";",
-            "switch-client", "-t", target, ";",
-            "select-pane", "-t", target,
-        ],
+        command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -118,7 +87,7 @@ async def focus_local_session(session_id: str) -> bool:
         check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"could not focus local tmux pane: {result.stderr.strip()}")
+        raise RuntimeError(f"could not focus local Zellij pane: {result.stderr.strip()}")
     return True
 
 
