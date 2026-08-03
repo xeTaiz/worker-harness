@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import os
@@ -24,7 +25,7 @@ app = typer.Typer(help="Inspect and message registered Pi sessions")
 console = Console()
 
 _ACTIVE_STATES = {"working", "idle"}
-_PICKER_MACHINE_WIDTH = 24
+_PICKER_CONTEXT_WIDTH = 28
 _PICKER_NAME_WIDTH = 16
 _PICKER_TYPE = {
     "interactive": "I",
@@ -32,6 +33,73 @@ _PICKER_TYPE = {
     "global-router": "G",
 }
 _PICKER_TEXT_TRANSLATION = str.maketrans({"\t": " ", "\n": " ", "\r": " "})
+
+
+def _parse_tailnet_dns_labels(status: dict) -> dict[str, str]:
+    """Map Tailnet IPs to their short MagicDNS labels."""
+
+    current_tailnet = status.get("CurrentTailnet")
+    suffix = str(status.get("MagicDNSSuffix") or (
+        current_tailnet.get("MagicDNSSuffix")
+        if isinstance(current_tailnet, dict)
+        else ""
+    ) or "").strip(".")
+    peers = status.get("Peer")
+    nodes = [status.get("Self")]
+    if isinstance(peers, dict):
+        nodes.extend(peers.values())
+    labels: dict[str, str] = {}
+    host_priorities: dict[str, int] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        dns_name = str(node.get("DNSName") or "").strip().rstrip(".")
+        if not dns_name:
+            continue
+        suffix_marker = f".{suffix}" if suffix else ""
+        short = (
+            dns_name[: -len(suffix_marker)]
+            if suffix_marker and dns_name.casefold().endswith(suffix_marker.casefold())
+            else dns_name
+        )
+        for address in node.get("TailscaleIPs") or []:
+            if address:
+                labels[str(address)] = short
+        host_name = str(node.get("HostName") or "").strip().casefold()
+        if host_name:
+            # Interactive hosts should prefer their ordinary Tailnet node over
+            # a separately tagged worker identity with the same OS hostname.
+            priority = 0 if not node.get("Tags") else 1
+            host_key = f"host:{host_name}"
+            if priority < host_priorities.get(host_key, 99):
+                labels[host_key] = short
+                host_priorities[host_key] = priority
+    return labels
+
+
+@functools.lru_cache(maxsize=1)
+def _tailnet_dns_labels() -> dict[str, str]:
+    """Best-effort local Tailnet inventory; picker operation never depends on it."""
+
+    tailscale = shutil.which("tailscale")
+    if not tailscale:
+        return {}
+    try:
+        result = subprocess.run(
+            [tailscale, "status", "--json"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if result.returncode != 0:
+            return {}
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return {}
+    return _parse_tailnet_dns_labels(payload)
 
 
 def _base_url() -> str:
@@ -118,13 +186,15 @@ def _attach_candidates(
     workers: list[dict] | None = None,
     *,
     local_host: str | None = None,
+    tailnet_dns_by_ip: dict[str, str] | None = None,
 ) -> list[dict]:
     """Return active sessions in global/local/remote/delegated picker order."""
 
-    worker_names = {
-        str(worker.get("id") or ""): str(worker.get("name") or worker.get("id") or "")
+    worker_records = {
+        str(worker.get("id") or ""): worker
         for worker in workers or []
     }
+    tailnet_dns_by_ip = tailnet_dns_by_ip or {}
     local = (local_host or socket.gethostname()).casefold()
     state_order = {"working": 0, "idle": 1}
     candidates: list[dict] = []
@@ -134,21 +204,30 @@ def _attach_candidates(
         row = dict(source)
         session_type = str(row.get("session_type") or "")
         host = str(row.get("host") or "").strip()
+        tailnet_host_name = host
+        tailnet_address = str(row.get("terminal_host") or "").strip()
         if session_type == "global-router":
-            rank, label, search = 0, "Global", "global router"
+            rank, label = 0, "Global"
         elif session_type == "delegated":
             worker_id = str(row.get("worker_id") or "").strip()
-            machine = worker_names.get(worker_id) or worker_id or "Unknown worker"
-            rank, label, search = 3, f"Delegated · {machine}", machine
+            worker = worker_records.get(worker_id) or {}
+            machine = str(worker.get("name") or worker_id or "Unknown worker")
+            tailnet_host_name = machine
+            tailnet_address = str(worker.get("worker_ip") or "").strip()
+            rank, label = 3, f"Delegated · {machine}"
         elif host and host.casefold() == local:
-            rank, label, search = 1, f"Local · {host}", host
+            rank, label = 1, f"Local · {host}"
         else:
             machine = host or "Unknown machine"
-            rank, label, search = 2, machine, machine
+            rank, label = 2, machine
+        tailnet_dns = (
+            tailnet_dns_by_ip.get(tailnet_address, "")
+            or tailnet_dns_by_ip.get(f"host:{tailnet_host_name.casefold()}", "")
+        )
         row.update({
             "_machine_rank": rank,
             "_machine_label": label,
-            "_machine_search": search,
+            "_machine_dns": tailnet_dns,
             "_machine_group": f"{rank}:{label.casefold()}",
         })
         candidates.append(row)
@@ -159,10 +238,15 @@ def _attach_candidates(
         -int(row.get("updated_at") or 0),
         str(row.get("id") or ""),
     ))
-    for row in candidates:
-        # Repeat the machine on every row. Group adjacency still provides the
-        # visual grouping, while every filtered result remains self-contained.
-        row["_machine_cell"] = row["_machine_label"]
+    for index, row in enumerate(candidates):
+        group = str(row["_machine_group"])
+        row["_machine_first"] = (
+            index == 0 or str(candidates[index - 1]["_machine_group"]) != group
+        )
+        row["_machine_last"] = (
+            index == len(candidates) - 1
+            or str(candidates[index + 1]["_machine_group"]) != group
+        )
     return candidates
 
 
@@ -174,7 +258,11 @@ async def _candidate_inventory() -> list[dict]:
             workers = await _request("GET", "/api/v1/workers")
         except RuntimeError:
             pass
-    return _attach_candidates(rows, workers)
+    return _attach_candidates(
+        rows,
+        workers,
+        tailnet_dns_by_ip=_tailnet_dns_labels(),
+    )
 
 
 def _resolve_session(rows: list[dict], target: str) -> dict:
@@ -387,21 +475,32 @@ def _pick_session(rows: list[dict]) -> dict:
             _PICKER_TEXT_TRANSLATION
         )
         cwd = str(row.get("cwd") or "-").translate(_PICKER_TEXT_TRANSLATION)
-        machine = str(row.get("_machine_cell") or "").translate(
+        machine = str(row.get("_machine_label") or "Unknown machine").translate(
             _PICKER_TEXT_TRANSLATION
         )
-        display = "   ".join((
+        tailnet_dns = str(row.get("_machine_dns") or "").translate(
+            _PICKER_TEXT_TRANSLATION
+        )
+        machine_context = machine + (f"  @{tailnet_dns}" if tailnet_dns else "")
+        dim_context = (
+            "\x1b[2m"
+            + set_cell_size(machine_context, _PICKER_CONTEXT_WIDTH)
+            + "\x1b[0m"
+        )
+        branch = "└─" if row.get("_machine_last") else "├─"
+        child = "  " + branch + " " + "   ".join((
             state_glyph(state),
             _PICKER_TYPE.get(session_type, "?"),
-            set_cell_size(machine, _PICKER_MACHINE_WIDTH),
+            dim_context,
             set_cell_size(label, _PICKER_NAME_WIDTH),
             cwd,
         ))
+        display = f"{machine_context}\n{child}" if row.get("_machine_first") else child
         lines.append("\t".join((session_id, display)))
-    header = "   ".join((
+    header = "      " + "   ".join((
         "S",
         "T",
-        set_cell_size("MACHINE", _PICKER_MACHINE_WIDTH),
+        set_cell_size("MACHINE @TAILNET", _PICKER_CONTEXT_WIDTH),
         set_cell_size("NAME", _PICKER_NAME_WIDTH),
         "PATH",
     ))
@@ -414,6 +513,9 @@ def _pick_session(rows: list[dict]) -> dict:
         "--sync",
         "--no-sort",
         "--no-hscroll",
+        "--ansi",
+        "--read0",
+        "--print0",
         "--delimiter=\\t",
         "--with-nth=2",
         # fzf applies --nth after --with-nth. Search the one transformed
@@ -430,16 +532,17 @@ def _pick_session(rows: list[dict]) -> dict:
         command.append(f"--bind=load:pos({local_position})")
     result = subprocess.run(
         command,
-        input="\n".join(lines) + "\n",
+        input="\0".join(lines) + "\0",
         text=True,
         stdout=subprocess.PIPE,
         check=False,
     )
-    if result.returncode == 130 or not result.stdout.strip():
+    selected_record = result.stdout.rstrip("\0")
+    if result.returncode == 130 or not selected_record:
         raise typer.Abort()
     if result.returncode != 0:
         raise RuntimeError(f"fzf session picker failed with exit code {result.returncode}")
-    session_id = result.stdout.strip().split("\t", 1)[0]
+    session_id = selected_record.split("\t", 1)[0]
     if session_id not in by_id:
         raise RuntimeError("fzf returned an unknown Pi session")
     return by_id[session_id]

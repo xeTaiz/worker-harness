@@ -202,10 +202,12 @@ Optionally set an 80% width and 70% height after a live visual check. Keep short
 
 Build one session inventory from `/api/v1/pi/sessions` plus a best-effort `/api/v1/workers` fetch:
 
-- interactive session: `host`;
-- delegated session: mapped worker name by `worker_id`, falling back to worker ID;
+- interactive session: `host`, with `terminal_host` used to resolve its Tailnet identity;
+- delegated session: mapped worker name by `worker_id`, falling back to worker ID, with `worker_ip` used for its Tailnet identity;
 - global router: dedicated `Global router` group;
 - missing location: `Unknown machine`.
+
+Best-effort `tailscale status --json` supplies the current `MagicDNSSuffix` plus IP/hostname→DNS maps. Strip the suffix and show the short identity next to the machine heading (for example `KW60898  @camel` for an interactive host and `Delegated · KW60898  @kw60898` for its separately tagged worker). When an unattached interactive bridge has no `terminal_host`, resolve by its reported OS hostname; if an ordinary Tailnet node and tagged worker share that hostname, prefer the untagged node for interactive sessions. Cache this lookup once per CLI process; absence, timeout, or malformed output must not block the picker.
 
 Failure to fetch workers must not block the picker; use IDs as fallback. Compare interactive hosts case-insensitively with `socket.gethostname()`; order the global router first, the local machine second, remote interactive machines next, and delegated workers last.
 
@@ -224,28 +226,38 @@ Use this same ordered inventory for next/previous cycling. In fzf, automatically
 
 ### 5.3 One-stage fzf presentation
 
-Keep every row selectable and use one preformatted, cell-width-aware display field so columns align consistently:
+Keep every session selectable and emulate a tree without introducing selectable heading rows. Use NUL-delimited multiline fzf records:
 
 ```text
-id<TAB>display
+id<TAB>display<NUL>
 ```
 
-- `display` is `S   T   MACHINE(24)   NAME(16)   PATH`, using Rich terminal-cell widths rather than raw code-point padding.
+Example:
+
+```text
+KW60898  @camel
+  ├─ ●   I   KW60898 @camel              DRRT               /home/engeld/Dev/DRRT
+  └─ ✓   I   KW60898 @camel              TomoFoam           /home/engeld/Dev/radfoam
+```
+
+- Attach the machine heading to the first selectable session record in each group; it is visual context, not an independent row, so Up/Down/Enter never land on a non-session heading.
+- Prefix children with `├─`/`└─`. Group ordering remains Global, Local, remote interactive, delegated.
 - Status reuses the tab glyphs: `●` working, `✓` idle, `!` failed, `?` disconnected.
 - Type is one unambiguous letter: `I` interactive, `D` delegated, `G` global router.
 - The visible name is capped at 16 cells and the full path remains on the right.
-- Repeat the machine label on every row so a filtered result is self-contained; group adjacency still supplies the grouping.
-- Use `--with-nth=2 --nth=1`: fzf applies `--nth` after the `--with-nth` transformation, so referring to original hidden field indexes would make every query return zero matches.
+- Repeat a fixed-width, dimmed `machine @tailnet` context column on every child, before the name, so the full path remains the rightmost column. If filtering removes the first child/heading, the surviving result still identifies its machine and Tailnet identity; searching either machine or Tailnet label matches every child in the group.
+- Use `--ansi --read0 --print0 --with-nth=2 --nth=1`: fzf strips the dimming escape codes for matching and applies `--nth` after the `--with-nth` transformation, so referring to original hidden field indexes would make every query return zero matches.
 - Preserve full session ID as the hidden selection key and disable horizontal scroll so the aligned leading columns remain stable.
 
-Search intentionally covers the complete visible row, including machine, displayed name, and full path. Do not add selectable separator/header rows.
+Search covers the complete visible multiline record, including heading/context, displayed name, full path, and Tailnet label. Do not add selectable separator/header rows.
 
 ### 5.4 Commit 3 tests
 
 - Interactive host, delegated worker-name mapping, worker-ID fallback, global router, and unknown group.
 - Local host first, alphabetical remote groups, state/recent/ID order within groups.
-- Visual machine label on every row, including continuation rows in the same group.
-- Installed-fzf filtering by lowercase/uppercase name and full path still maps the complete row to the correct session.
+- Multiline machine heading on the first child, correct `├─`/`└─` branches, and compact machine/Tailnet context on every child.
+- MagicDNS suffix parsing and best-effort IP→short-label mapping for interactive and delegated identities.
+- Installed-fzf filtering by lowercase/uppercase name, full path, machine, and Tailnet label still maps the complete NUL-delimited record to the correct session.
 - Next/previous cycles across the exact grouped order and wraps.
 
 ## 6. Commit 4 — live plugin-free state glyphs — implemented

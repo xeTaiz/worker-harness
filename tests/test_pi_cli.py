@@ -59,6 +59,37 @@ class PiCliTests(unittest.TestCase):
             ):
                 self.assertEqual(pi._base_url(), "http://orchestrator.tail:12889")
 
+    def test_parse_tailnet_dns_labels_uses_reported_magicdns_suffix(self):
+        labels = pi._parse_tailnet_dns_labels({
+            "MagicDNSSuffix": "hs.d0me.xyz",
+            "Self": {
+                "HostName": "archdome",
+                "DNSName": "archdome.hs.d0me.xyz.",
+                "TailscaleIPs": ["100.64.0.2"],
+            },
+            "Peer": {
+                "interactive": {
+                    "HostName": "KW60898",
+                    "DNSName": "camel.hs.d0me.xyz.",
+                    "TailscaleIPs": ["100.64.0.4", "fd7a::4"],
+                },
+                "worker": {
+                    "HostName": "KW60898",
+                    "DNSName": "kw60898.hs.d0me.xyz.",
+                    "TailscaleIPs": ["100.64.0.126"],
+                    "Tags": ["tag:wh-worker"],
+                },
+            },
+        })
+        self.assertEqual(labels, {
+            "100.64.0.2": "archdome",
+            "host:archdome": "archdome",
+            "100.64.0.4": "camel",
+            "fd7a::4": "camel",
+            "host:kw60898": "camel",
+            "100.64.0.126": "kw60898",
+        })
+
     def test_sessions_text(self):
         with patch.object(pi, "_request", new=AsyncMock(return_value=[self._session()])):
             result = self.runner.invoke(pi.app, ["sessions"])
@@ -95,23 +126,40 @@ class PiCliTests(unittest.TestCase):
             {**self._session(), "id": "remote", "host": "zeta", "updated_at": 5},
             {**self._session(), "id": "delegated", "session_type": "delegated",
              "host": "", "worker_id": "worker-1", "updated_at": 9},
-            {**self._session(), "id": "local-idle", "host": "local", "updated_at": 8},
+            {**self._session(), "id": "local-idle", "host": "local",
+             "terminal_host": "100.64.0.2", "updated_at": 8},
             {**self._session(), "id": "local-working", "host": "local",
-             "state": "working", "updated_at": 1},
+             "terminal_host": "100.64.0.2", "state": "working", "updated_at": 1},
             {**self._session(), "id": "global", "session_type": "global-router",
              "host": "router", "updated_at": 1},
             {**self._session(), "id": "alpha", "host": "alpha", "updated_at": 3},
         ]
         candidates = pi._attach_candidates(
-            rows, [{"id": "worker-1", "name": "GPU Box"}], local_host="local"
+            rows,
+            [{"id": "worker-1", "name": "GPU Box", "worker_ip": "100.64.0.126"}],
+            local_host="local",
+            tailnet_dns_by_ip={
+                "100.64.0.2": "local-tailnet",
+                "host:zeta": "remote-tailnet",
+                "100.64.0.126": "gpu-worker",
+            },
         )
         self.assertEqual([row["id"] for row in candidates], [
             "global", "local-working", "local-idle", "alpha", "remote", "delegated",
         ])
-        self.assertEqual(candidates[0]["_machine_cell"], "Global")
-        self.assertEqual(candidates[1]["_machine_cell"], "Local · local")
-        self.assertEqual(candidates[2]["_machine_cell"], "Local · local")
-        self.assertEqual(candidates[-1]["_machine_cell"], "Delegated · GPU Box")
+        self.assertEqual(candidates[0]["_machine_label"], "Global")
+        self.assertEqual(candidates[1]["_machine_label"], "Local · local")
+        self.assertEqual(candidates[2]["_machine_label"], "Local · local")
+        self.assertEqual(candidates[-1]["_machine_label"], "Delegated · GPU Box")
+        self.assertEqual(candidates[1]["_machine_dns"], "local-tailnet")
+        self.assertEqual(next(
+            row["_machine_dns"] for row in candidates if row["id"] == "remote"
+        ), "remote-tailnet")
+        self.assertEqual(candidates[-1]["_machine_dns"], "gpu-worker")
+        self.assertTrue(candidates[1]["_machine_first"])
+        self.assertFalse(candidates[1]["_machine_last"])
+        self.assertFalse(candidates[2]["_machine_first"])
+        self.assertTrue(candidates[2]["_machine_last"])
 
     def test_picker_starts_on_first_local_with_global_one_step_up(self):
         rows = pi._attach_candidates([
@@ -127,9 +175,9 @@ class PiCliTests(unittest.TestCase):
             selected = pi._pick_session(rows)
         self.assertEqual(selected["id"], "local")
         self.assertIn("--bind=load:pos(2)", run.call_args.args[0])
-        picker_input = run.call_args.kwargs["input"].splitlines()
-        self.assertTrue(picker_input[0].startswith("global\t✓   G   Global"))
-        self.assertTrue(picker_input[1].startswith("local\t✓   I   Local · local"))
+        picker_input = run.call_args.kwargs["input"].rstrip("\0").split("\0")
+        self.assertTrue(picker_input[0].startswith("global\tGlobal\n  └─ ✓   G"))
+        self.assertTrue(picker_input[1].startswith("local\tLocal · local\n  └─ ✓   I"))
 
     def test_picker_uses_aligned_glyph_type_name_and_searchable_path_columns(self):
         rows = pi._attach_candidates([{
@@ -142,7 +190,7 @@ class PiCliTests(unittest.TestCase):
         }], local_host="local")
 
         def choose_input(_command, **kwargs):
-            return subprocess.CompletedProcess([], 0, kwargs["input"].splitlines()[0] + "\n", "")
+            return subprocess.CompletedProcess([], 0, kwargs["input"].split("\0", 1)[0] + "\0", "")
 
         with (
             patch.object(pi.shutil, "which", return_value="/usr/bin/fzf"),
@@ -155,12 +203,47 @@ class PiCliTests(unittest.TestCase):
         self.assertIn("--with-nth=2", command)
         self.assertIn("--nth=1", command)
         self.assertIn("--no-hscroll", command)
-        fields = run.call_args.kwargs["input"].strip().split("\t")
+        self.assertIn("--read0", command)
+        self.assertIn("--print0", command)
+        record = run.call_args.kwargs["input"].split("\0", 1)[0]
+        fields = record.split("\t", 1)
         self.assertEqual(len(fields), 2)
         self.assertEqual(fields[0], "local")
-        self.assertTrue(fields[1].startswith("●   I   Local · local"))
+        self.assertTrue(fields[1].startswith("Local · local\n  └─ ●   I"))
         self.assertIn("0123456789abcdef", fields[1])
+        self.assertIn("Local · local", fields[1])
         self.assertTrue(fields[1].endswith("/full/path/to/the/repository"))
+
+    def test_picker_renders_machine_heading_tree_and_tailnet_context(self):
+        rows = pi._attach_candidates([
+            {**self._session(), "id": "drrt", "host": "KW60898",
+             "terminal_host": "100.64.0.4", "name": "DRRT",
+             "cwd": "/home/engeld/Dev/DRRT", "state": "working"},
+            {**self._session(), "id": "tomo", "host": "KW60898",
+             "terminal_host": "100.64.0.4", "name": "TomoFoam",
+             "cwd": "/home/engeld/Dev/radfoam"},
+        ], local_host="archdome", tailnet_dns_by_ip={"100.64.0.4": "camel"})
+        captured: dict[str, str] = {}
+
+        def choose_first(command, **kwargs):
+            captured["input"] = kwargs["input"]
+            return subprocess.CompletedProcess(command, 0, kwargs["input"].split("\0", 1)[0] + "\0", "")
+
+        with (
+            patch.object(pi.shutil, "which", return_value="/usr/bin/fzf"),
+            patch.object(pi.subprocess, "run", side_effect=choose_first),
+        ):
+            selected = pi._pick_session(rows)
+
+        self.assertEqual(selected["id"], "drrt")
+        records = captured["input"].rstrip("\0").split("\0")
+        self.assertIn("KW60898  @camel\n  ├─ ●   I", records[0])
+        self.assertNotIn("KW60898  @camel\n", records[1])
+        self.assertIn("  └─ ✓   I", records[1])
+        self.assertGreaterEqual(records[0].count("KW60898  @camel"), 2)
+        self.assertEqual(records[1].count("KW60898  @camel"), 1)
+        self.assertTrue(records[0].endswith("/home/engeld/Dev/DRRT"))
+        self.assertTrue(records[1].endswith("/home/engeld/Dev/radfoam"))
 
     @unittest.skipUnless(pi.shutil.which("fzf"), "fzf is not installed")
     def test_installed_fzf_filters_visible_name_and_path(self):
@@ -168,9 +251,10 @@ class PiCliTests(unittest.TestCase):
             **self._session(),
             "id": "drrt",
             "host": "KW60898",
+            "terminal_host": "100.64.0.4",
             "name": "DRRT",
             "cwd": "/home/engeld/Dev/DRRT",
-        }], local_host="archdome")
+        }], local_host="archdome", tailnet_dns_by_ip={"100.64.0.4": "camel"})
         captured: dict[str, object] = {}
 
         def capture(command, **kwargs):
@@ -185,7 +269,7 @@ class PiCliTests(unittest.TestCase):
             with self.assertRaises(typer.Abort):
                 pi._pick_session(rows)
 
-        for query in ("d", "D", "DRRT"):
+        for query in ("d", "D", "DRRT", "engeld", "camel", "KW60898"):
             with self.subTest(query=query):
                 result = subprocess.run(
                     [*captured["command"], f"--filter={query}"],
@@ -207,7 +291,7 @@ class PiCliTests(unittest.TestCase):
 
         def choose_first(_command, **kwargs):
             captured["input"] = kwargs["input"]
-            return subprocess.CompletedProcess([], 0, kwargs["input"].splitlines()[0] + "\n", "")
+            return subprocess.CompletedProcess([], 0, kwargs["input"].split("\0", 1)[0] + "\0", "")
 
         with (
             patch.object(pi.shutil, "which", return_value="/usr/bin/fzf"),
@@ -215,7 +299,10 @@ class PiCliTests(unittest.TestCase):
         ):
             pi._pick_session(rows)
 
-        displays = [line.split("\t")[1] for line in captured["input"].splitlines()]
+        displays = [
+            record.split("\t", 1)[1]
+            for record in captured["input"].rstrip("\0").split("\0")
+        ]
         self.assertIn("✓   G", displays[0])
         self.assertIn("✓   D", displays[1])
 
