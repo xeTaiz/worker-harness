@@ -1,0 +1,27 @@
+services:
+  wh-web:
+    build:
+      context: .
+      dockerfile: web_container/Dockerfile
+    image: ${WH_WEB_IMAGE:-xetaiz/wh-web:latest}
+    container_name: wh-web
+    restart: unless-stopped
+    ports:
+      # Required: bind only to the VPS host's Tailscale IPv4 address.
+      - "${WH_WEB_BIND_IP:?set WH_WEB_BIND_IP to the VPS Tailscale IPv4 address}:${WH_WEB_PORT:-18080}:8080"
+    networks:
+      - wh-internal
+    user: "101:101"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /var/cache/nginx:size=16m,mode=1777
+
+networks:
+  wh-internal:
+    name: ${WH_DOCKER_NETWORK:-wh-internal}
+    external: true

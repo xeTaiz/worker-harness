@@ -17,11 +17,15 @@ Required ACL directions:
 3. Operator/client Tailnet members -> `tag:wh-orchestrator:12889` (privileged control API, including Pi delegation)
 
 `tag:wh-worker` must not be granted access to port `12889`; worker registration
-and the operator control plane are deliberately separate services. The mobile
-Pi-session webapp is served from the control service root, for example
-`http://<orchestrator-tailnet-name>:12889/`, and uses the same Tailnet trust
-boundary—there is no separate browser credential. Working/idle delegated
-sessions expose a **Terminal preview** tab through the worker relay on port
+and the operator control plane are deliberately separate services. In
+production, the mobile Pi-session webapp is served by the standalone `wh-web`
+container on the VPS host's Tailscale IP. `wh-web` proxies only the session UI's
+HTTP, SSE, and WebSocket routes to `wh-orch:12889` over a private Docker network.
+It uses the existing Tailnet trust boundary—there is no separate browser
+credential. The orchestrator can still serve an explicitly configured
+`WH_WEB_DIR` for local development, but its production image does not bundle the
+web assets. Working/idle delegated sessions expose a **Terminal preview** tab
+through the worker relay on port
 `27888`. Ordinary interactive Pi sessions launched inside tmux or Zellij expose
 the same tab through an auto-started host relay on the host's Tailnet port
 `27888`; random terminals remain non-attachable. The host relay binds only to
@@ -85,8 +89,76 @@ Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 ## Build images
 
 ```bash
-just build
+just build          # orchestrator, worker, and wh-web
+just build-orch     # orchestrator only
+just build-worker   # worker only
+just build-web      # wh-web only
 ```
+
+Every Docker build receives three ready-to-push tags automatically:
+`xetaiz/<image>:latest`, `xetaiz/<image>:<branch>`, and
+`xetaiz/<image>:<branch>-<7-character-commit>`. A dirty worktree adds `-dirty`
+to the commit tag so an uncommitted image cannot be mistaken for an exact
+commit build. For example, `just build-orch` on clean `giga-wh` builds
+`xetaiz/wh-orch:latest`, `xetaiz/wh-orch:giga-wh`, and
+`xetaiz/wh-orch:giga-wh-<commit>`. Set `WH_IMAGE_NAMESPACE` to override
+`xetaiz` without editing the `justfile`.
+
+## Run the standalone web UI
+
+`docker-compose.web.example.yml` manages only `wh-web`. This is intentional: you
+can deploy and test it against the currently running orchestrator before
+replacing the orchestrator image.
+
+The existing orchestrator must be attached to a user-defined Docker network and
+be resolvable there as `wh-orch`:
+
+```bash
+docker network inspect wh-internal >/dev/null 2>&1 || docker network create wh-internal
+docker network connect --alias wh-orch wh-internal wh-orch
+```
+
+If the orchestrator has a different container name, use that name as the final
+argument while retaining the `wh-orch` alias. Connecting a container that is
+already on the network is unnecessary.
+
+Start the web container with an explicit host Tailscale address. There is no
+`0.0.0.0` default, and the web container needs no persistent volume because its
+assets are baked into the image.
+
+```bash
+export WH_WEB_BIND_IP="$(tailscale ip -4 | head -n1)"
+export WH_WEB_PORT=18080
+export WH_DOCKER_NETWORK=wh-internal
+
+docker compose -f docker-compose.web.example.yml up -d --build
+```
+
+Verify the separate path before changing the orchestrator deployment:
+
+```bash
+curl -fsS "http://${WH_WEB_BIND_IP}:${WH_WEB_PORT}/healthz"
+curl -fsS "http://${WH_WEB_BIND_IP}:${WH_WEB_PORT}/"
+curl -fsS "http://${WH_WEB_BIND_IP}:${WH_WEB_PORT}/api/v1/pi/sessions"
+```
+
+Then open `http://<VPS-TAILSCALE-IP>:18080/` from an authorized Tailnet client
+and verify session updates, prompting/configuration, and terminal attachment.
+The old orchestrator-served UI remains available during this test, so stopping
+`wh-web` is a complete rollback.
+
+Only after that test passes should the no-web orchestrator image be deployed.
+The replacement `wh-orch` must join `wh-internal` with the same alias. Restart
+`wh-web` after replacing `wh-orch`, because Nginx resolves the upstream container
+address when it starts:
+
+```bash
+docker compose -f docker-compose.web.example.yml restart wh-web
+```
+
+Do not change or share the orchestrator's SQLite or Tailscale state mounts as
+part of this web cutover, and never run two orchestrators against the same
+Tailscale state directory.
 
 ## Start containers with Docker or Podman (ephemeral runtime)
 
@@ -96,28 +168,28 @@ Run orchestrator (required env: `TS_AUTHKEY`):
 
 ```bash
 docker run -d \
-  --name worker-harness-orchestrator \
+  --name wh-orch \
   --restart unless-stopped \
   --cap-add NET_ADMIN \
   --device /dev/net/tun:/dev/net/tun \
   -v worker-harness-orchestrator-tailscale:/var/lib/tailscale \
   -v worker-harness-orchestrator-data:/root/.config/worker-harness \
   -e TS_AUTHKEY='<ORCH_TS_AUTHKEY>' \
-  worker-harness/orchestrator:latest
+  xetaiz/wh-orch:latest
 ```
 
 ### Podman
 
 ```bash
 podman run -d \
-  --name worker-harness-orchestrator \
+  --name wh-orch \
   --restart unless-stopped \
   --cap-add NET_ADMIN \
   --device /dev/net/tun:/dev/net/tun \
   -v worker-harness-orchestrator-tailscale:/var/lib/tailscale \
   -v worker-harness-orchestrator-data:/root/.config/worker-harness \
   -e TS_AUTHKEY='<ORCH_TS_AUTHKEY>' \
-  worker-harness/orchestrator:latest
+  xetaiz/wh-orch:latest
 ```
 
 Both orchestrator volumes are required for replacement-safe deployments. The
@@ -140,7 +212,7 @@ docker run -d \
   -e ORCHESTRATOR_HOST='<orchestrator-tailnet-dns-or-ip>' \
   -e SSH_USER="$(id -un)" \
   -e WH_PROXY='socks5://127.0.0.1:1055' \
-  worker-harness/worker:latest
+  xetaiz/wh-worker:latest
 ```
 
 ### Podman
@@ -154,7 +226,7 @@ podman run -d \
   -e ORCHESTRATOR_HOST='<orchestrator-tailnet-dns-or-ip>' \
   -e SSH_USER="$(id -un)" \
   -e WH_PROXY='socks5://127.0.0.1:1055' \
-  worker-harness/worker:latest
+  xetaiz/wh-worker:latest
 ```
 
 Notes:
@@ -169,7 +241,7 @@ Notes:
 Build and convert from local Docker image:
 
 ```bash
-apptainer pull worker-harness-worker.sif docker-daemon://worker-harness/worker:latest
+apptainer pull worker-harness-worker.sif docker-daemon://xetaiz/wh-worker:latest
 ```
 
 Recommended deploy flow:

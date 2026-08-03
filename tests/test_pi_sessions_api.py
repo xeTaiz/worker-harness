@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import threading
 import time
@@ -102,8 +103,11 @@ class PiSessionsApiTests(unittest.TestCase):
         asyncio.run(self.db.close())
         Path(self.tmp.name).unlink(missing_ok=True)
 
-    def test_mobile_webapp_is_served_by_control_app(self):
-        with TestClient(self.app) as client:
+    def test_explicit_local_web_dir_is_served_by_control_app(self):
+        web_dir = Path(__file__).resolve().parents[1] / "web"
+        with patch.dict(os.environ, {"WH_WEB_DIR": str(web_dir)}):
+            app = create_app(self.db)
+        with TestClient(app) as client:
             page = client.get("/")
             manifest = client.get("/manifest.webmanifest")
             script = client.get("/app.js")

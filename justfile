@@ -1,21 +1,49 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
-orchestrator_image := "worker-harness/orchestrator:latest"
-worker_image := "worker-harness/worker:latest"
+image_namespace := env_var_or_default("WH_IMAGE_NAMESPACE", "xetaiz")
+git_branch := `branch="$(git branch --show-current)"; printf '%s' "${branch:-detached}" | sed 's/[^A-Za-z0-9_.-]/-/g'`
+git_sha := `git rev-parse --short=7 HEAD`
+git_dirty := `if test -n "$(git status --porcelain)"; then printf '%s' '-dirty'; fi`
+release_tag := git_branch + "-" + git_sha + git_dirty
 
-build:
-    @echo "[just build] Building orchestrator image: {{orchestrator_image}}"
-    @docker build -t {{orchestrator_image}} -f orchestrator_container/Dockerfile .
-    @echo "[just build] Building worker image: {{worker_image}}"
-    @docker build -t {{worker_image}} -f worker_container/Dockerfile worker_container
+orchestrator_repo := image_namespace + "/wh-orch"
+worker_repo := image_namespace + "/wh-worker"
+web_repo := image_namespace + "/wh-web"
+
+orchestrator_image := orchestrator_repo + ":latest"
+worker_image := worker_repo + ":latest"
+web_image := web_repo + ":latest"
+
+build: build-orch build-worker build-web
+    @echo "[just build] Built orchestrator, worker, and web images"
 
 # Build everything (docker containers + singularity .sif) then produce dist bundle.
 all: build build-singularity dist
     @echo "[just all] Done. dist bundle ready in ./dist"
 
 build-orch:
-    @echo "[just build-orch] Building orchestrator image: {{orchestrator_image}}"
-    @docker build -t {{orchestrator_image}} -f orchestrator_container/Dockerfile .
+    @echo "[just build-orch] Building {{orchestrator_repo}} with tags latest, {{git_branch}}, and {{release_tag}}"
+    @docker build \
+        -t {{orchestrator_repo}}:latest \
+        -t {{orchestrator_repo}}:{{git_branch}} \
+        -t {{orchestrator_repo}}:{{release_tag}} \
+        -f orchestrator_container/Dockerfile .
+
+build-worker:
+    @echo "[just build-worker] Building {{worker_repo}} with tags latest, {{git_branch}}, and {{release_tag}}"
+    @docker build \
+        -t {{worker_repo}}:latest \
+        -t {{worker_repo}}:{{git_branch}} \
+        -t {{worker_repo}}:{{release_tag}} \
+        -f worker_container/Dockerfile worker_container
+
+build-web:
+    @echo "[just build-web] Building {{web_repo}} with tags latest, {{git_branch}}, and {{release_tag}}"
+    @docker build \
+        -t {{web_repo}}:latest \
+        -t {{web_repo}}:{{git_branch}} \
+        -t {{web_repo}}:{{release_tag}} \
+        -f web_container/Dockerfile .
 
 build-singularity output="worker-harness-worker.sif":
     @echo "[just build-singularity] Building Singularity image: {{output}}"

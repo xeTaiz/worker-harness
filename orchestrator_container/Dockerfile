@@ -21,8 +21,6 @@ WORKDIR /app
 
 COPY pyproject.toml /app/pyproject.toml
 COPY src /app/src
-COPY web /app/web
-ENV WH_WEB_DIR=/app/web
 RUN pip install --no-cache-dir .
 
 COPY orchestrator_container/entrypoint.sh /entrypoint.sh
