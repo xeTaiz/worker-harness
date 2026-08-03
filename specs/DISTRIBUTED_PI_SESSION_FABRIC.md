@@ -353,7 +353,7 @@ It selects the likely target from session name, CWD, recent activity, and explic
 3. **Zellij:** the client/host-relay adapter is implemented: stable locators, exact local focus, disposable remote clients, resize, cleanup, picker, and local/streamed cycling reuse the same discovery/attachment contract. Full mixed-host/multiplexer live acceptance remains.
 4. **Mobile webapp/PWA:** the Tailnet-served session directory, durable semantic transcript, session switching, prompt/steer composer, model/thinking controls, terminal preview, gateway-first transport, and idle/replacement return UX are implemented. Automatic reconnect, HTTPS installation, real-browser gateway acceptance, and optional xterm-grade rendering remain.
 
-The current orchestrator image bundles and serves the static web assets from the control-service origin, but the browser client is otherwise API-driven. A separate static/PWA container is compatible if one HTTPS edge origin routes `/` assets to that container and proxies `/api/` (including SSE and WebSocket upgrades) to the Tailnet-only orchestrator. A distinct browser/API origin would additionally require configurable API URLs, HTTP/SSE CORS, WebSocket origin/auth handling, and HTTPS on both origins. Publicly proxying the unauthenticated control API would change the accepted Tailnet trust boundary and is prohibited unless a separate authentication milestone is explicitly approved.
+The current orchestrator image bundles and serves the static web assets from the control-service origin, but the browser client is otherwise API-driven. The approved next separation milestone is `specs/WEB_UI_ORCHESTRATOR_SEPARATION.md`: one authenticated HTTPS Nginx+Authelia edge serves an independent static PWA container at `/` and proxies only an explicit Pi HTTP/SSE/WS allowlist to the Tailnet-only orchestrator. Public browser terminal traffic is gateway-only; `:12888`, `:12889`, and relay `:27888` remain private. A distinct browser/API origin, broad `/api/` proxy, or unauthenticated public control API remains prohibited.
 
 The global router in §9 is an orthogonal agent/service, not another terminal client. Its implementation and acceptance must not be combined with Zellij or PWA delivery milestones.
 
@@ -456,7 +456,7 @@ Remaining work, in order:
 5. **Zellij adapter closure:** stable session/pane identity and client-specific exact focus are proven on Zellij 0.44.2; finish mixed-client resize semantics, direct/prefix shortcut acceptance, fleet rollout, and source-session survival after relay cleanup.
 6. **Pi attach UX next slice:** execute `specs/PI_ATTACH_UX_NEXT.md` in order: diagnose/fix the reopened managed-tmux inner-status-bar regression; add the floating Zellij picker and dedicated/reused `π` tabs; group the picker by source machine; then add SSE-driven working/idle/error tab glyphs.
 7. **Hidden tmux managed launcher matrix:** finish remote Zellij/tmux, cap/idle/replacement, mixed-size, and fleet acceptance after the P0 invisible-status fix.
-8. **PWA HTTPS:** choose Tailnet HTTPS publication and validate service-worker installation/update behavior.
+8. **PWA separation + HTTPS:** execute `specs/WEB_UI_ORCHESTRATOR_SEPARATION.md`; deploy the independent static image behind the authenticated same-origin edge; validate gateway-only transport, service-worker installation/update, exact API allowlisting, and private-port negative tests.
 
 ## 13. Explicit non-goals
 
@@ -465,7 +465,7 @@ Remaining work, in order:
 - Vault on workers/delegated children.
 - LiteLLM in the first release.
 - Git/checkouts/deploy keys on workers for Pi release distribution.
-- Public browser access, Funnel, native mobile apps, and multi-tenant operation.
+- Unauthenticated public browser access, Funnel, direct public orchestrator/relay exposure, native mobile apps, and multi-tenant operation. An Authelia-authenticated, same-origin, gateway-only browser edge is the explicit planned exception in `specs/WEB_UI_ORCHESTRATOR_SEPARATION.md`.
 - Replacing direct relay `27888` with an internal SSH `SessionTunnelManager` unless a demonstrated reachability/ACL problem reopens that decision.
 - Durable writer leases, ownership transfer, collaborative editing guarantees, or CRDT terminal semantics. Concurrent input from the single operator is allowed and follows normal tmux arrival ordering.
 - Guaranteeing exactly-once execution; commands/events remain idempotent and uncertainty is surfaced explicitly.
