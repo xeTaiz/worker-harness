@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 import httpx
 import typer
+from rich.cells import set_cell_size
 from rich.console import Console
 from rich.table import Table
 
@@ -23,6 +24,14 @@ app = typer.Typer(help="Inspect and message registered Pi sessions")
 console = Console()
 
 _ACTIVE_STATES = {"working", "idle"}
+_PICKER_MACHINE_WIDTH = 24
+_PICKER_NAME_WIDTH = 16
+_PICKER_TYPE = {
+    "interactive": "I",
+    "delegated": "D",
+    "global-router": "G",
+}
+_PICKER_TEXT_TRANSLATION = str.maketrans({"\t": " ", "\n": " ", "\r": " "})
 
 
 def _base_url() -> str:
@@ -367,21 +376,45 @@ def _pick_session(rows: list[dict]) -> dict:
         if len(rows) == 1:
             return rows[0]
         raise RuntimeError("fzf is required when no session ID is supplied")
+    from worker_harness.pi_zellij_state import state_glyph
+
     by_id = {str(row.get("id")): row for row in rows}
     lines = []
     for row in rows:
         session_id = str(row.get("id", ""))
-        label = str(row.get("name") or row.get("task") or "-").replace("\t", " ")
-        cwd = str(row.get("cwd") or "-").replace("\t", " ")
-        lines.append("\t".join((
-            session_id,
+        state = str(row.get("state") or "")
+        session_type = str(row.get("session_type") or "")
+        label = str(row.get("name") or row.get("task") or "-").translate(
+            _PICKER_TEXT_TRANSLATION
+        )
+        cwd = str(row.get("cwd") or "-").translate(_PICKER_TEXT_TRANSLATION)
+        machine = str(row.get("_machine_cell") or "").translate(
+            _PICKER_TEXT_TRANSLATION
+        )
+        display = "   ".join((
+            state_glyph(state),
+            _PICKER_TYPE.get(session_type, "?"),
+            set_cell_size(machine, _PICKER_MACHINE_WIDTH),
+            set_cell_size(label, _PICKER_NAME_WIDTH),
+            cwd,
+        ))
+        search = " ".join((
             str(row.get("_machine_search") or ""),
-            str(row.get("state") or ""),
-            str(row.get("session_type") or ""),
-            str(row.get("_machine_cell") or ""),
+            str(row.get("_machine_label") or ""),
             label,
             cwd,
-        )))
+            state,
+            session_type,
+            session_id,
+        )).translate(_PICKER_TEXT_TRANSLATION)
+        lines.append("\t".join((session_id, search, display)))
+    header = "   ".join((
+        "S",
+        "T",
+        set_cell_size("MACHINE", _PICKER_MACHINE_WIDTH),
+        set_cell_size("NAME", _PICKER_NAME_WIDTH),
+        "PATH",
+    ))
     command = [
         fzf,
         "--no-tmux",
@@ -390,10 +423,11 @@ def _pick_session(rows: list[dict]) -> dict:
         "--border",
         "--sync",
         "--no-sort",
+        "--no-hscroll",
         "--delimiter=\\t",
-        "--with-nth=3..",
-        "--nth=2,6..",
-        "--header=STATE  TYPE  MACHINE  NAME/TASK  CWD",
+        "--with-nth=3",
+        "--nth=2,3",
+        f"--header={header}",
         "--prompt=Pi session> ",
     ]
     local_position = next((

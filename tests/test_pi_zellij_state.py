@@ -19,6 +19,8 @@ class ZellijStateTests(unittest.TestCase):
         self.assertEqual(state.tab_title("research", state.DISCONNECTED), "π ? research")
         self.assertEqual(state.tab_title("  line\tone\n two  ", "unknown"), "π ? line one two")
         self.assertEqual(state.tab_title("\n\t", state.IDLE), "π ✓ Pi")
+        self.assertEqual(state.state_glyph("failed"), "!")
+        self.assertEqual(state.state_glyph("offline"), "?")
 
     def test_working_idle_and_sticky_error_until_next_turn(self):
         tracker = state.SessionStateTracker(state.IDLE)

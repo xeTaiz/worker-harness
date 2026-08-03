@@ -126,8 +126,63 @@ class PiCliTests(unittest.TestCase):
         self.assertEqual(selected["id"], "local")
         self.assertIn("--bind=load:pos(2)", run.call_args.args[0])
         picker_input = run.call_args.kwargs["input"].splitlines()
-        self.assertTrue(picker_input[0].startswith("global\tglobal router\t"))
-        self.assertTrue(picker_input[1].startswith("local\tlocal\t"))
+        self.assertTrue(picker_input[0].startswith("global\tglobal router Global "))
+        self.assertTrue(picker_input[1].startswith("local\tlocal Local · local "))
+
+    def test_picker_uses_aligned_glyph_type_name_and_searchable_path_columns(self):
+        rows = pi._attach_candidates([{
+            **self._session(),
+            "id": "local",
+            "host": "local",
+            "state": "working",
+            "name": "0123456789abcdefghijkl",
+            "cwd": "/full/path/to/the/repository",
+        }], local_host="local")
+
+        def choose_input(_command, **kwargs):
+            return subprocess.CompletedProcess([], 0, kwargs["input"].splitlines()[0] + "\n", "")
+
+        with (
+            patch.object(pi.shutil, "which", return_value="/usr/bin/fzf"),
+            patch.object(pi.subprocess, "run", side_effect=choose_input) as run,
+        ):
+            selected = pi._pick_session(rows)
+
+        self.assertEqual(selected["id"], "local")
+        command = run.call_args.args[0]
+        self.assertIn("--with-nth=3", command)
+        self.assertIn("--nth=2,3", command)
+        self.assertIn("--no-hscroll", command)
+        fields = run.call_args.kwargs["input"].strip().split("\t")
+        self.assertEqual(len(fields), 3)
+        self.assertEqual(fields[0], "local")
+        self.assertIn("0123456789abcdefghijkl", fields[1])
+        self.assertIn("/full/path/to/the/repository", fields[1])
+        self.assertTrue(fields[2].startswith("●   I   Local · local"))
+        self.assertIn("0123456789abcdef", fields[2])
+        self.assertTrue(fields[2].endswith("/full/path/to/the/repository"))
+
+    def test_picker_abbreviates_global_and_delegated_types(self):
+        rows = pi._attach_candidates([
+            {**self._session(), "id": "global", "session_type": "global-router"},
+            {**self._session(), "id": "delegate", "session_type": "delegated",
+             "worker_id": "worker-1"},
+        ], [{"id": "worker-1", "name": "GPU"}], local_host="local")
+        captured: dict[str, str] = {}
+
+        def choose_first(_command, **kwargs):
+            captured["input"] = kwargs["input"]
+            return subprocess.CompletedProcess([], 0, kwargs["input"].splitlines()[0] + "\n", "")
+
+        with (
+            patch.object(pi.shutil, "which", return_value="/usr/bin/fzf"),
+            patch.object(pi.subprocess, "run", side_effect=choose_first),
+        ):
+            pi._pick_session(rows)
+
+        displays = [line.split("\t")[2] for line in captured["input"].splitlines()]
+        self.assertIn("✓   G", displays[0])
+        self.assertIn("✓   D", displays[1])
 
     def test_zellij_cycle_finds_original_pane_suppressed_by_in_place_helper(self):
         panes = [

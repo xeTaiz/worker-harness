@@ -224,17 +224,19 @@ Use this same ordered inventory for next/previous cycling. In fzf, automatically
 
 ### 5.3 One-stage fzf presentation
 
-Keep every row selectable and make the machine searchable even when its visible label appears only once:
+Keep every row selectable and use one preformatted, cell-width-aware display field so columns align consistently:
 
 ```text
-id<TAB>machine_search<TAB>state<TAB>type<TAB>machine_cell<TAB>name/task<TAB>cwd
+id<TAB>search_text<TAB>display
 ```
 
-- Hide `id` and `machine_search` from display with `--with-nth`.
-- Include `machine_search` in `--nth` so typing a hostname/worker name matches every session in that group.
+- `display` is `S   T   MACHINE(24)   NAME(16)   PATH`, using Rich terminal-cell widths rather than raw code-point padding.
+- Status reuses the tab glyphs: `●` working, `✓` idle, `!` failed, `?` disconnected.
+- Type is one unambiguous letter: `I` interactive, `D` delegated, `G` global router.
+- `search_text` includes the full machine label, full untruncated name/task, full path, state, type, and session ID; the visible name is capped at 16 cells and the full path remains on the right.
+- Hide `id` and `search_text` with `--with-nth=3`, while `--nth=2,3` keeps both hidden metadata and visible text searchable.
 - Show the full machine label on the first row and `╎` on continuation rows.
-- Preserve full session ID as the selection key.
-- Update the header to `STATE  TYPE  MACHINE  NAME/TASK  CWD`.
+- Preserve full session ID as the selection key and disable horizontal scroll so the aligned leading columns remain stable.
 
 When a query filters out a group's first row, continuation glyphs may remain; this is acceptable for a single-stage fzf implementation because the hidden machine field still searches correctly. Do not add selectable separator/header rows.
 

@@ -67,11 +67,22 @@ def sanitize_name(name: str | None) -> str:
     return text or _DEFAULT_NAME
 
 
+def state_glyph(state: str) -> str:
+    """Return the tab/picker glyph for a projected session state."""
+
+    normalized = {
+        "failed": ERROR,
+        "runtime_error": ERROR,
+        "offline": DISCONNECTED,
+        "unknown": DISCONNECTED,
+    }.get(state, state)
+    return _STATE_GLYPHS.get(normalized, _STATE_GLYPHS[DISCONNECTED])
+
+
 def tab_title(name: str, state: str) -> str:
     """Return the deterministic Zellij tab title for ``state``."""
 
-    glyph = _STATE_GLYPHS.get(state, _STATE_GLYPHS[DISCONNECTED])
-    return f"\u03c0 {glyph} {sanitize_name(name)}"
+    return f"\u03c0 {state_glyph(state)} {sanitize_name(name)}"
 
 
 # ---------------------------------------------------------------------------
