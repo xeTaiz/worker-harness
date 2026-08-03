@@ -8,6 +8,8 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+
+import typer
 from unittest.mock import ANY, AsyncMock, patch
 
 from typer.testing import CliRunner
@@ -108,7 +110,7 @@ class PiCliTests(unittest.TestCase):
         ])
         self.assertEqual(candidates[0]["_machine_cell"], "Global")
         self.assertEqual(candidates[1]["_machine_cell"], "Local · local")
-        self.assertEqual(candidates[2]["_machine_cell"], "╎")
+        self.assertEqual(candidates[2]["_machine_cell"], "Local · local")
         self.assertEqual(candidates[-1]["_machine_cell"], "Delegated · GPU Box")
 
     def test_picker_starts_on_first_local_with_global_one_step_up(self):
@@ -126,8 +128,8 @@ class PiCliTests(unittest.TestCase):
         self.assertEqual(selected["id"], "local")
         self.assertIn("--bind=load:pos(2)", run.call_args.args[0])
         picker_input = run.call_args.kwargs["input"].splitlines()
-        self.assertTrue(picker_input[0].startswith("global\tglobal router Global "))
-        self.assertTrue(picker_input[1].startswith("local\tlocal Local · local "))
+        self.assertTrue(picker_input[0].startswith("global\t✓   G   Global"))
+        self.assertTrue(picker_input[1].startswith("local\t✓   I   Local · local"))
 
     def test_picker_uses_aligned_glyph_type_name_and_searchable_path_columns(self):
         rows = pi._attach_candidates([{
@@ -150,17 +152,50 @@ class PiCliTests(unittest.TestCase):
 
         self.assertEqual(selected["id"], "local")
         command = run.call_args.args[0]
-        self.assertIn("--with-nth=3", command)
-        self.assertIn("--nth=2,3", command)
+        self.assertIn("--with-nth=2", command)
+        self.assertIn("--nth=1", command)
         self.assertIn("--no-hscroll", command)
         fields = run.call_args.kwargs["input"].strip().split("\t")
-        self.assertEqual(len(fields), 3)
+        self.assertEqual(len(fields), 2)
         self.assertEqual(fields[0], "local")
-        self.assertIn("0123456789abcdefghijkl", fields[1])
-        self.assertIn("/full/path/to/the/repository", fields[1])
-        self.assertTrue(fields[2].startswith("●   I   Local · local"))
-        self.assertIn("0123456789abcdef", fields[2])
-        self.assertTrue(fields[2].endswith("/full/path/to/the/repository"))
+        self.assertTrue(fields[1].startswith("●   I   Local · local"))
+        self.assertIn("0123456789abcdef", fields[1])
+        self.assertTrue(fields[1].endswith("/full/path/to/the/repository"))
+
+    @unittest.skipUnless(pi.shutil.which("fzf"), "fzf is not installed")
+    def test_installed_fzf_filters_visible_name_and_path(self):
+        rows = pi._attach_candidates([{
+            **self._session(),
+            "id": "drrt",
+            "host": "KW60898",
+            "name": "DRRT",
+            "cwd": "/home/engeld/Dev/DRRT",
+        }], local_host="archdome")
+        captured: dict[str, object] = {}
+
+        def capture(command, **kwargs):
+            captured["command"] = command
+            captured["input"] = kwargs["input"]
+            return subprocess.CompletedProcess(command, 130, "", "")
+
+        with (
+            patch.object(pi.shutil, "which", return_value=pi.shutil.which("fzf")),
+            patch.object(pi.subprocess, "run", side_effect=capture),
+        ):
+            with self.assertRaises(typer.Abort):
+                pi._pick_session(rows)
+
+        for query in ("d", "D", "DRRT"):
+            with self.subTest(query=query):
+                result = subprocess.run(
+                    [*captured["command"], f"--filter={query}"],
+                    input=captured["input"],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0)
+                self.assertTrue(result.stdout.startswith("drrt\t"))
 
     def test_picker_abbreviates_global_and_delegated_types(self):
         rows = pi._attach_candidates([
@@ -180,7 +215,7 @@ class PiCliTests(unittest.TestCase):
         ):
             pi._pick_session(rows)
 
-        displays = [line.split("\t")[2] for line in captured["input"].splitlines()]
+        displays = [line.split("\t")[1] for line in captured["input"].splitlines()]
         self.assertIn("✓   G", displays[0])
         self.assertIn("✓   D", displays[1])
 

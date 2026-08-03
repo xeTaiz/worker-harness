@@ -159,11 +159,10 @@ def _attach_candidates(
         -int(row.get("updated_at") or 0),
         str(row.get("id") or ""),
     ))
-    previous_group = ""
     for row in candidates:
-        group = str(row["_machine_group"])
-        row["_machine_cell"] = row["_machine_label"] if group != previous_group else "╎"
-        previous_group = group
+        # Repeat the machine on every row. Group adjacency still provides the
+        # visual grouping, while every filtered result remains self-contained.
+        row["_machine_cell"] = row["_machine_label"]
     return candidates
 
 
@@ -398,16 +397,7 @@ def _pick_session(rows: list[dict]) -> dict:
             set_cell_size(label, _PICKER_NAME_WIDTH),
             cwd,
         ))
-        search = " ".join((
-            str(row.get("_machine_search") or ""),
-            str(row.get("_machine_label") or ""),
-            label,
-            cwd,
-            state,
-            session_type,
-            session_id,
-        )).translate(_PICKER_TEXT_TRANSLATION)
-        lines.append("\t".join((session_id, search, display)))
+        lines.append("\t".join((session_id, display)))
     header = "   ".join((
         "S",
         "T",
@@ -425,8 +415,10 @@ def _pick_session(rows: list[dict]) -> dict:
         "--no-sort",
         "--no-hscroll",
         "--delimiter=\\t",
-        "--with-nth=3",
-        "--nth=2,3",
+        "--with-nth=2",
+        # fzf applies --nth after --with-nth. Search the one transformed
+        # display field; combining original field indexes here matches nothing.
+        "--nth=1",
         f"--header={header}",
         "--prompt=Pi session> ",
     ]

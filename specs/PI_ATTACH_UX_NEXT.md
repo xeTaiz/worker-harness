@@ -227,25 +227,25 @@ Use this same ordered inventory for next/previous cycling. In fzf, automatically
 Keep every row selectable and use one preformatted, cell-width-aware display field so columns align consistently:
 
 ```text
-id<TAB>search_text<TAB>display
+id<TAB>display
 ```
 
 - `display` is `S   T   MACHINE(24)   NAME(16)   PATH`, using Rich terminal-cell widths rather than raw code-point padding.
 - Status reuses the tab glyphs: `●` working, `✓` idle, `!` failed, `?` disconnected.
 - Type is one unambiguous letter: `I` interactive, `D` delegated, `G` global router.
-- `search_text` includes the full machine label, full untruncated name/task, full path, state, type, and session ID; the visible name is capped at 16 cells and the full path remains on the right.
-- Hide `id` and `search_text` with `--with-nth=3`, while `--nth=2,3` keeps both hidden metadata and visible text searchable.
-- Show the full machine label on the first row and `╎` on continuation rows.
-- Preserve full session ID as the selection key and disable horizontal scroll so the aligned leading columns remain stable.
+- The visible name is capped at 16 cells and the full path remains on the right.
+- Repeat the machine label on every row so a filtered result is self-contained; group adjacency still supplies the grouping.
+- Use `--with-nth=2 --nth=1`: fzf applies `--nth` after the `--with-nth` transformation, so referring to original hidden field indexes would make every query return zero matches.
+- Preserve full session ID as the hidden selection key and disable horizontal scroll so the aligned leading columns remain stable.
 
-When a query filters out a group's first row, continuation glyphs may remain; this is acceptable for a single-stage fzf implementation because the hidden machine field still searches correctly. Do not add selectable separator/header rows.
+Search intentionally covers the complete visible row, including machine, displayed name, and full path. Do not add selectable separator/header rows.
 
 ### 5.4 Commit 3 tests
 
 - Interactive host, delegated worker-name mapping, worker-ID fallback, global router, and unknown group.
 - Local host first, alphabetical remote groups, state/recent/ID order within groups.
-- Visual machine label only on first row and hidden machine field on every row.
-- Searching/selection still maps the complete fzf row to the correct session.
+- Visual machine label on every row, including continuation rows in the same group.
+- Installed-fzf filtering by lowercase/uppercase name and full path still maps the complete row to the correct session.
 - Next/previous cycles across the exact grouped order and wraps.
 
 ## 6. Commit 4 — live plugin-free state glyphs — implemented
