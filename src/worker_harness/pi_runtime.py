@@ -17,6 +17,7 @@ from typing import Any, Sequence
 from urllib.parse import quote
 
 MANAGED_TMUX_SESSION = "wh-pi"
+MANAGED_TMUX_HISTORY_LIMIT = 50_000
 _ROUTE_POLL_SECONDS = 0.1
 _PANE_ID = re.compile(r"^%\d+$")
 _CONFLICTING_PI_OPTIONS = {
@@ -134,11 +135,28 @@ def _session_exists(socket: Path) -> bool:
 def _configure_managed_server(socket: Path) -> None:
     for key in ("ZELLIJ", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID"):
         _run_tmux(socket, "set-environment", "-g", "-u", key, check=False)
-    # This server is exclusively Worker Harness-owned. Keep the global default
-    # off so every future grouped relay session starts without backend chrome,
-    # then reinforce it on the owner session itself.
+    # This server is exclusively Worker Harness-owned. Keep managed defaults
+    # isolated from the user's tmux configuration, then reinforce the options
+    # that attached clients depend on directly on the owner session.
     _run_tmux(socket, "set-option", "-g", "status", "off")
+    _run_tmux(socket, "set-option", "-g", "mouse", "on")
+    _run_tmux(
+        socket,
+        "set-option",
+        "-g",
+        "history-limit",
+        str(MANAGED_TMUX_HISTORY_LIMIT),
+    )
     _run_tmux(socket, "set-option", "-t", MANAGED_TMUX_SESSION, "status", "off")
+    _run_tmux(socket, "set-option", "-t", MANAGED_TMUX_SESSION, "mouse", "on")
+    _run_tmux(
+        socket,
+        "set-option",
+        "-t",
+        MANAGED_TMUX_SESSION,
+        "history-limit",
+        str(MANAGED_TMUX_HISTORY_LIMIT),
+    )
     _run_tmux(
         socket,
         "set-option",
@@ -219,8 +237,29 @@ def start_managed_pi(
             command,
         )
     else:
+        # Set global options in the same tmux command queue that starts the
+        # server, before the first pane is allocated. In particular, tmux fixes
+        # a pane's history limit at creation time, so configuring it after
+        # new-session would leave the first managed Pi at the 2,000-line default.
         created = _run_tmux(
             socket,
+            "start-server",
+            ";",
+            "set-option",
+            "-g",
+            "status",
+            "off",
+            ";",
+            "set-option",
+            "-g",
+            "mouse",
+            "on",
+            ";",
+            "set-option",
+            "-g",
+            "history-limit",
+            str(MANAGED_TMUX_HISTORY_LIMIT),
+            ";",
             "new-session",
             "-d",
             "-P",

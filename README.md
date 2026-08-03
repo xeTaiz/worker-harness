@@ -56,8 +56,10 @@ wh pi attach <id-prefix-or-name>     # select directly
 
 `wh pi start` generates the internal Pi session ID, creates one single-pane
 window in a dedicated status-free tmux server, waits for its exact local route,
-and attaches over loopback; `--name` is only the human-facing label. Press
-`Ctrl-]` to detach without stopping Pi. Tmux sources always stream through a
+and attaches over loopback; `--name` is only the human-facing label. The
+managed backend retains 50,000 lines per new pane and enables tmux mouse mode,
+so scrolling up enters tmux copy mode even through Zellij. Press `Ctrl-]` to
+detach without stopping Pi. Tmux sources always stream through a
 disposable relay client, including on the source host, so an unrelated outer
 tmux keeps its own status and navigation. A same-client local Zellij source is
 the sole direct-focus exception because streaming it recursively would render

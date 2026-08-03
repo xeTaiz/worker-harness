@@ -103,6 +103,11 @@ class PiRuntimeTests(unittest.TestCase):
         self.assertIn("177", args)
         self.assertIn("-y", args)
         self.assertIn("51", args)
+        new_session_index = args.index("new-session")
+        self.assertEqual(args[1], "start-server")
+        self.assertLess(args.index("mouse"), new_session_index)
+        self.assertLess(args.index("history-limit"), new_session_index)
+        self.assertLess(args.index(str(pi_runtime.MANAGED_TMUX_HISTORY_LIMIT)), new_session_index)
         configure.assert_called_once_with(socket)
 
     def test_concurrent_owner_creation_falls_back_to_new_window(self):
@@ -124,18 +129,36 @@ class PiRuntimeTests(unittest.TestCase):
                     executable="/usr/bin/pi",
                 )
         self.assertEqual(managed.tmux_pane_id, "%13")
-        self.assertEqual(run.call_args_list[0].args[1], "new-session")
+        self.assertEqual(run.call_args_list[0].args[1], "start-server")
+        self.assertIn("new-session", run.call_args_list[0].args)
         self.assertEqual(run.call_args_list[1].args[1], "new-window")
         configure.assert_called_once_with(socket)
 
-    def test_managed_server_disables_global_and_owner_status(self):
+    def test_managed_server_configures_global_and_owner_options(self):
         completed = subprocess.CompletedProcess([], 0, "", "")
         with patch.object(pi_runtime, "_run_tmux", return_value=completed) as run:
             pi_runtime._configure_managed_server(Path("/tmp/pi.sock"))
         commands = [call.args[1:] for call in run.call_args_list]
+        history_limit = str(pi_runtime.MANAGED_TMUX_HISTORY_LIMIT)
         self.assertIn(("set-option", "-g", "status", "off"), commands)
+        self.assertIn(("set-option", "-g", "mouse", "on"), commands)
+        self.assertIn(("set-option", "-g", "history-limit", history_limit), commands)
         self.assertIn(
             ("set-option", "-t", pi_runtime.MANAGED_TMUX_SESSION, "status", "off"),
+            commands,
+        )
+        self.assertIn(
+            ("set-option", "-t", pi_runtime.MANAGED_TMUX_SESSION, "mouse", "on"),
+            commands,
+        )
+        self.assertIn(
+            (
+                "set-option",
+                "-t",
+                pi_runtime.MANAGED_TMUX_SESSION,
+                "history-limit",
+                history_limit,
+            ),
             commands,
         )
         self.assertIn(

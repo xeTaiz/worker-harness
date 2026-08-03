@@ -177,7 +177,7 @@ Expected implementation files:
 - dotfiles `zellij/.config/zellij/config.kdl`;
 - README and the parent distributed-session spec status.
 
-No orchestrator image, SQLite migration, or worker SIF rebuild is required. Operator hosts require updated dotfiles/CLI, host-relay restart, Pi `/reload`, and a fresh/reloaded Zellij configuration. The live relay is revision 12. It retains environment/TMPDIR hardening, adds managed-runtime route metadata, reinforces the managed server's global `status off`, and fails closed unless each grouped tmux attachment session has `status off` plus `window-size latest`.
+No orchestrator image, SQLite migration, or worker SIF rebuild is required. Operator hosts require updated dotfiles/CLI, host-relay restart, Pi `/reload`, and a fresh/reloaded Zellij configuration. Relay revision 13 retains environment/TMPDIR hardening and managed-runtime route metadata, reinforces the managed server's global `status off` plus `mouse on`, and fails closed unless each grouped tmux attachment session has `status off` plus `window-size latest`; managed grouped sessions also explicitly enable mouse mode so wheel events pass through Zellij into tmux copy mode.
 
 ## 9. Implementation slices
 

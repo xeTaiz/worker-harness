@@ -29,7 +29,7 @@ A later shell alias may make this feel like ordinary `pi`, but plain `pi` in an 
 2. **The hidden server uses a distinct socket.** It is not the operator's outer tmux server. An outer tmux client therefore keeps its own status bar, windows, prefix, and session state while the managed Pi backend remains invisible.
 3. **One Pi per window, one pane per window.** The managed server has no split-pane topology. This avoids relay zoom conflicts and lets each Pi window participate independently in tmux sizing.
 4. **One owner session groups the Pi windows.** The launcher recreates the owner session when absent. It may disappear when the last Pi exits; the next launch recreates it.
-5. **No visible backend chrome.** Force `status off` and `window-size latest` on the owner session and on relay-created grouped sessions. Existing probes confirm grouped sessions inherit both values, but the relay should enforce them defensively.
+5. **No visible backend chrome, but native scrollback.** Force `status off`, `mouse on`, `history-limit 50000`, and `window-size latest` on the managed server/owner session. Relay-created grouped sessions defensively reinforce `status off`, `mouse on`, and `window-size latest`. The history limit must be set before the first pane is created because tmux fixes each pane's allocation at creation time.
 6. **The backend is intentionally hard to operate directly.** Worker Harness owns creation, naming, attachment, cycling, detach, and cleanup. Lack of convenient nested tmux bindings is a benefit, not a UX defect, provided the Worker Harness escape/detach path is reliable.
 7. **Protocol v2 remains unchanged.** This adds launcher and local-path policy only; no orchestrator schema, terminal protocol, worker SIF, attachment ownership, or gateway change is required.
 
@@ -82,12 +82,19 @@ Resume modes need explicit handling. If the operator supplies `--session`, `--se
 1. Resolve the real Pi executable before any optional `pi -> wh pi start` alias to avoid recursion.
 2. Determine the managed socket and create its parent directory mode `0700`.
 3. Ensure the dedicated tmux server and owner session exist.
-4. Force owner options:
+4. In the first server-start command queue, set managed global options before creating the first pane; then reinforce the owner-session options on every launch:
 
    ```tmux
+   set-option -g status off
+   set-option -g mouse on
+   set-option -g history-limit 50000
    set-option -t wh-pi status off
+   set-option -t wh-pi mouse on
+   set-option -t wh-pi history-limit 50000
    set-option -t wh-pi window-size latest
    ```
+
+   `mouse on` lets a wheel gesture pass through Ghostty/Zellij into tmux's built-in `WheelUpPane` copy-mode binding. Existing panes cannot be enlarged retroactively; the configured history limit applies when each pane is allocated.
 
 5. Generate the private session UUID and human display name.
 6. Create a detached one-pane window and capture its stable pane ID. Treat the name and all Pi arguments as untrusted argv data: use an argv-safe launcher helper or strict shell quoting for tmux's command string; never concatenate operator/model-generated text into an executable shell fragment.
@@ -225,7 +232,7 @@ Recommended defaults:
 ## 13. Rollout
 
 1. **Implemented:** dedicated socket/session manager and pure command construction tests.
-2. **Implemented and hardened in relay revision 12:** nested tmux/Zellij environment sanitization, managed-runtime route metadata, managed-server global `status off`, and fail-closed grouped-session `status off` verification.
+2. **Implemented and hardened through relay revision 13:** nested tmux/Zellij environment sanitization, managed-runtime route metadata, managed-server global `status off`, and fail-closed grouped-session `status off` verification landed through revision 12; revision 13 additionally reinforces `mouse on` globally and on each managed grouped attachment session.
 3. **Implemented:** new-session identity/name handling, argv-safe detached window lifecycle, and explicit rejection of resume/continue/fork conflicts.
 4. **Implemented:** exact local UDS route wait plus loopback native attach and `--no-attach`.
 5. **Revision-12 fix live; final user confirmation pending:** the reopened two-status-bar gate now enforces global and owner `status off` on the managed server plus grouped-session verification in the relay. Live outer-tmux instrumentation showed the outer session `on` while global, `wh-pi`, and active `wh_attach_*` were all `off`; the user should repeat the original visual sequence.
