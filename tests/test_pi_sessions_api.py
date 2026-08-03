@@ -121,7 +121,7 @@ class PiSessionsApiTests(unittest.TestCase):
         self.assertIn("new WebSocket", script.text)
         self.assertIn("attach-info", script.text)
         self.assertIn("gateway_websocket_url", script.text)
-        self.assertIn("idle-timeout", script.text)
+        self.assertNotIn("idle-timeout", script.text)
         self.assertIn("replaced", script.text)
         self.assertIn("4410", script.text)
         self.assertIn("orchestrator gateway", script.text)

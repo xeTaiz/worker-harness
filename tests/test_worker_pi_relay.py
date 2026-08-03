@@ -232,40 +232,25 @@ class PiRelayTests(unittest.TestCase):
                 self.assertEqual(client.get("/healthz").json()["attachment_count"], 0)
                 client.post(f"/v1/sessions/{session_id}:cancel")
 
-    def test_worker_relay_detaches_idle_client_but_preserves_session(self):
+    def test_worker_relay_keeps_idle_client_attached_until_disconnect(self):
         with tempfile.TemporaryDirectory() as tmp:
-            state = self.relay.RelayState(
-                root=Path(tmp) / "sessions",
-                command="/bin/sh",
-                default_cwd=Path(tmp),
-                attach_idle_seconds=0.1,
-            )
+            with patch.dict(os.environ, {"WH_PI_ATTACH_IDLE_SECONDS": "0.05"}):
+                state = self.relay.RelayState(
+                    root=Path(tmp) / "sessions",
+                    command="/bin/sh",
+                    default_cwd=Path(tmp),
+                )
             app = self.relay.create_relay_app(state)
-            session_id = f"idle-attach-{time.time_ns()}"
+            session_id = f"persistent-attach-{time.time_ns()}"
             with TestClient(app) as client:
                 client.post("/v1/sessions", json={"session_id": session_id})
                 with client.websocket_connect(f"/v1/sessions/{session_id}/attach") as websocket:
                     self.assertEqual(websocket.receive_json()["type"], "status")
-                    time.sleep(0.06)
-                    refreshed_at = time.monotonic()
+                    time.sleep(0.1)
+                    health = client.get("/healthz").json()
+                    self.assertEqual(health["attachments_by_session"], {session_id: 1})
+                    self.assertNotIn("attachment_idle_seconds", health)
                     websocket.send_json({"type": "resize", "rows": 30, "cols": 100})
-                    deadline = time.monotonic() + 3
-                    idle_status = None
-                    while time.monotonic() < deadline:
-                        message = websocket.receive()
-                        if message.get("text"):
-                            payload = json.loads(message["text"])
-                            if payload.get("state") == "idle-timeout":
-                                idle_status = payload
-                                break
-                    self.assertEqual(
-                        idle_status,
-                        {"type": "status", "state": "idle-timeout", "reason": "attachment inactive"},
-                    )
-                    self.assertGreaterEqual(time.monotonic() - refreshed_at, 0.08)
-                    with self.assertRaises(WebSocketDisconnect) as closed:
-                        websocket.receive_text()
-                    self.assertEqual(closed.exception.code, 4408)
                 self.assertEqual(client.get("/v1/sessions").json()[0]["state"], "working")
                 self.assertEqual(client.get("/healthz").json()["attachment_count"], 0)
                 client.post(f"/v1/sessions/{session_id}:cancel")

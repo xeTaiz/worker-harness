@@ -18,7 +18,7 @@ Make Zellij a first-class Worker Harness operator client and interactive-session
 - a client running in either tmux or Zellij can attach to either source multiplexer;
 - same-host, same-multiplexer targets focus the original pane directly;
 - cross-host and cross-multiplexer targets use the existing protocol-v2 direct WebSocket with orchestrator-gateway fallback;
-- the picker, next/previous cycling, detach, resize, bounded multi-attach, idle timeout, and longest-idle replacement behave the same as the tmux client.
+- the picker, next/previous cycling, detach, resize, bounded persistent multi-attach, and longest-idle replacement behave the same as the tmux client.
 
 This is a client/host-relay milestone. It must not introduce a second registry, a second terminal protocol, an orchestrator schema change, a worker-image requirement, or Zellij-specific attachment ownership.
 
@@ -29,7 +29,7 @@ This is a client/host-relay milestone. It must not introduce a second registry, 
 3. **Direct local focus is Zellij-only.** All tmux sources stream through a disposable relay client, including on the source host. Zellij retains client-aware pane actions only to prevent recursive same-client rendering.
 4. **Zellij 0.44.2 is the initial compatibility floor.** The adapter relies on `ZELLIJ_SESSION_NAME`, `ZELLIJ_PANE_ID`, `zellij action list-panes --json --all`, `focus-pane-id`, `switch-session --pane-id`, and `list-clients`.
 5. **No WASM plugin in v1.** The existing native CLI/fzf picker plus KDL bindings are sufficient. A custom dashboard/status-bar plugin is optional follow-up work.
-6. **Protocol v2 is unchanged.** Direct/gateway framing, close codes, capacity eight, one-hour idle timeout, and longest-idle replacement remain authoritative.
+6. **Protocol v2 is unchanged.** Direct/gateway framing, close codes, capacity eight, persistent connection lifetime, and longest-idle replacement remain authoritative.
 7. **One Bun host relay supports both source multiplexers.** Tailscale Serve continues to publish only `27888`; loopback remains `127.0.0.1:27890`; the UDS remains mode `0600`.
 
 ## 3. Behavior matrix
@@ -91,9 +91,9 @@ Refactor host-relay route and attachment operations behind a small multiplexer b
 
 - route registration, incarnation replacement, TTL, unregister, and stale cleanup;
 - direct WebSocket upgrade and protocol-v2 status;
-- initial dimensions, input, changed-resize activity, output forwarding;
+- initial dimensions, input, changed-resize activity ranking, output forwarding;
 - cap eight, exact attachment IDs, longest-idle replacement, `4410`;
-- idle detach, `4408`;
+- attachment persistence until disconnect or capacity replacement;
 - Tailscale publication and health.
 
 ### 5.2 Tmux adapter
@@ -177,7 +177,7 @@ Expected implementation files:
 - dotfiles `zellij/.config/zellij/config.kdl`;
 - README and the parent distributed-session spec status.
 
-No orchestrator image, SQLite migration, or worker SIF rebuild is required. Operator hosts require updated dotfiles/CLI, host-relay restart, Pi `/reload`, and a fresh/reloaded Zellij configuration. Relay revision 13 retains environment/TMPDIR hardening and managed-runtime route metadata, reinforces the managed server's global `status off` plus `mouse on`, and fails closed unless each grouped tmux attachment session has `status off` plus `window-size latest`; managed grouped sessions also explicitly enable mouse mode so wheel events pass through Zellij into tmux copy mode.
+No orchestrator image, SQLite migration, or worker SIF rebuild is required for the Zellij adapter itself. Operator hosts require updated dotfiles/CLI, host-relay restart, Pi `/reload`, and a fresh/reloaded Zellij configuration. Relay revision 14 retains environment/TMPDIR hardening and managed-runtime route metadata, reinforces the managed server's global `status off` plus `mouse on`, fails closed unless each grouped tmux attachment session has `status off` plus `window-size latest`, and removes application-inactivity attachment detachment; managed grouped sessions also explicitly enable mouse mode so wheel events pass through Zellij into tmux copy mode.
 
 ## 9. Implementation slices
 
@@ -201,7 +201,7 @@ No orchestrator image, SQLite migration, or worker SIF rebuild is required. Oper
 - implement disposable bootstrap client;
 - exact target confirmation, startup timeout, suppressed bootstrap output;
 - resize/input/output/cleanup;
-- common cap/idle/replacement behavior.
+- common cap/persistence/replacement behavior.
 
 ### Z4 — picker/cycle/detach KDL UX — implemented; operator acceptance pending
 

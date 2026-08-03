@@ -473,11 +473,9 @@ function connectTerminal() {
         try {
           const payload = JSON.parse(event.data);
           if (payload.type === "status") {
-            if (payload.state === "idle-timeout" || payload.state === "replaced") {
+            if (payload.state === "replaced") {
               returnToSelector = true;
-              terminalStatus.textContent = payload.state === "replaced"
-                ? "Detached to make room for a newer attachment"
-                : "Detached after 1 hour of inactivity";
+              terminalStatus.textContent = "Detached to make room for a newer attachment";
               terminalStatus.className = "";
               socket.close(1000, `${payload.state} acknowledged`);
               setTimeout(() => {
@@ -508,10 +506,8 @@ function connectTerminal() {
         tryCandidate(index + 1);
         return;
       }
-      if (event.code === 4408 || event.code === 4410) {
-        terminalStatus.textContent = event.code === 4410
-          ? "Detached to make room for a newer attachment"
-          : "Detached after 1 hour of inactivity";
+      if (event.code === 4410) {
+        terminalStatus.textContent = "Detached to make room for a newer attachment";
         terminalStatus.className = "";
         setTimeout(closeDetail, 0);
         return;

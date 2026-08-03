@@ -175,7 +175,7 @@ The tmux implementation is feature-complete. The bridge captures stable tmux soc
 
 The remaining tmux work is rollout and acceptance across all hosts, not new attachment architecture. Attachments created before pane-marker support must be reopened once before cycling.
 
-The Zellij adapter is implemented in Worker Harness `81b411b`, `c5445b0`, and `a9dbe48` plus the attachment-tab UX and companion dotfiles through relay revision 13. It provides exact local-pane focus, remote PTY attachment through a disposable client, initial/dynamic resize, source-safe cleanup, multi-attach behavior, local/streamed cycling, and managed-tmux mouse-wheel forwarding into copy mode. A full plugin remains optional. The remaining Zellij work is the mixed tmux/Zellij local/remote/delegated live matrix, mixed-size client acceptance, gateway fallback, shortcut acceptance, and a refined return UX after directly focusing an original local pane.
+The Zellij adapter is implemented in Worker Harness `81b411b`, `c5445b0`, and `a9dbe48` plus the attachment-tab UX and companion dotfiles through relay revision 14. It provides exact local-pane focus, remote PTY attachment through a disposable client, initial/dynamic resize, source-safe cleanup, persistent multi-attach behavior, local/streamed cycling, and managed-tmux mouse-wheel forwarding into copy mode. A full plugin remains optional. The remaining Zellij work is the mixed tmux/Zellij local/remote/delegated live matrix, mixed-size client acceptance, gateway fallback, shortcut acceptance, and a refined return UX after directly focusing an original local pane.
 
 ### 6.2 Terminal protocol
 
@@ -195,18 +195,18 @@ The fabric is single-operator and intentionally permits multiple read-write clie
 
 Implemented initially in Worker Harness `8f20af5` and dotfiles `c3b6273`, then hardened for longest-idle replacement and close propagation in Worker Harness `ad9e056`/`29fb101` and dotfiles `82d8c00`; the checklist remains the acceptance contract:
 
-1. **Common policy:** allow at most eight live attachments per Pi session on both host and worker relays. When a new attachment arrives at capacity, atomically reclaim the longest-idle attachment and admit the newcomer so a broken idle reaper cannot lock out the operator. The victim receives `{type:"status", state:"replaced"}` and WebSocket close code `4410`; a typed `attachment_limit`/`4429` remains only as a defensive fallback if no reservation can be reclaimed. Expose active and eviction counts in relay health/metrics.
+1. **Common policy:** allow at most eight live attachments per Pi session on both host and worker relays. When a new attachment arrives at capacity, atomically reclaim the longest-idle attachment and admit the newcomer so clients that fail to disconnect cleanly cannot lock out the operator. The victim receives `{type:"status", state:"replaced"}` and WebSocket close code `4410`; a typed `attachment_limit`/`4429` remains only as a defensive fallback if no reservation can be reclaimed. Expose active and eviction counts in relay health/metrics.
 2. **Per-connection identity:** allocate an in-memory attachment ID for exact cleanup. Never key cleanup solely by session ID.
-3. **One-hour inactivity:** track client-originated application activity per attachment. Terminal input and changed resize frames refresh activity; PTY output and WebSocket ping/pong do not, because tmux status redraws would otherwise keep abandoned clients alive forever. After more than 3600 seconds without client activity, send `{type:"status", state:"idle-timeout"}`, close only that attachment, and leave Pi/tmux running. Passive viewers may therefore be detached after one hour and can immediately reattach.
-4. **Worker relay:** add an async-safe per-session reservation/count around `_relay_terminal`; release in `finally`; add a watchdog task to each PTY/WebSocket pair; make limits/timeouts configurable for tests while defaulting to `8` and `3600`.
+3. **Connection lifetime:** track client-originated application activity only to rank longest-idle replacement candidates. Terminal input and changed resize frames refresh that ranking timestamp; PTY output and WebSocket ping/pong do not. There is no application inactivity timeout: an attachment remains live until its client, network, PTY, or route disconnects, or until it is replaced at capacity.
+4. **Worker relay:** add an async-safe per-session reservation/count around `_relay_terminal`; release in `finally`; keep the cap configurable for tests with a default of `8`; do not run a per-attachment inactivity watchdog.
 5. **Interactive host relay:** replace `Map<sessionId, Attachment>` with per-session attachment-ID sets/maps and reserve capacity during WebSocket upgrade so simultaneous opens cannot exceed the cap.
 6. **Shared tmux window state:** snapshot/unzoom/zoom once for the first attachment to a pane, reference-count subsequent attachments, and restore the operator's original active pane/zoom only after the final attachment closes and only when the relay-applied state still matches. Concurrent relay attachment to two different target panes in one shared tmux window must fail explicitly rather than corrupting zoom state.
-7. **Route lifecycle:** unregister, stale-route reap, relay shutdown, PTY exit, WebSocket close, and idle timeout must each clean every relevant attachment idempotently without killing the source Pi session.
+7. **Route lifecycle:** unregister, stale-route reap, relay shutdown, PTY exit, and WebSocket close must each clean every relevant attachment idempotently without killing the source Pi session.
 8. **Resize semantics:** retain tmux `window-size latest`; the most recently connected/resized client controls shared dimensions. Clients send resize only when their actual dimensions change, avoiding continuous contention. Document this single-operator tradeoff.
-9. **Native UX:** direct attach remains first choice; an idle-timeout status restores the local TTY and returns the fullscreen attachment window to the attachable-agent selector. `Ctrl-]`, `Ctrl-a x`, and cycling remain immediate clean detach paths.
-10. **PWA UX:** idle timeout closes the terminal socket and returns to the session selector/list. Manual reconnect creates a fresh ordinary attachment; no ownership recovery state is required.
+9. **Native UX:** direct attach remains first choice; a replacement status restores the local TTY and returns the fullscreen attachment window to the attachable-agent selector. `Ctrl-]`, `Ctrl-a x`, and cycling remain immediate clean detach paths.
+10. **PWA UX:** replacement closes the victim's terminal socket and returns it to the session selector/list. Manual reconnect creates a fresh ordinary attachment; no ownership recovery state is required.
 11. **Compatibility:** keep protocol v2 framing and legacy `websocket_url`. Add the `replaced` status and close code `4410` compatibly; native and PWA victims return to their selector and can immediately reclaim a slot in turn. No database migration or protocol-v3 lease rollout is required.
-12. **Tests:** cover two simultaneous read-write clients, longest-idle replacement at capacity, pending-reservation and delayed-cleanup races, one-hour timeout with a short test clock, input/changed-resize activity refresh, output-not-activity behavior, source-session survival, final-only zoom restoration, route teardown, and current tmux sizing behavior.
+12. **Tests:** cover two simultaneous read-write clients, persistent silent attachments, longest-idle replacement at capacity, pending-reservation and delayed-cleanup races, input/changed-resize activity ranking, output-not-activity behavior, source-session survival, final-only zoom restoration, route teardown, and current tmux sizing behavior.
 
 ### 6.4 Orchestrator gateway fallback — implemented and deployed; live acceptance pending
 
@@ -219,7 +219,7 @@ Implemented in Worker Harness `8f20af5` and hardened for longest-idle replacemen
 3. Resolve session state and direct relay target once before pumping. Forward only validated initial `rows`/`cols` query parameters upstream.
 4. Use two strict receive-then-send tasks with no unbounded intermediate terminal queue and no SQLite work per frame. Preserve text/binary frames exactly.
 5. Bound WebSocket library queues, cap concurrent gateway streams, reclaim the longest-idle gateway stream before opening a replacement upstream, apply a per-send stall watchdog, and propagate close/cancellation in both directions. The upstream relay remains the authoritative unified cap across direct and gateway clients. Never persist or log terminal payload bytes.
-6. Native CLI/tmux/Zellij clients try direct first and use gateway only for connection/upgrade failures. They must not fallback after a deliberate idle timeout or clean detach.
+6. Native CLI/tmux/Zellij clients try direct first and use gateway only for connection/upgrade failures. They must not fallback after a deliberate replacement or clean detach.
 7. The PWA uses gateway first for same-origin reliability, then direct if the gateway cannot be opened. Display the active transport accurately.
 8. Add gateway active/refused/evicted/close-reason metrics and health visibility.
 9. Test binary and JSON frame fidelity, bidirectional close, unavailable upstream, direct/gateway coexistence under the relay cap, slow-client timeout/backpressure, and URL construction behind HTTP/HTTPS.
@@ -351,7 +351,7 @@ It selects the likely target from session name, CWD, recent activity, and explic
 1. **CLI:** `wh pi sessions`, `wh pi events`, `wh pi prompt`, and `wh pi attach` are implemented. `wh pi watch` and a CLI delegation convenience command remain optional parity work because the Pi extension already exposes delegation.
 2. **tmux:** local exact-pane focus and remote attachment are implemented, including fullscreen resize, detach, and cross-agent cycling.
 3. **Zellij:** the client/host-relay adapter is implemented: stable locators, exact local focus, disposable remote clients, resize, cleanup, picker, and local/streamed cycling reuse the same discovery/attachment contract. Full mixed-host/multiplexer live acceptance remains.
-4. **Mobile webapp/PWA:** the Tailnet-served session directory, durable semantic transcript, session switching, prompt/steer composer, model/thinking controls, terminal preview, gateway-first transport, and idle/replacement return UX are implemented. Automatic reconnect, HTTPS installation, real-browser gateway acceptance, and optional xterm-grade rendering remain.
+4. **Mobile webapp/PWA:** the Tailnet-served session directory, durable semantic transcript, session switching, prompt/steer composer, model/thinking controls, terminal preview, gateway-first transport, and capacity-replacement return UX are implemented. Automatic reconnect, HTTPS installation, real-browser gateway acceptance, and optional xterm-grade rendering remain.
 
 The production build is separated per `specs/WEB_UI_ORCHESTRATOR_SEPARATION.md`: the standalone `wh-web` container serves the static PWA and proxies only the session UI's HTTP/SSE/WebSocket routes to `wh-orch:12889` over a private Docker network; the orchestrator image no longer bundles `web/`. Phase 1 preserves the Tailnet-only trust boundary and gateway-first/direct-fallback browser behavior. A later optional public edge must use authenticated same-origin HTTPS, gateway-only terminal transport, exact route allowlisting, and private `:12888`, `:12889`, and `:27888` ports. A distinct browser/API origin, broad `/api/` proxy, or unauthenticated public control API remains prohibited.
 
@@ -367,8 +367,8 @@ Semantic transcript events share the durable `pi_session_events` log. SQLite ass
 - Ordinary interactive bridges register on `:12889`, survive incarnation replacement, report lifecycle/model/thinking state, upload durable sanitized transcript events, and claim/ack prompt/configure commands. Delegated reports enter through `:12888`; stale projections receive permanent `410 Gone` handling.
 - SQLite sequence cursors, bounded replay, SSE, latest-exchange backfill, and the mobile-first semantic webapp are implemented. Live acceptance still needs repeated-reload deduplication and orchestrator-restart bridge re-registration checks.
 - Direct protocol-v2 terminal relays are implemented for delegated worker sessions and ordinary tmux/Zellij interactive sessions. The native CLI supports attachable-only discovery, exact local-pane focus, remote fullscreen streaming, reliable initial/dynamic sizing, `Ctrl-]`, and cross-agent cycling. Tmux is feature-complete; fleet rollout and a local/remote/delegated cycling matrix remain.
-- Bounded multi-attachment/idle cleanup and the orchestrator gateway are implemented and deployed. Corrected direct-relay live acceptance opened eight draining clients, refreshed one, and proved that the ninth replaced the true longest-idle client with status `replaced` plus close `4410`, kept the count at eight, and preserved the source Pi. Full interactive/delegated/direct/gateway/backpressure acceptance remains.
-- Zellij registration, exact local focus, disposable remote attachment, cap/idle/replacement reuse, recursive-local-stream prevention, and local/streamed cycling are implemented. Isolated exact-client and cap-two tests passed; the mixed tmux/Zellij source/client matrix, mixed-size semantics, gateway fallback, shortcut acceptance, and direct-focus return UX remain.
+- Bounded persistent multi-attachment and the orchestrator gateway are implemented and deployed. Corrected direct-relay live acceptance opened eight draining clients, refreshed one, and proved that the ninth replaced the true longest-idle client with status `replaced` plus close `4410`, kept the count at eight, and preserved the source Pi. Full interactive/delegated/direct/gateway/backpressure acceptance remains.
+- Zellij registration, exact local focus, disposable remote attachment, cap/persistence/replacement reuse, recursive-local-stream prevention, and local/streamed cycling are implemented. Isolated exact-client and cap-two tests passed; the mixed tmux/Zellij source/client matrix, mixed-size semantics, gateway fallback, shortcut acceptance, and direct-focus return UX remain.
 - Fresh non-live validation reports 161 tests plus 19 subtests passing, Python compile/diff checks clean, revision-12 Bun relay/bridge builds valid, and the floating-picker Zellij KDL configuration valid. The global router remains a separate orthogonal milestone.
 
 ### M0 — contracts and schema — complete
@@ -395,17 +395,17 @@ The host relay, native terminal client, Zellij-only direct local focus, universa
 
 **Remaining gate:** deploy current Worker Harness/dotfiles to every operator and interactive host; validate local→local, local→remote, remote→local, and delegated cycling plus reconnect and clean detach.
 
-### M3b — bounded multi-attachment and idle cleanup — implemented; key direct acceptance complete, full matrix pending
+### M3b — bounded persistent multi-attachment — implemented; key direct acceptance complete, full matrix pending
 
-Allow up to eight concurrent read-write clients per Pi session on both relays, with exact per-connection cleanup, shared tmux zoom reference counting, one-hour application inactivity detach, and selector return UX.
+Allow up to eight persistent concurrent read-write clients per Pi session on both relays, with exact per-connection cleanup, shared tmux zoom reference counting, longest-idle replacement at capacity, and selector return UX for the replaced victim.
 
-**Gate:** eight simultaneous clients can view/type; a ninth atomically replaces the longest-idle attachment without exceeding eight; the victim returns to its selector; activity refreshes the timer; an idle client detaches without ending Pi; delayed victim cleanup cannot release the replacement slot; the final disconnect alone restores source layout; reconnect is an ordinary new attachment.
+**Gate:** eight simultaneous clients can view/type; a ninth atomically replaces the longest-idle attachment without exceeding eight; the victim returns to its selector; silent attachments remain connected below capacity; activity updates only the replacement ranking; delayed victim cleanup cannot release the replacement slot; the final disconnect alone restores source layout; reconnect is an ordinary new attachment.
 
 ### M3c — orchestrator gateway fallback — implemented and deployed; live acceptance pending
 
 Implement the bounded `:12889` protocol-v2 WebSocket proxy. PWA uses gateway-first; CLI/multiplexer clients use direct-first with fallback.
 
-**Gate:** direct and gateway clients coexist under the relay cap; resize/input/detach and idle timeout work through the proxy; slow/dead clients cannot create unbounded memory or starve control-plane SQLite work.
+**Gate:** direct and gateway clients coexist under the relay cap; resize/input/detach, persistent silent connections, and capacity replacement work through the proxy; slow/dead clients cannot create unbounded memory or starve control-plane SQLite work.
 
 ### M4 — worker daemon session service — complete
 
@@ -427,15 +427,15 @@ Sync wait/result behavior, truthful cancellation/timeout handling, direct worker
 
 ### M7 — Zellij adapter — implemented; live acceptance pending
 
-The implementation contract is `specs/ZELLIJ_PI_CLIENT.md` plus `specs/PI_ATTACH_UX_NEXT.md`. Zellij registration metadata, exact same-host client focus, floating machine-grouped picker, dedicated/reused state-named tabs, multiplexer-neutral relay routes, resize/cleanup, recursive-local-stream prevention, and grouped-order cycling reuse protocol v2 multi-attach and gateway fallback; delegated workers remain tmux-backed. Host relay revision 13 adds managed-only global/grouped `mouse on` reinforcement so wheel events reach tmux copy mode through Zellij. Managed Zellij tab creation/reuse/close-on-detach and outer-tmux global/owner/grouped status-off invariants passed live; final user shortcut/state-transition confirmation and the broader remote/multi-client matrix remain.
+The implementation contract is `specs/ZELLIJ_PI_CLIENT.md` plus `specs/PI_ATTACH_UX_NEXT.md`. Zellij registration metadata, exact same-host client focus, floating machine-grouped picker, dedicated/reused state-named tabs, multiplexer-neutral relay routes, resize/cleanup, recursive-local-stream prevention, and grouped-order cycling reuse protocol v2 multi-attach and gateway fallback; delegated workers remain tmux-backed. Host relay revision 14 retains the managed-only global/grouped `mouse on` reinforcement that lets wheel events reach tmux copy mode through Zellij and removes application-inactivity attachment detachment. Managed Zellij tab creation/reuse/close-on-detach and outer-tmux global/owner/grouped status-off invariants passed live; final user shortcut/state-transition confirmation and the broader remote/multi-client matrix remain.
 
 **Gate:** Zellij focuses an existing local Pi pane or opens a remote attachment, then cycles between local/remote/delegated agents with the same behavior as tmux. A second Zellij client must focus the requested pane without moving or terminating the source client.
 
 ### M8 — PWA attachment hardening — partially implemented
 
-Gateway-first transport, direct fallback on upstream-open failure, and inactivity/replacement return-to-selector UX are implemented. Automatic reconnect, HTTPS publication/installability, and real-browser gateway acceptance remain. An xterm-grade renderer is optional and does not block semantic chat.
+Gateway-first transport, direct fallback on upstream-open failure, capacity-replacement return-to-selector UX, and the standalone Tailnet-only `wh-web` deployment split are implemented. Automatic reconnect, HTTPS publication/installability, and real-browser gateway acceptance remain. An xterm-grade renderer is optional and does not block semantic chat.
 
-**Gate:** a phone/browser attaches through the gateway, detaches cleanly after inactivity, trivially reconnects from the selector, and may coexist with native clients.
+**Gate:** a phone/browser attaches through the gateway, remains connected while silent, returns to the selector if replaced at capacity, reconnects trivially, and may coexist with native clients.
 
 ### M9 — global router — orthogonal
 
@@ -450,12 +450,12 @@ Completed spikes: tmux PTY relay/direct WebSocket/resize/input, bridge replaceme
 Remaining work, in order:
 
 1. **Tmux closure matrix:** current versions on every host; local/remote/delegated cycle and wraparound; reconnect; orchestrator restart re-registration; repeated web reload without duplicate backfill.
-2. **Multi-attach prototype:** eight concurrent clients to one delegated and one interactive session; ninth attach replaces the longest-idle client; victim selector return; activity-refresh and short-clock idle timeout; shared zoom final-only restore; underlying Pi survives every detach.
+2. **Multi-attach prototype:** eight concurrent clients to one delegated and one interactive session; ninth attach replaces the longest-idle client; victim selector return; silent clients persist below capacity; activity updates replacement ranking; shared zoom final-only restore; underlying Pi survives every detach.
 3. **Gateway backpressure:** direct upstream relay plus deliberately slow downstream client; prove frame fidelity, bounded memory, send watchdog, close propagation, and coexistence with direct clients.
-4. **Native/PWA fallback:** force direct connection failure, confirm gateway selection, idle-timeout return to selector, and immediate reattach.
+4. **Native/PWA fallback:** force direct connection failure, confirm gateway selection, replacement return to selector, and immediate reattach.
 5. **Zellij adapter closure:** stable session/pane identity and client-specific exact focus are proven on Zellij 0.44.2; finish mixed-client resize semantics, direct/prefix shortcut acceptance, fleet rollout, and source-session survival after relay cleanup.
-6. **Pi attach UX next slice:** execute `specs/PI_ATTACH_UX_NEXT.md` in order: diagnose/fix the reopened managed-tmux inner-status-bar regression; add the floating Zellij picker and dedicated/reused `π` tabs; group the picker by source machine; then add SSE-driven working/idle/error tab glyphs.
-7. **Hidden tmux managed launcher matrix:** finish remote Zellij/tmux, cap/idle/replacement, mixed-size, and fleet acceptance after the P0 invisible-status fix.
+6. **Pi attach UX acceptance:** the floating picker, dedicated/reused `π` tabs, machine tree, and SSE-driven state glyphs are implemented; finish the shortcut/state-transition and broader remote/multi-client matrix.
+7. **Hidden tmux managed launcher matrix:** finish remote Zellij/tmux, cap/persistent-connection/replacement, mixed-size, and fleet acceptance after the P0 invisible-status fix.
 8. **PWA rollout and optional HTTPS edge:** the standalone Tailnet-only `wh-web` split is implemented; publish and deploy the images, rerun its live browser matrix, then add the authenticated same-origin HTTPS/gateway-only edge only if public browser access is desired.
 
 ## 13. Explicit non-goals

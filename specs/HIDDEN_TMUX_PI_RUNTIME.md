@@ -223,7 +223,7 @@ Recommended defaults:
 6. Two differently sized clients follow documented `window-size latest` behavior; source Pi survives both detach paths.
 7. A same-host managed start attaches through loopback even when the orchestrator is temporarily unavailable; registration retries and later makes the session remotely discoverable.
 8. A host relay bootstrapped from inside outer tmux or managed tmux strips inherited `TMUX`/`TMUX_PANE` and can create the disposable client without a nested-session warning.
-9. Existing unmanaged tmux/Zellij sessions, delegated workers, multi-attach replacement, idle cleanup, gateway fallback, and all non-live tests remain green.
+9. Existing unmanaged tmux/Zellij sessions, delegated workers, persistent multi-attach replacement, gateway fallback, and all non-live tests remain green.
 10. Failure before Pi starts cleans only the new window; failure after Pi starts reports the still-running session and a manual attach command rather than silently killing it.
 11. Names may collide without attaching the wrong session because the start path uses its generated UUID.
 12. Names, CWDs, and Pi passthrough arguments containing whitespace, quotes, shell metacharacters, and Unicode launch exactly as argv data without command injection or truncation.
@@ -232,11 +232,11 @@ Recommended defaults:
 ## 13. Rollout
 
 1. **Implemented:** dedicated socket/session manager and pure command construction tests.
-2. **Implemented and hardened through relay revision 13:** nested tmux/Zellij environment sanitization, managed-runtime route metadata, managed-server global `status off`, and fail-closed grouped-session `status off` verification landed through revision 12; revision 13 additionally reinforces `mouse on` globally and on each managed grouped attachment session.
+2. **Implemented and hardened through relay revision 14:** nested tmux/Zellij environment sanitization, managed-runtime route metadata, managed-server global `status off`, and fail-closed grouped-session `status off` verification landed through revision 12; revision 13 additionally reinforces `mouse on` globally and on each managed grouped attachment session; revision 14 removes application-inactivity attachment detachment.
 3. **Implemented:** new-session identity/name handling, argv-safe detached window lifecycle, and explicit rejection of resume/continue/fork conflicts.
 4. **Implemented:** exact local UDS route wait plus loopback native attach and `--no-attach`.
 5. **Revision-12 fix live; final user confirmation pending:** the reopened two-status-bar gate now enforces global and owner `status off` on the managed server plus grouped-session verification in the relay. Live outer-tmux instrumentation showed the outer session `on` while global, `wh-pi`, and active `wh_attach_*` were all `off`; the user should repeat the original visual sequence.
-6. **Pending live matrix:** run remote tmux/Zellij, multi-attach, idle, replacement, and resize acceptance.
+6. **Pending live matrix:** run remote tmux/Zellij, persistent multi-attach, capacity replacement, and resize acceptance.
 7. Keep plain `pi` documented throughout rollout.
 8. Only after acceptance consider a `pi` shell alias or making the managed launcher the preferred default.
 

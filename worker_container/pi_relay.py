@@ -45,14 +45,6 @@ def _positive_int_env(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
-def _positive_float_env(name: str, default: float) -> float:
-    try:
-        value = float(os.environ.get(name, str(default)))
-    except ValueError:
-        return default
-    return value if value > 0 else default
-
-
 class SessionCreate(BaseModel):
     """Requested delegated Pi session. The worker determines its command."""
 
@@ -127,9 +119,6 @@ class RelayState:
     max_attachments_per_session: int = field(
         default_factory=lambda: _positive_int_env("WH_PI_MAX_ATTACHMENTS", 8)
     )
-    attach_idle_seconds: float = field(
-        default_factory=lambda: _positive_float_env("WH_PI_ATTACH_IDLE_SECONDS", 3600.0)
-    )
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _attachment_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _attachments: dict[str, dict[str, AttachmentSlot]] = field(default_factory=dict)
@@ -144,8 +133,6 @@ class RelayState:
         self.tmux_tmpdir.chmod(0o1777)
         if self.max_attachments_per_session < 1:
             raise ValueError("max_attachments_per_session must be positive")
-        if self.attach_idle_seconds <= 0:
-            raise ValueError("attach_idle_seconds must be positive")
         self._load()
 
     async def reserve_attachment(
@@ -576,7 +563,6 @@ async def _relay_terminal(
     record: SessionRecord,
     tmux_tmpdir: Path,
     *,
-    idle_seconds: float,
     attachment: AttachmentSlot,
 ) -> None:
     """Attach a disposable tmux client PTY; never kill the underlying Pi."""
@@ -640,26 +626,12 @@ async def _relay_terminal(
                 touch_client_activity()
                 os.write(master_fd, str(frame.get("data", "")).encode())
 
-    async def idle_watchdog() -> None:
-        while True:
-            remaining = idle_seconds - (loop.time() - attachment.last_activity)
-            if remaining <= 0:
-                await websocket.send_json({
-                    "type": "status",
-                    "state": "idle-timeout",
-                    "reason": "attachment inactive",
-                })
-                await websocket.close(code=4408, reason="attachment inactive")
-                return
-            await asyncio.sleep(min(remaining, 30.0))
-
     output_task = asyncio.create_task(read_output())
     input_task = asyncio.create_task(read_input())
-    idle_task = asyncio.create_task(idle_watchdog())
     eviction_task = asyncio.create_task(attachment.evict.wait())
     try:
         done, pending = await asyncio.wait(
-            {output_task, input_task, idle_task, eviction_task},
+            {output_task, input_task, eviction_task},
             return_when=asyncio.FIRST_COMPLETED,
         )
         for task in pending:
@@ -728,7 +700,6 @@ def create_relay_app(
             "attachment_count": attachment_count,
             "attachments_by_session": attachments_by_session,
             "max_attachments_per_session": relay_state.max_attachments_per_session,
-            "attachment_idle_seconds": relay_state.attach_idle_seconds,
             "attachment_evictions_total": relay_state.attachment_evictions_total,
         }
 
@@ -794,7 +765,6 @@ def create_relay_app(
                 websocket,
                 session,
                 relay_state.tmux_tmpdir,
-                idle_seconds=relay_state.attach_idle_seconds,
                 attachment=attachment,
             )
         finally:

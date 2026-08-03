@@ -544,7 +544,7 @@ class PiCliTests(unittest.TestCase):
             ["ws://relay/first", "ws://relay/second"],
         )
 
-    def test_idle_timeout_returns_attachment_window_to_picker(self):
+    def test_replacement_returns_attachment_window_to_picker(self):
         first = {**self._session(), "id": "first"}
         second = {**self._session(), "id": "second", "name": "second-agent"}
         request = AsyncMock(side_effect=[

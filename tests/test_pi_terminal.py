@@ -74,7 +74,7 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(direction, expected)
                 self.assertEqual(websocket.sent, [b"before"])
 
-    async def test_attach_falls_back_to_gateway_and_returns_selector_on_idle(self):
+    async def test_attach_falls_back_to_gateway_and_returns_selector_when_replaced(self):
         direct = "ws://direct/attach"
         gateway = "ws://gateway/attach"
         connections = []
@@ -84,7 +84,7 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
             if url.startswith(direct):
                 return FakeConnection(error=OSError("direct unavailable"))
             return FakeConnection(FakeWebSocket([
-                '{"type":"status","state":"idle-timeout","reason":"attachment inactive"}',
+                '{"type":"status","state":"replaced","reason":"capacity reclaimed"}',
             ]))
 
         master_fd, slave_fd = pty.openpty()
@@ -136,12 +136,6 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
             os.close(read_fd)
             if write_fd >= 0:
                 os.close(write_fd)
-
-    async def test_receive_output_returns_to_selector_after_idle_timeout(self):
-        websocket = FakeWebSocket([
-            '{"type":"status","state":"idle-timeout","reason":"attachment inactive"}',
-        ])
-        self.assertEqual(await pi_terminal._receive_output(websocket, 1), "select")
 
     async def test_receive_output_returns_to_selector_when_replaced_at_capacity(self):
         websocket = FakeWebSocket([
