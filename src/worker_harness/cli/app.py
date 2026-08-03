@@ -80,7 +80,11 @@ def main(
 def main_entry():
     """Entry point installed as the `worker-harness` console script."""
     # Register subcommands lazily to avoid circular imports
-    from worker_harness.cli import workers, jobs, tunnels, pi, agent as agent_mod
+    from worker_harness.cli import workers, jobs, tunnels, pi, launch, agent as agent_mod
+    app.command(
+        name="launch",
+        context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+    )(launch.launch)
     app.add_typer(workers.app, name="workers")
     app.add_typer(jobs.app, name="job")
     app.add_typer(tunnels.app, name="tunnel")
