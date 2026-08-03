@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import typer
 from typer.testing import CliRunner
 
@@ -277,28 +278,48 @@ class LaunchCliTests(unittest.TestCase):
         ])
 
 
+class _FakeAsyncClient:
+    def __init__(self, responses):
+        self.responses = responses
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def get(self, _path):
+        return self.responses.pop(0)
+
+
 class LaunchRegistrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_waits_for_exact_attachable_session(self):
+    async def test_waits_for_exact_attachable_session_and_honors_rate_limit(self):
+        request = httpx.Request("GET", "http://orchestrator/api/v1/pi/sessions/wanted")
         responses = [
-            [],
-            [{"id": "other", "state": "idle", "terminal_attachable": True}],
-            [{"id": "wanted", "state": "idle", "terminal_attachable": False}],
-            [{"id": "wanted", "state": "idle", "terminal_attachable": True}],
+            httpx.Response(404, request=request),
+            httpx.Response(429, headers={"Retry-After": "1"}, request=request),
+            httpx.Response(200, json={
+                "id": "wanted", "state": "idle", "terminal_attachable": False,
+            }, request=request),
+            httpx.Response(200, json={
+                "id": "wanted", "state": "idle", "terminal_attachable": True,
+            }, request=request),
         ]
-
-        async def request(_method, _path):
-            return responses.pop(0)
-
-        from worker_harness.cli import pi
+        sleep = AsyncMock()
         with (
-            patch.object(pi, "_request", side_effect=request),
-            patch.object(launch.asyncio, "sleep", new=AsyncMock()),
+            patch.object(
+                launch.httpx,
+                "AsyncClient",
+                return_value=_FakeAsyncClient(responses),
+            ),
+            patch.object(launch.asyncio, "sleep", new=sleep),
         ):
             selected = await launch.wait_for_registered_session(
                 "wanted", timeout=5, require_attachable=True
             )
         self.assertEqual(selected["id"], "wanted")
         self.assertFalse(responses)
+        self.assertTrue(any(call.args[0] >= 1.0 for call in sleep.call_args_list))
 
 
 def shlex_split_once(command: str) -> list[str]:

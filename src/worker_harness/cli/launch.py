@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Sequence
 
+import httpx
 import typer
 from rich.console import Console
 
@@ -501,30 +502,45 @@ async def wait_for_registered_session(
 
     deadline = time.monotonic() + timeout
     last_error = "session has not registered"
-    while True:
-        try:
-            rows = await pi._request("GET", "/api/v1/pi/sessions")
-            selected = next(
-                (row for row in rows if str(row.get("id") or "") == session_id),
-                None,
-            )
-            if selected is not None:
-                state = str(selected.get("state") or "")
-                if state not in _ACTIVE_STATES:
-                    last_error = f"session registered with state {state or 'unknown'}"
-                elif not require_attachable or bool(selected.get("terminal_attachable")):
-                    return selected
+    endpoint = f"/api/v1/pi/sessions/{session_id}"
+    async with httpx.AsyncClient(base_url=pi._base_url(), timeout=5.0) as client:
+        while True:
+            delay = 1.0
+            try:
+                response = await client.get(endpoint)
+                if response.status_code == 429:
+                    # The control service has a shared per-operator-IP token
+                    # bucket. Honor its rounded Retry-After rather than polling
+                    # quickly enough to keep the bucket permanently empty, and
+                    # do not hide a more useful prior registration state.
+                    try:
+                        retry_after = float(response.headers.get("Retry-After", "1"))
+                    except ValueError:
+                        retry_after = 1.0
+                    delay = max(1.0, retry_after) + 0.05
+                elif response.status_code == 404:
+                    last_error = "session has not registered"
                 else:
-                    last_error = "session registered but is not terminal-attachable yet"
-        except RuntimeError as exc:
-            last_error = str(exc)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise RuntimeError(
-                f"Pi {session_id} started on the target, but {last_error} "
-                f"within {timeout:g} seconds"
-            )
-        await asyncio.sleep(min(0.25, remaining))
+                    response.raise_for_status()
+                    selected = response.json()
+                    state = str(selected.get("state") or "")
+                    if state not in _ACTIVE_STATES:
+                        last_error = f"session registered with state {state or 'unknown'}"
+                    elif not require_attachable or bool(selected.get("terminal_attachable")):
+                        return selected
+                    else:
+                        last_error = "session registered but is not terminal-attachable yet"
+            except (httpx.HTTPError, json.JSONDecodeError) as exc:
+                last_error = f"control API unavailable: {exc}"
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"Pi {session_id} started on the target, but {last_error} "
+                    f"within {timeout:g} seconds. The target Pi is still running; "
+                    "check its bridge orchestrator URL/connectivity, then attach by session ID."
+                )
+            await asyncio.sleep(min(delay, remaining))
 
 
 async def _load_worker_records() -> list[dict[str, Any]]:

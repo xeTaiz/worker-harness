@@ -81,7 +81,7 @@ The command does not recursively scan home, execute project files, or require a 
 4. Prompt for manual path if chosen.
 5. Default name to `PurePath(cwd).name`, with a safe `Pi` fallback.
 6. Run local or SSH launch command and parse its JSON `{session_id, name, …}`.
-7. Poll `GET /api/v1/pi/sessions` for the exact UUID and, when attaching, `attach-info` until active/attachable or timeout.
+7. Poll `GET /api/v1/pi/sessions/{session_id}` for the exact UUID until active/attachable or timeout. Poll no faster than once per second and honor `429 Retry-After` without replacing a more useful prior registration state in the final diagnostic.
 8. With `--no-attach`, print the launch result including machine and cwd.
 9. Otherwise reuse the existing Pi attachment path; in immediate Zellij create/focus the dedicated state-named tab.
 
@@ -94,7 +94,7 @@ The command does not recursively scan home, execute project files, or require a 
 - Machine selectors may not start with `-`; pass `--` before the SSH destination where supported by the local OpenSSH CLI.
 - A nonzero SSH/target command exit is failure. Include bounded stdout/stderr in the error.
 - Malformed or missing JSON is failure.
-- Registration timeout does not claim the target Pi stopped; report its UUID and that launch succeeded remotely but registration/attachability was not observed.
+- Registration timeout does not claim the target Pi stopped; report its UUID, state that launch succeeded remotely, and direct the operator to the target bridge orchestrator URL/connectivity before attaching by session ID.
 
 ## Tests
 
