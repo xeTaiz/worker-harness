@@ -369,7 +369,7 @@ Semantic transcript events share the durable `pi_session_events` log. SQLite ass
 - Direct protocol-v2 terminal relays are implemented for delegated worker sessions and ordinary tmux/Zellij interactive sessions. The native CLI supports attachable-only discovery, exact local-pane focus, remote fullscreen streaming, reliable initial/dynamic sizing, `Ctrl-]`, and cross-agent cycling. Tmux is feature-complete; fleet rollout and a local/remote/delegated cycling matrix remain.
 - Bounded persistent multi-attachment and the orchestrator gateway are implemented and deployed. Corrected direct-relay live acceptance opened eight draining clients, refreshed one, and proved that the ninth replaced the true longest-idle client with status `replaced` plus close `4410`, kept the count at eight, and preserved the source Pi. Full interactive/delegated/direct/gateway/backpressure acceptance remains.
 - Zellij registration, exact local focus, disposable remote attachment, cap/persistence/replacement reuse, recursive-local-stream prevention, and local/streamed cycling are implemented. Isolated exact-client and cap-two tests passed; the mixed tmux/Zellij source/client matrix, mixed-size semantics, gateway fallback, shortcut acceptance, and direct-focus return UX remain.
-- Fresh non-live validation reports 161 tests plus 19 subtests passing, Python compile/diff checks clean, revision-12 Bun relay/bridge builds valid, and the floating-picker Zellij KDL configuration valid. The global router remains a separate orthogonal milestone.
+- The established non-live suite, Python compile/diff checks, Bun relay/bridge builds, and floating-picker Zellij KDL checks remain the regression baseline. The global router is now implemented as the separate orthogonal contract in `specs/GLOBAL_SEMANTIC_ROUTER.md`; terminal-client delivery remains unchanged.
 
 ### M0 — contracts and schema — complete
 
@@ -437,11 +437,11 @@ Gateway-first transport, direct fallback on upstream-open failure, capacity-repl
 
 **Gate:** a phone/browser attaches through the gateway, remains connected while silent, returns to the selector if replaced at capacity, reconnects trivially, and may coexist with native clients.
 
-### M9 — global router — orthogonal
+### M9 — global semantic router — implementation started
 
-Implement the constrained router from §9 independently of terminal-client delivery. It lists active interactive sessions and sends semantic prompts; it neither owns terminal leases nor blocks Zellij/PWA work.
+The implementation contract is `specs/GLOBAL_SEMANTIC_ROUTER.md`. The router is a stateless virtual dispatcher backed by a private Pi `ModelRuntime` sidecar: explicit recipients bypass classification; Auto selects only active interactive sessions; every dispatch uses steering; the prior successful route is a bounded follow-up hint for less than three minutes; model/thinking selection and classification latency are visible in the global PWA. It neither owns terminal attachments nor blocks Zellij/PWA transport work.
 
-**Gate:** ambiguous requests ask for a target; unambiguous requests reach the intended existing interactive session and render the linked durable response.
+**Gate:** ambiguous requests ask for a target; unambiguous requests reach the intended existing interactive session; Interrupt matches Pi Escape semantics; bounded latest prompt/output/tool activity from every interactive session renders without cross-session interleaving.
 
 ## 12. Required spikes and acceptance work
 
