@@ -1,0 +1,35 @@
+services:
+  wh-router:
+    build:
+      context: .
+      dockerfile: router_service/Dockerfile
+    image: ${WH_ROUTER_IMAGE:-xetaiz/wh-router:latest}
+    container_name: wh-router
+    restart: unless-stopped
+    environment:
+      PI_AGENT_DIR: /pi-agent
+      WH_PI_ROUTER_PORT: "12900"
+      WH_PI_ROUTER_MAX_OUTPUT_TOKENS: ${WH_PI_ROUTER_MAX_OUTPUT_TOKENS:-64}
+    volumes:
+      # Use a dedicated copy: OAuth refresh and credential locking require writes.
+      - "${WH_PI_ROUTER_AGENT_DIR:?set WH_PI_ROUTER_AGENT_DIR to a dedicated Pi agent config directory}:/pi-agent"
+    networks:
+      - wh-internal
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:12900/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+networks:
+  wh-internal:
+    name: ${WH_DOCKER_NETWORK:-wh-internal}
+    external: true

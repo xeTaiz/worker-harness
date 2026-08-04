@@ -31,6 +31,7 @@
         <button id="next-session" class="switch-button" type="button" aria-label="Next session">›</button>
       </nav>
       <span id="connection-dot" class="connection-dot" title="Disconnected"></span>
+      <button id="global-button" class="install-button" type="button">Global</button>
       <button id="install" class="install-button hidden">Install</button>
       <button id="refresh" class="icon-button" aria-label="Refresh sessions">↻</button>
     </header>
@@ -48,6 +49,50 @@
         <h2>No sessions found</h2>
         <p>Start Pi with the Worker Harness bridge, then refresh.</p>
       </div>
+    </main>
+
+    <main id="global-router-view" class="view global-view hidden">
+      <section class="global-controls" aria-label="Global router controls">
+        <label>
+          <span>Routing model</span>
+          <select id="router-model" aria-label="Routing model"></select>
+        </label>
+        <label>
+          <span>Thinking</span>
+          <select id="router-thinking" aria-label="Router thinking level">
+            <option value="off">Off</option>
+            <option value="minimal">Minimal</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="xhigh">Extra high</option>
+            <option value="max">Max</option>
+          </select>
+        </label>
+        <span id="router-latency" class="control-status">No routes yet</span>
+      </section>
+      <section class="global-section" aria-labelledby="global-agents-title">
+        <div class="global-section-head">
+          <div><p class="eyebrow">INTERACTIVE AGENTS</p><h2 id="global-agents-title">Working now</h2></div>
+          <button id="global-refresh" class="icon-button" type="button" aria-label="Refresh global view">↻</button>
+        </div>
+        <div id="global-roster" class="global-roster" aria-live="polite"></div>
+      </section>
+      <section class="global-section" aria-labelledby="global-turns-title">
+        <div class="global-section-head"><div><p class="eyebrow">LATEST TURNS</p><h2 id="global-turns-title">Across sessions</h2></div></div>
+        <div id="global-turns" class="global-turns" aria-live="polite"></div>
+      </section>
+      <form id="global-composer" class="composer global-composer">
+        <div class="composer-controls">
+          <label for="global-target">Recipient</label>
+          <select id="global-target" name="target"><option value="">Auto</option></select>
+        </div>
+        <div class="composer-row">
+          <textarea id="global-message" rows="1" maxlength="20000" placeholder="Message the right Pi session…" aria-label="Global message"></textarea>
+          <button id="global-send" type="submit" aria-label="Route message">↑</button>
+        </div>
+        <p id="global-status" class="composer-status" role="status"></p>
+      </form>
     </main>
 
     <main id="session-detail-view" class="view detail-view hidden">

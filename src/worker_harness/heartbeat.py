@@ -45,6 +45,8 @@ from .models import (
     PiBridgeRegister,
     PiDelegation,
     PiIngestPayload,
+    PiRouterConfig,
+    PiRouterRequest,
     PiSession,
     PiSessionCommand,
     PiSessionEvent,
@@ -54,6 +56,17 @@ from .models import (
     WorkerJobReportBatch,
     WorkerRegistration,
     WorkerStatus,
+)
+from .pi_router import (
+    ROUTER_MESSAGE_LIMIT,
+    ROUTER_RECENT_SECONDS,
+    ROUTER_THINKING_LEVELS,
+    HttpPiRouterClient,
+    RouterUnavailable,
+    build_candidates,
+    build_classifier_prompt,
+    parse_router_output,
+    summarize_session_events,
 )
 from .ratelimit import AgentRateLimiter, RateLimited, resolve_agent_name
 from .reaper import reap_loop
@@ -129,6 +142,19 @@ class PiConfigureRequest(BaseModel):
 
 class PiCommandAck(BaseModel):
     incarnation: str
+
+
+class PiRouterConfigureRequest(BaseModel):
+    provider: str
+    model: str
+    thinking_level: Literal["off", "minimal", "low", "medium", "high", "xhigh", "max"] = "off"
+
+
+class PiRouterDispatchRequest(BaseModel):
+    message: str
+    target_session_id: str | None = None
+    reply_session_id: str | None = None
+    request_id: str | None = None
 
 
 # Timeout gate (spec §8.1): an expired delegation is cancelled through the
@@ -448,7 +474,7 @@ async def _pump_terminal_gateway(
     return "replaced" if eviction_task in done else "completed"
 
 
-def create_app(db: Database) -> FastAPI:
+def create_app(db: Database, router_client=None) -> FastAPI:
     """Create the privileged control API (kept as the public test factory)."""
     app = FastAPI(title="Worker Harness Control API", lifespan=lifespan)
     jm = JobManager(db)
@@ -468,6 +494,11 @@ def create_app(db: Database) -> FastAPI:
     app.state.pi_gateway_max_per_session = _positive_int_env(
         "WH_PI_MAX_ATTACHMENTS", 8
     )
+    app.state.pi_router = router_client or HttpPiRouterClient(
+        os.environ.get("WH_PI_ROUTER_URL", "http://wh-router:12900"),
+        timeout_seconds=float(os.environ.get("WH_PI_ROUTER_TIMEOUT_SECONDS", "30")),
+    )
+    app.state.pi_router_lock = asyncio.Lock()
     set_global_metrics(app.state.metrics)
     set_lanes(app.state.lanes)
 
@@ -674,6 +705,222 @@ def create_app(db: Database) -> FastAPI:
     @app.get("/api/v1/pi/sessions")
     async def pi_sessions_list(worker_id: str | None = None):
         return [session.model_dump(mode="json") for session in await db.list_pi_sessions(worker_id)]
+
+    async def router_config() -> PiRouterConfig:
+        stored = await db.get_pi_router_config()
+        if stored:
+            return stored
+        return PiRouterConfig(
+            provider=os.environ.get("WH_PI_ROUTER_PROVIDER", "openai-codex"),
+            model=os.environ.get("WH_PI_ROUTER_MODEL", "gpt-5.3-codex-spark"),
+            thinking_level=os.environ.get("WH_PI_ROUTER_THINKING", "off"),
+        )
+
+    async def router_summaries(sessions: list[PiSession]) -> dict[str, dict[str, Any]]:
+        summaries: dict[str, dict[str, Any]] = {}
+        for session in sessions:
+            if (
+                session.session_type == PiSessionType.INTERACTIVE
+                and session.state in {PiSessionState.WORKING, PiSessionState.IDLE}
+                and session.bridge_incarnation
+                and not session.name.startswith("subagent-")
+            ):
+                events = await db.list_recent_pi_session_events(session.id, limit=500)
+                latest_user = await db.get_latest_pi_message_event(session.id, "user")
+                if latest_user and all(event.id != latest_user.id for event in events):
+                    events = sorted([latest_user, *events], key=lambda event: event.sequence)
+                summaries[session.id] = summarize_session_events(events)
+        return summaries
+
+    @app.get("/api/v1/pi/router/config")
+    async def pi_router_config_get():
+        return (await router_config()).model_dump(mode="json")
+
+    @app.put("/api/v1/pi/router/config")
+    async def pi_router_config_put(payload: PiRouterConfigureRequest):
+        provider = payload.provider.strip()
+        model = payload.model.strip()
+        if not provider or not model or len(provider) > 256 or len(model) > 256:
+            raise HTTPException(status_code=422, detail="provider and model are required")
+        if payload.thinking_level not in ROUTER_THINKING_LEVELS:
+            raise HTTPException(status_code=422, detail="invalid thinking level")
+        config = PiRouterConfig(
+            provider=provider,
+            model=model,
+            thinking_level=payload.thinking_level,
+            updated_at=int(datetime.now(timezone.utc).timestamp()),
+        )
+        return (await db.set_pi_router_config(config)).model_dump(mode="json")
+
+    @app.get("/api/v1/pi/router/models")
+    async def pi_router_models():
+        try:
+            models = await app.state.pi_router.list_models()
+        except RouterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"models": models}
+
+    @app.get("/api/v1/pi/router/snapshot")
+    async def pi_router_snapshot():
+        sessions = await db.list_pi_sessions()
+        summaries = await router_summaries(sessions)
+        candidates = build_candidates(sessions, summaries)
+        latest = await db.get_latest_pi_router_request(classified_only=True)
+        return {
+            "sessions": [
+                {
+                    **session.model_dump(mode="json"),
+                    **summaries.get(session.id, {}),
+                }
+                for session in sessions
+                if session.id in summaries
+            ],
+            "candidates": [candidate.as_dict() for candidate in candidates],
+            "config": (await router_config()).model_dump(mode="json"),
+            "latest_route": latest.model_dump(mode="json") if latest else None,
+        }
+
+    @app.post("/api/v1/pi/router:dispatch")
+    async def pi_router_dispatch(payload: PiRouterDispatchRequest):
+        message = payload.message.strip()
+        if not message:
+            raise HTTPException(status_code=422, detail="message must not be empty")
+        if len(message) > ROUTER_MESSAGE_LIMIT:
+            raise HTTPException(status_code=422, detail=f"message exceeds {ROUTER_MESSAGE_LIMIT} characters")
+        if payload.target_session_id and payload.reply_session_id:
+            raise HTTPException(status_code=422, detail="choose target_session_id or reply_session_id, not both")
+        request_id = payload.request_id or str(uuid4())
+        existing = await db.get_pi_router_request(request_id)
+        if existing:
+            return existing.model_dump(mode="json")
+
+        now = int(datetime.now(timezone.utc).timestamp())
+        config = await router_config()
+        sessions = await db.list_pi_sessions()
+        summaries = await router_summaries(sessions)
+        candidates = build_candidates(sessions, summaries)
+        candidate_snapshot = [candidate.as_dict() for candidate in candidates]
+        explicit_target = payload.target_session_id or payload.reply_session_id
+        selection_mode = "reply" if payload.reply_session_id else "explicit" if payload.target_session_id else "auto"
+        route_request = PiRouterRequest(
+            id=request_id,
+            message=message,
+            selection_mode=selection_mode,
+            candidate_snapshot=candidate_snapshot,
+            provider=config.provider,
+            model=config.model,
+            thinking_level=config.thinking_level,
+            created_at=now,
+        )
+        if not await db.insert_pi_router_request(route_request):
+            existing = await db.get_pi_router_request(request_id)
+            assert existing is not None
+            return existing.model_dump(mode="json")
+
+        target_id = explicit_target
+        if explicit_target:
+            if explicit_target not in {candidate.session_id for candidate in candidates}:
+                route_request.status = "needs_target"
+                route_request.error = "explicit target is not an active interactive session"
+        elif not candidates:
+            route_request.status = "needs_target"
+            route_request.error = "no active interactive sessions"
+        else:
+            recent = await db.get_latest_pi_router_request(dispatched_only=True)
+            recent_id = None
+            recent_message = ""
+            if recent and now - recent.completed_at < ROUTER_RECENT_SECONDS:
+                recent_id = recent.selected_session_id
+                recent_message = recent.message
+            classifier_prompt = build_classifier_prompt(
+                message,
+                candidates,
+                recent_session_id=recent_id,
+                recent_message=recent_message,
+            )
+            try:
+                async with app.state.pi_router_lock:
+                    classified = await app.state.pi_router.classify(classifier_prompt, config)
+                route_request.router_output = classified.output
+                route_request.latency_ms = classified.latency_ms
+                route_request.provider = classified.provider
+                route_request.model = classified.model
+                route_request.thinking_level = classified.thinking_level
+                selected_index = parse_router_output(classified.output, len(candidates))
+                if selected_index:
+                    target_id = candidates[selected_index - 1].session_id
+                else:
+                    route_request.status = "needs_target"
+                    route_request.error = "router did not select one recipient"
+            except RouterUnavailable as exc:
+                route_request.status = "needs_target"
+                route_request.error = str(exc)
+
+        if target_id and route_request.status == "routing":
+            target = await db.get_pi_session(target_id)
+            if (
+                not target
+                or target.session_type != PiSessionType.INTERACTIVE
+                or target.state not in {PiSessionState.WORKING, PiSessionState.IDLE}
+                or not target.bridge_incarnation
+            ):
+                route_request.status = "needs_target"
+                route_request.error = "selected recipient is no longer active"
+            else:
+                command = PiSessionCommand(
+                    session_id=target.id,
+                    kind="prompt",
+                    message=message,
+                    deliver_as="steer",
+                    payload={"router_request_id": route_request.id},
+                    created_at=now,
+                )
+                await db.enqueue_pi_session_command(command)
+                await db.insert_pi_session_event(PiSessionEvent(
+                    session_id=target.id,
+                    event_type="prompt-queued",
+                    payload={
+                        "command_id": command.id,
+                        "deliver_as": "steer",
+                        "router_request_id": route_request.id,
+                    },
+                    created_at=now,
+                ))
+                route_request.selected_session_id = target.id
+                route_request.command_id = command.id
+                route_request.status = "dispatched"
+
+        route_request.completed_at = int(datetime.now(timezone.utc).timestamp())
+        await db.update_pi_router_request(route_request)
+        return route_request.model_dump(mode="json")
+
+    @app.get("/api/v1/pi/router/requests/{request_id}")
+    async def pi_router_request_get(request_id: str):
+        request = await db.get_pi_router_request(request_id)
+        if not request:
+            raise HTTPException(status_code=404, detail="router request not found")
+        return request.model_dump(mode="json")
+
+    @app.post("/api/v1/pi/sessions/{session_id}:interrupt")
+    async def pi_session_interrupt(session_id: str):
+        session = await db.get_pi_session(session_id)
+        if (
+            not session
+            or session.session_type != PiSessionType.INTERACTIVE
+            or not session.bridge_incarnation
+            or session.state not in {PiSessionState.WORKING, PiSessionState.IDLE}
+        ):
+            raise HTTPException(status_code=409, detail="interactive Pi bridge is not active")
+        now = int(datetime.now(timezone.utc).timestamp())
+        command = PiSessionCommand(session_id=session.id, kind="interrupt", created_at=now)
+        await db.enqueue_pi_session_command(command)
+        await db.insert_pi_session_event(PiSessionEvent(
+            session_id=session.id,
+            event_type="interrupt-queued",
+            payload={"command_id": command.id},
+            created_at=now,
+        ))
+        return {"command_id": command.id, "queued": True}
 
     @app.get("/api/v1/pi/sessions/{session_id}")
     async def pi_session_get(session_id: str):

@@ -18,6 +18,8 @@ from .models import (
     PiBridgeEventBatch,
     PiBridgeRegister,
     PiDelegation,
+    PiRouterConfig,
+    PiRouterRequest,
     PiSession,
     PiSessionCommand,
     PiSessionEvent,
@@ -196,6 +198,7 @@ class Database:
                 terminal_host TEXT DEFAULT '',
                 terminal_port INTEGER DEFAULT 0,
                 terminal_protocol_version INTEGER DEFAULT 0,
+                has_pending_messages INTEGER DEFAULT 0,
                 last_seen INTEGER DEFAULT 0,
                 created_at INTEGER DEFAULT 0,
                 updated_at INTEGER DEFAULT 0
@@ -211,6 +214,7 @@ class Database:
             "terminal_host": "TEXT DEFAULT ''",
             "terminal_port": "INTEGER DEFAULT 0",
             "terminal_protocol_version": "INTEGER DEFAULT 0",
+            "has_pending_messages": "INTEGER DEFAULT 0",
             "last_seen": "INTEGER DEFAULT 0",
         }.items():
             if column not in pi_session_cols:
@@ -273,6 +277,37 @@ class Database:
             )
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_pi_commands_pending ON pi_session_commands(session_id, delivered_at, created_at)"
+        )
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS pi_router_config (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                thinking_level TEXT NOT NULL DEFAULT 'off',
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS pi_router_requests (
+                id TEXT PRIMARY KEY,
+                message TEXT NOT NULL,
+                selection_mode TEXT NOT NULL,
+                candidate_snapshot TEXT NOT NULL DEFAULT '[]',
+                selected_session_id TEXT,
+                router_output TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                thinking_level TEXT NOT NULL DEFAULT 'off',
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'routing',
+                error TEXT NOT NULL DEFAULT '',
+                command_id TEXT,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                completed_at INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pi_router_requests_created ON pi_router_requests(created_at DESC)"
         )
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS pi_delegations (
@@ -416,6 +451,9 @@ class Database:
             terminal_protocol_version=(
                 row["terminal_protocol_version"] if "terminal_protocol_version" in row.keys() else 0
             ),
+            has_pending_messages=(
+                bool(row["has_pending_messages"]) if "has_pending_messages" in row.keys() else False
+            ),
             last_seen=row["last_seen"] if "last_seen" in row.keys() else 0,
             created_at=row["created_at"], updated_at=row["updated_at"],
         )
@@ -425,13 +463,13 @@ class Database:
             """INSERT INTO pi_sessions
                (id, worker_id, parent_session_id, session_type, state, task, cwd, tmux_session, detail,
                 name, host, bridge_incarnation, terminal_attachable, terminal_host, terminal_port,
-                terminal_protocol_version, last_seen, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                terminal_protocol_version, has_pending_messages, last_seen, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (session.id, session.worker_id, session.parent_session_id, session.session_type.value,
              session.state.value, session.task, session.cwd, session.tmux_session, session.detail,
              session.name, session.host, session.bridge_incarnation, int(session.terminal_attachable),
              session.terminal_host, session.terminal_port, session.terminal_protocol_version,
-             session.last_seen, session.created_at, session.updated_at),
+             int(session.has_pending_messages), session.last_seen, session.created_at, session.updated_at),
         )
         await self._db.commit()
 
@@ -439,12 +477,13 @@ class Database:
         await self._db.execute(
             """UPDATE pi_sessions SET worker_id=?, parent_session_id=?, session_type=?, state=?, task=?, cwd=?,
                tmux_session=?, detail=?, name=?, host=?, bridge_incarnation=?, terminal_attachable=?,
-               terminal_host=?, terminal_port=?, terminal_protocol_version=?, last_seen=?, updated_at=? WHERE id=?""",
+               terminal_host=?, terminal_port=?, terminal_protocol_version=?, has_pending_messages=?,
+               last_seen=?, updated_at=? WHERE id=?""",
             (session.worker_id, session.parent_session_id, session.session_type.value, session.state.value,
              session.task, session.cwd, session.tmux_session, session.detail, session.name, session.host,
              session.bridge_incarnation, int(session.terminal_attachable), session.terminal_host,
-             session.terminal_port, session.terminal_protocol_version, session.last_seen,
-             session.updated_at, session.id),
+             session.terminal_port, session.terminal_protocol_version, int(session.has_pending_messages),
+             session.last_seen, session.updated_at, session.id),
         )
         await self._db.commit()
 
@@ -474,8 +513,8 @@ class Database:
                 """INSERT INTO pi_sessions
                    (id, worker_id, parent_session_id, session_type, state, task, cwd, tmux_session,
                     detail, name, host, bridge_incarnation, terminal_attachable, terminal_host,
-                    terminal_port, terminal_protocol_version, last_seen, created_at, updated_at)
-                   VALUES (?, NULL, NULL, ?, ?, '', ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    terminal_port, terminal_protocol_version, has_pending_messages, last_seen, created_at, updated_at)
+                   VALUES (?, NULL, NULL, ?, ?, '', ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                      worker_id=NULL, parent_session_id=NULL, session_type=excluded.session_type,
                      state=excluded.state, cwd=excluded.cwd, detail='', name=excluded.name,
@@ -483,12 +522,13 @@ class Database:
                      terminal_attachable=excluded.terminal_attachable,
                      terminal_host=excluded.terminal_host, terminal_port=excluded.terminal_port,
                      terminal_protocol_version=excluded.terminal_protocol_version,
+                     has_pending_messages=excluded.has_pending_messages,
                      last_seen=excluded.last_seen, updated_at=excluded.updated_at""",
                 (
                     payload.session_id, PiSessionType.INTERACTIVE.value, PiSessionState.IDLE.value,
                     payload.cwd, payload.name, payload.host, payload.incarnation,
                     int(payload.terminal_attachable), payload.terminal_host, payload.terminal_port,
-                    payload.terminal_protocol_version, now, created_at, now,
+                    payload.terminal_protocol_version, int(payload.has_pending_messages), now, created_at, now,
                 ),
             )
             # A replacement bridge may reclaim commands whose response was
@@ -556,11 +596,14 @@ class Database:
             if payload.state is not None:
                 session.state = payload.state
             session.detail = payload.detail
+            if payload.has_pending_messages is not None:
+                session.has_pending_messages = payload.has_pending_messages
             session.last_seen = now
             session.updated_at = now
             await self._db.execute(
-                "UPDATE pi_sessions SET state=?, detail=?, last_seen=?, updated_at=? WHERE id=?",
-                (session.state.value, session.detail, now, now, session_id),
+                """UPDATE pi_sessions SET state=?, detail=?, has_pending_messages=?, last_seen=?, updated_at=?
+                   WHERE id=?""",
+                (session.state.value, session.detail, int(session.has_pending_messages), now, now, session_id),
             )
             await self._db.commit()
             return session, persisted
@@ -727,6 +770,124 @@ class Database:
             """SELECT * FROM pi_session_events
                WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT ?""",
             (session_id, max(0, after), max(1, min(limit, 1000))),
+        )
+        return [
+            PiSessionEvent(
+                id=row["id"], session_id=row["session_id"], event_type=row["event_type"],
+                payload=json.loads(row["payload"] or "{}"), created_at=row["created_at"],
+                sequence=row["sequence"],
+            )
+            for row in rows
+        ]
+
+    @staticmethod
+    def _row_to_pi_router_request(row: aiosqlite.Row) -> PiRouterRequest:
+        return PiRouterRequest(
+            id=row["id"], message=row["message"], selection_mode=row["selection_mode"],
+            candidate_snapshot=json.loads(row["candidate_snapshot"] or "[]"),
+            selected_session_id=row["selected_session_id"], router_output=row["router_output"],
+            provider=row["provider"], model=row["model"], thinking_level=row["thinking_level"],
+            latency_ms=row["latency_ms"], status=row["status"], error=row["error"],
+            command_id=row["command_id"], created_at=row["created_at"], completed_at=row["completed_at"],
+        )
+
+    async def get_pi_router_config(self) -> PiRouterConfig | None:
+        row = await (await self._db.execute("SELECT * FROM pi_router_config WHERE id=1")).fetchone()
+        if not row:
+            return None
+        return PiRouterConfig(
+            provider=row["provider"], model=row["model"],
+            thinking_level=row["thinking_level"], updated_at=row["updated_at"],
+        )
+
+    async def set_pi_router_config(self, config: PiRouterConfig) -> PiRouterConfig:
+        await self._db.execute(
+            """INSERT INTO pi_router_config (id, provider, model, thinking_level, updated_at)
+               VALUES (1, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET provider=excluded.provider, model=excluded.model,
+                 thinking_level=excluded.thinking_level, updated_at=excluded.updated_at""",
+            (config.provider, config.model, config.thinking_level, config.updated_at),
+        )
+        await self._db.commit()
+        return config
+
+    async def insert_pi_router_request(self, request: PiRouterRequest) -> bool:
+        cursor = await self._db.execute(
+            """INSERT OR IGNORE INTO pi_router_requests
+               (id, message, selection_mode, candidate_snapshot, selected_session_id, router_output,
+                provider, model, thinking_level, latency_ms, status, error, command_id, created_at, completed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                request.id, request.message, request.selection_mode, json.dumps(request.candidate_snapshot),
+                request.selected_session_id, request.router_output, request.provider, request.model,
+                request.thinking_level, request.latency_ms, request.status, request.error,
+                request.command_id, request.created_at, request.completed_at,
+            ),
+        )
+        await self._db.commit()
+        return bool(cursor.rowcount)
+
+    async def update_pi_router_request(self, request: PiRouterRequest) -> None:
+        await self._db.execute(
+            """UPDATE pi_router_requests SET selection_mode=?, candidate_snapshot=?, selected_session_id=?,
+               router_output=?, provider=?, model=?, thinking_level=?, latency_ms=?, status=?, error=?,
+               command_id=?, completed_at=? WHERE id=?""",
+            (
+                request.selection_mode, json.dumps(request.candidate_snapshot), request.selected_session_id,
+                request.router_output, request.provider, request.model, request.thinking_level,
+                request.latency_ms, request.status, request.error, request.command_id,
+                request.completed_at, request.id,
+            ),
+        )
+        await self._db.commit()
+
+    async def get_pi_router_request(self, request_id: str) -> PiRouterRequest | None:
+        row = await (await self._db.execute(
+            "SELECT * FROM pi_router_requests WHERE id=?", (request_id,)
+        )).fetchone()
+        return self._row_to_pi_router_request(row) if row else None
+
+    async def get_latest_pi_router_request(
+        self, *, dispatched_only: bool = False, classified_only: bool = False,
+    ) -> PiRouterRequest | None:
+        clauses = []
+        if dispatched_only:
+            clauses.append("status='dispatched'")
+        if classified_only:
+            clauses.append("selection_mode='auto' AND latency_ms>0")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = await (await self._db.execute(
+            f"""SELECT * FROM pi_router_requests {where}
+                ORDER BY completed_at DESC, created_at DESC, rowid DESC LIMIT 1"""
+        )).fetchone()
+        return self._row_to_pi_router_request(row) if row else None
+
+    async def get_latest_pi_message_event(
+        self, session_id: str, role: str,
+    ) -> PiSessionEvent | None:
+        row = await (await self._db.execute(
+            """SELECT * FROM pi_session_events
+               WHERE session_id=? AND event_type='message-end'
+                 AND json_extract(payload, '$.message.role')=?
+               ORDER BY sequence DESC LIMIT 1""",
+            (session_id, role),
+        )).fetchone()
+        if not row:
+            return None
+        return PiSessionEvent(
+            id=row["id"], session_id=row["session_id"], event_type=row["event_type"],
+            payload=json.loads(row["payload"] or "{}"), created_at=row["created_at"],
+            sequence=row["sequence"],
+        )
+
+    async def list_recent_pi_session_events(
+        self, session_id: str, limit: int = 500,
+    ) -> list[PiSessionEvent]:
+        rows = await self._db.execute_fetchall(
+            """SELECT * FROM (
+                   SELECT * FROM pi_session_events WHERE session_id=? ORDER BY sequence DESC LIMIT ?
+               ) ORDER BY sequence""",
+            (session_id, max(1, min(limit, 1000))),
         )
         return [
             PiSessionEvent(

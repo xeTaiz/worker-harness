@@ -437,9 +437,9 @@ Gateway-first transport, direct fallback on upstream-open failure, capacity-repl
 
 **Gate:** a phone/browser attaches through the gateway, remains connected while silent, returns to the selector if replaced at capacity, reconnects trivially, and may coexist with native clients.
 
-### M9 — global semantic router — implementation started
+### M9 — global semantic router — implemented; live rollout pending
 
-The implementation contract is `specs/GLOBAL_SEMANTIC_ROUTER.md`. The router is a stateless virtual dispatcher backed by a private Pi `ModelRuntime` sidecar: explicit recipients bypass classification; Auto selects only active interactive sessions; every dispatch uses steering; the prior successful route is a bounded follow-up hint for less than three minutes; model/thinking selection and classification latency are visible in the global PWA. It neither owns terminal attachments nor blocks Zellij/PWA transport work.
+The implementation contract is `specs/GLOBAL_SEMANTIC_ROUTER.md`. The stateless virtual dispatcher, private Pi `ModelRuntime` sidecar, explicit-recipient bypass, interactive-only Auto classification, steering dispatch, bounded three-minute follow-up hint, durable request/latency records, bridge Interrupt, pending indicator, and bounded cross-session Global PWA are implemented. It neither owns terminal attachments nor blocks Zellij/PWA transport work; image publication, bridge reload, and live browser/fleet acceptance remain.
 
 **Gate:** ambiguous requests ask for a target; unambiguous requests reach the intended existing interactive session; Interrupt matches Pi Escape semantics; bounded latest prompt/output/tool activity from every interactive session renders without cross-session interleaving.
 

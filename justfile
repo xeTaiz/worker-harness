@@ -9,13 +9,15 @@ release_tag := git_branch + "-" + git_sha + git_dirty
 orchestrator_repo := image_namespace + "/wh-orch"
 worker_repo := image_namespace + "/wh-worker"
 web_repo := image_namespace + "/wh-web"
+router_repo := image_namespace + "/wh-router"
 
 orchestrator_image := orchestrator_repo + ":latest"
 worker_image := worker_repo + ":latest"
 web_image := web_repo + ":latest"
+router_image := router_repo + ":latest"
 
-build: build-orch build-worker build-web
-    @echo "[just build] Built orchestrator, worker, and web images"
+build: build-orch build-worker build-web build-router
+    @echo "[just build] Built orchestrator, worker, web, and router images"
 
 # Build everything (docker containers + singularity .sif) then produce dist bundle.
 all: build build-singularity dist
@@ -44,6 +46,14 @@ build-web:
         -t {{web_repo}}:{{git_branch}} \
         -t {{web_repo}}:{{release_tag}} \
         -f web_container/Dockerfile .
+
+build-router:
+    @echo "[just build-router] Building {{router_repo}} with tags latest, {{git_branch}}, and {{release_tag}}"
+    @docker build \
+        -t {{router_repo}}:latest \
+        -t {{router_repo}}:{{git_branch}} \
+        -t {{router_repo}}:{{release_tag}} \
+        -f router_service/Dockerfile .
 
 build-singularity output="worker-harness-worker.sif":
     @echo "[just build-singularity] Building Singularity image: {{output}}"

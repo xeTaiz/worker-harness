@@ -90,10 +90,11 @@ Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 ## Build images
 
 ```bash
-just build          # orchestrator, worker, and wh-web
+just build          # orchestrator, worker, wh-web, and wh-router
 just build-orch     # orchestrator only
 just build-worker   # worker only
 just build-web      # wh-web only
+just build-router   # stateless Pi routing classifier only
 ```
 
 Every Docker build receives three ready-to-push tags automatically:
@@ -160,6 +161,47 @@ docker compose -f docker-compose.web.example.yml restart wh-web
 Do not change or share the orchestrator's SQLite or Tailscale state mounts as
 part of this web cutover, and never run two orchestrators against the same
 Tailscale state directory.
+
+## Run the global semantic router
+
+The global UI routes operator messages only to active interactive Pi sessions.
+Explicit recipients bypass classification; Auto uses the private `wh-router`
+sidecar and includes the previous successful route only while it is less than
+three minutes old. Every dispatch uses Pi steering, which starts an ordinary
+turn when the recipient is idle. The UI records and displays the latest
+classification latency.
+
+`wh-router` has no published port or Tailnet identity. It joins `wh-internal`
+and uses a dedicated copy of the operator's Pi auth/model configuration. The
+directory is writable because OAuth refresh and credential-store locking need
+to update it; do not mount the live interactive-agent directory into two
+writers:
+
+```bash
+install -d -m 0700 "$HOME/.pi/wh-router-agent"
+cp -a "$HOME/.pi/agent/." "$HOME/.pi/wh-router-agent/"
+export WH_PI_ROUTER_AGENT_DIR="$HOME/.pi/wh-router-agent"
+export WH_DOCKER_NETWORK=wh-internal
+docker compose -f docker-compose.router.example.yml up -d --build
+```
+
+The `wh-orch` container must join the same network and use:
+
+```text
+WH_PI_ROUTER_URL=http://wh-router:12900
+```
+
+The router model and thinking level are selected from the Global web view and
+persist in orchestrator SQLite. Initial intended comparisons are
+`openai-codex/gpt-5.3-codex-spark` and `openai-codex/gpt-5.6-luna`; all models
+reported as available by the mounted Pi configuration are selectable. The
+sidecar receives no filesystem or Worker Harness tools and starts every
+classification from a fresh one-message context.
+
+Global **Interrupt** matches Pi's normal Escape behavior through the bridge's
+`ctx.abort()`: queued messages are restored into the target Pi editor and the
+current operation is aborted. It does not terminate Pi or undo completed tool
+side effects.
 
 ## Start containers with Docker or Podman (ephemeral runtime)
 

@@ -199,6 +199,7 @@ class PiSession(BaseModel):
     terminal_host: str = ""
     terminal_port: int = 0
     terminal_protocol_version: int = 0
+    has_pending_messages: bool = False
     last_seen: int = 0
     created_at: int = 0
     updated_at: int = 0
@@ -244,6 +245,7 @@ class PiBridgeRegister(BaseModel):
     terminal_host: str = Field(default="", max_length=256, pattern=r"^[A-Za-z0-9.-]*$")
     terminal_port: int = Field(default=0, ge=0, le=65535)
     terminal_protocol_version: int = Field(default=0, ge=0, le=100)
+    has_pending_messages: bool = False
     # A newly attached bridge may include the latest completed exchange so the
     # durable transcript is useful immediately. The database accepts only
     # message start/end events from this bounded registration snapshot.
@@ -254,6 +256,7 @@ class PiBridgeEventBatch(BaseModel):
     incarnation: str = Field(min_length=1, max_length=128)
     state: PiSessionState | None = None
     detail: str = Field(default="", max_length=4096)
+    has_pending_messages: bool | None = None
     events: list[PiIngestEvent] = Field(default_factory=list)
 
 
@@ -268,6 +271,31 @@ class PiSessionCommand(BaseModel):
     claimed_at: int = 0
     claimed_by: str = ""
     delivered_at: int = 0
+
+
+class PiRouterConfig(BaseModel):
+    provider: str = "openai-codex"
+    model: str = "gpt-5.3-codex-spark"
+    thinking_level: str = "off"
+    updated_at: int = 0
+
+
+class PiRouterRequest(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    message: str
+    selection_mode: str = "auto"
+    candidate_snapshot: list[dict[str, Any]] = Field(default_factory=list)
+    selected_session_id: str | None = None
+    router_output: str = ""
+    provider: str = ""
+    model: str = ""
+    thinking_level: str = "off"
+    latency_ms: int = 0
+    status: str = "routing"
+    error: str = ""
+    command_id: str | None = None
+    created_at: int = 0
+    completed_at: int = 0
 
 
 class PiDelegation(BaseModel):

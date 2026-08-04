@@ -1,6 +1,6 @@
 ---
 title: Worker Harness Global Semantic Router
-status: approved-implementation-started
+status: implemented-pending-live-rollout
 created: 2026-08-03
 baseline_worker_harness: d9202ee
 baseline_dotfiles: c93cc22
@@ -317,7 +317,21 @@ Expansion fetches the existing per-session durable event history. Concurrent ses
 17. Router sidecar has no published host/Tailnet port.
 18. Existing direct/gateway terminal, Zellij/tmux, delegation, job, and standalone-web tests remain green.
 
-## 13. Explicit non-goals
+## 13. Implementation status
+
+Implemented in the companion code commit after this spec:
+
+- pure interactive-only candidate filtering, bounded event summaries, recent-route prompt construction, and strict numeric parsing;
+- SQLite router configuration/request/latency persistence and idempotent request IDs;
+- explicit/reply bypass, auto classification, stale-target revalidation, and durable steer enqueue;
+- private Bun/Pi `ModelRuntime` sidecar with available-model discovery and fresh-context classification;
+- durable bridge Interrupt using `ctx.abort()` plus pending-message boolean reporting;
+- Global PWA model/thinking controls, latest latency, compact roster, bounded cross-session cards, per-session SSE updates, explicit recipient selection, ambiguity retention, and Interrupt;
+- same-origin Nginx allowlisting, container/Compose/build recipes, and rollout documentation.
+
+Non-live validation: 186 tests plus 25 subtests, Python compileall, JavaScript syntax, TypeScript type-check, Bun bundles, Compose rendering, and diff checks pass. The hardened router container runs with a read-only root filesystem and a dedicated writable Pi credential directory; it discovers both Spark and Luna. A live local sidecar→orchestrator dispatch selected the intended session. Three-call latency samples with thinking off were Spark `[2742, 2558, 4565]` ms (median 2742 ms) and Luna `[2389, 2692, 2428]` ms (median 2428 ms); these are observational canaries, not a formal benchmark. Production image publication, bridge reload, and browser/fleet acceptance remain.
+
+## 14. Explicit non-goals
 
 - Delegated-session auto-routing.
 - Autonomous creation of Pi sessions.
