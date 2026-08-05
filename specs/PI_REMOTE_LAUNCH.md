@@ -29,7 +29,7 @@ This is an explicit operator action. It does not add an orchestrator remote-exec
    - `Manual path…`, whose prompt defaults to target `$HOME`.
 8. The default human name is the selected directory basename. The launcher supplies it explicitly to `wh pi start`; generated session UUID remains authoritative and duplicate names are allowed.
 9. The launcher executes target-side existing `wh --output json pi start --no-attach --name … -- [PI_ARGS…]` after `cd -- CWD`. Remote shell values are quoted with `shlex.quote`; the local target bypasses SSH and executes argv directly.
-10. The target must already have SSH, `wh`, Pi, its bridge extension, tmux/Bun, orchestrator configuration, and host-relay/Tailscale Serve prerequisites. V1 deliberately has no doctor/bootstrap flow; failures are surfaced with target stdout/stderr.
+10. The target must already have SSH, `wh`, Pi, its bridge extension, tmux/Bun, orchestrator configuration, and host-relay/Tailscale Serve prerequisites. `wh host setup` and `wh host doctor` now capture and validate the target's non-interactive runtime per `specs/HOST_RUNTIME_SETUP.md`; launch still performs no automatic bootstrap and surfaces target failures through bounded stdout/stderr.
 11. After target `wh pi start` returns its generated UUID, the operator polls the existing orchestrator registry until that exact session is active and attachable, then reuses the existing direct-first/gateway-fallback and dedicated/reused Zellij attachment flow.
 
 ## CLI

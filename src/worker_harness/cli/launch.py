@@ -421,7 +421,6 @@ def build_remote_launch_command(cwd: str, name: str, pi_args: Sequence[str]) -> 
     if not name.strip() or "\0" in name:
         raise RuntimeError("Pi session name may not be empty")
     argv = [
-        "wh",
         "--output",
         "json",
         "pi",
@@ -432,7 +431,19 @@ def build_remote_launch_command(cwd: str, name: str, pi_args: Sequence[str]) -> 
     ]
     if pi_args:
         argv.extend(("--", *pi_args))
-    script = f"cd -- {shlex.quote(cwd)} && exec {shlex.join(argv)}"
+    script = "\n".join((
+        "set -eu",
+        "wh_bin=$(command -v wh 2>/dev/null || true)",
+        "if [ -z \"$wh_bin\" ] || [ ! -x \"$wh_bin\" ]; then",
+        "  wh_bin=\"$HOME/.local/bin/wh\"",
+        "fi",
+        "if [ ! -x \"$wh_bin\" ]; then",
+        "  echo 'wh executable not found; install Worker Harness and run `wh host setup`' >&2",
+        "  exit 127",
+        "fi",
+        f"cd -- {shlex.quote(cwd)}",
+        f'exec "$wh_bin" {shlex.join(argv)}',
+    ))
     return "sh -lc " + shlex.quote(script)
 
 

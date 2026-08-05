@@ -77,6 +77,17 @@ def validate_new_session_args(pi_args: Sequence[str]) -> None:
             )
 
 
+def _host_runtime():
+    from worker_harness.host_runtime import HostRuntimeError, load_host_runtime
+
+    try:
+        return load_host_runtime(required=False)
+    except HostRuntimeError as exc:
+        raise RuntimeError(
+            f"host runtime manifest is invalid: {exc}; rerun `wh host setup`"
+        ) from exc
+
+
 def _real_pi_executable() -> str:
     configured = os.environ.get("WH_PI_EXECUTABLE")
     if configured:
@@ -84,21 +95,36 @@ def _real_pi_executable() -> str:
         if not candidate.is_file() or not os.access(candidate, os.X_OK):
             raise RuntimeError(f"WH_PI_EXECUTABLE is not executable: {candidate}")
         return str(candidate.resolve())
-    executable = shutil.which("pi")
+    runtime = _host_runtime()
+    executable = runtime.executable("pi") if runtime else shutil.which("pi")
     if not executable:
-        raise RuntimeError("Pi executable not found; install pi or set WH_PI_EXECUTABLE")
+        raise RuntimeError(
+            "Pi executable not found; run `wh host setup` from a shell where pi is available "
+            "or set WH_PI_EXECUTABLE"
+        )
     return str(Path(executable).resolve())
 
 
+def _tmux_executable() -> str:
+    runtime = _host_runtime()
+    executable = runtime.executable("tmux") if runtime else shutil.which("tmux")
+    if not executable:
+        raise RuntimeError(
+            "tmux is required for wh pi start; run `wh host setup` from a prepared shell"
+        )
+    return executable
+
+
 def _tmux_environment() -> dict[str, str]:
-    environment = dict(os.environ)
+    runtime = _host_runtime()
+    environment = runtime.environment() if runtime else dict(os.environ)
     for key in ("TMUX", "TMUX_PANE", "ZELLIJ", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID"):
         environment.pop(key, None)
     return environment
 
 
 def _tmux_command(socket: Path, *args: str) -> list[str]:
-    return ["tmux", "-f", "/dev/null", "-S", str(socket), *args]
+    return [_tmux_executable(), "-f", "/dev/null", "-S", str(socket), *args]
 
 
 def _run_tmux(
@@ -207,9 +233,14 @@ def start_managed_pi(
         raise RuntimeError(f"unsafe managed Pi socket directory: {socket.parent}")
     socket.parent.chmod(0o700)
 
+    runtime = _host_runtime()
+    runtime_assignments = (
+        [f"PATH={os.pathsep.join(runtime.path)}"] if runtime is not None else []
+    )
     command = shlex.join([
         "env",
         "WH_MANAGED_PI=1",
+        *runtime_assignments,
         pi_executable,
         "--session-id",
         session_id,

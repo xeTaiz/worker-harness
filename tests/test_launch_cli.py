@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -190,13 +191,46 @@ class LaunchCommandTests(unittest.TestCase):
         )
         self.assertTrue(command.startswith("sh -lc "))
         self.assertIn("cd --", command)
-        self.assertIn("wh --output json pi start --no-attach --name", command)
+        self.assertIn('exec "$wh_bin" --output json pi start --no-attach --name', command)
+        self.assertIn('wh_bin="$HOME/.local/bin/wh"', command)
+        self.assertIn("run `wh host setup`", command)
         # The dangerous fragments exist only as quoted data, never as a bare
         # command separator in the outer remote command.
         parsed = shlex_split_once(command)
         self.assertEqual(parsed[0:2], ["sh", "-lc"])
         self.assertIn("'/home/u/Dev/a b;echo BAD'", parsed[2])
         self.assertIn("'value;echo BAD'", parsed[2])
+
+    def test_remote_launch_falls_back_to_uv_tool_link_under_restricted_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            repo = home / "repo"
+            repo.mkdir()
+            bin_dir = home / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+            args_file = home / "args.txt"
+            fake_wh = bin_dir / "wh"
+            fake_wh.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HOME/args.txt\"\n"
+                "printf '{\"session_id\":\"session-1\",\"name\":\"Repo\"}\\n'\n"
+            )
+            fake_wh.chmod(0o755)
+            command = launch.build_remote_launch_command(
+                str(repo), "Repo", ["--offline", "value;still-data"]
+            )
+            result = subprocess.run(
+                ["sh", "-c", command],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                check=False,
+                text=True,
+            )
+            captured_args = args_file.read_text().splitlines()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["session_id"], "session-1")
+        self.assertEqual(captured_args[-2:], ["--offline", "value;still-data"])
 
     def test_local_launch_bypasses_ssh_and_uses_target_cwd(self):
         machine = self.remote_machine(local=True)

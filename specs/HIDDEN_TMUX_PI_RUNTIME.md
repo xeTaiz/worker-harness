@@ -79,7 +79,7 @@ Resume modes need explicit handling. If the operator supplies `--session`, `--se
 
 ## 5. Start lifecycle
 
-1. Resolve the real Pi executable before any optional `pi -> wh pi start` alias to avoid recursion.
+1. Resolve the real Pi executable before any optional `pi -> wh pi start` alias to avoid recursion. Prefer the private host-runtime manifest created by `wh host setup`; `WH_PI_EXECUTABLE` remains the explicit override.
 2. Determine the managed socket and create its parent directory mode `0700`.
 3. Ensure the dedicated tmux server and owner session exist.
 4. In the first server-start command queue, set managed global options before creating the first pane; then reinforce the owner-session options on every launch:
@@ -211,6 +211,7 @@ Recommended defaults:
 - Resume/continue/fork identity semantics require explicit design and tests.
 - A local loopback attach path adds a small client branch, though terminal framing and relay behavior stay shared.
 - The managed launcher must distinguish its real Pi executable from any shell alias/wrapper.
+- Non-interactive launches consume `specs/HOST_RUNTIME_SETUP.md`: the captured Pi/tmux paths and PATH are injected into managed panes so Pi's Node shebang and the bridge's Bun relay startup do not depend on shell profile files.
 - Formal client distribution remains Git/uv-tool based until a versioned release workflow exists.
 
 ## 12. Acceptance gates

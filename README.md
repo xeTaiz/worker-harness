@@ -50,14 +50,34 @@ prefer the direct Tailnet relay and fall back through the orchestrator gateway;
 the PWA uses the same-origin gateway first.
 
 For a native terminal attachment, install the CLI on each operator device and
-pick a session:
+capture the prepared interactive shell's host runtime before launching Pi:
 
 ```bash
 uv tool install --editable ~/Dev/worker-harness
+wh host setup                        # capture wh/pi/Bun/Node/tmux/Tailscale paths
+wh host doctor                       # validate from a clean SSH-like environment
 wh pi start --name research          # new Pi in the hidden managed tmux backend
 wh pi attach                         # interactive fzf picker
 wh pi attach <id-prefix-or-name>     # select directly
 ```
+
+`uv tool install` intentionally cannot run project post-install hooks. On an
+ordinary fleet host, chain the explicit setup step after a pinned install:
+
+```bash
+uv tool install --force --reinstall \
+  'git+ssh://git@github.com/xeTaiz/worker-harness.git@<commit>' \
+  && wh host setup
+```
+
+`wh host setup` writes a private, atomic
+`~/.config/worker-harness/host-runtime.json` manifest. It records the absolute
+executables and stable PATH needed by non-interactive SSH launches and managed
+tmux panes, including Pi's `#!/usr/bin/env node` dependency and the Bun path
+used to start the host relay. It does not edit shell profiles. Rerun setup after
+moving or upgrading Node, Bun, Pi, tmux, Tailscale, or the `wh` installation;
+`wh host doctor` reports stale paths and exits nonzero. Set
+`WH_HOST_RUNTIME_CONFIG` only when an alternate manifest path is required.
 
 `wh pi start` generates the internal Pi session ID, creates one single-pane
 window in a dedicated status-free tmux server, waits for its exact local route,

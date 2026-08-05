@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from worker_harness import pi_runtime
+from worker_harness.host_runtime import HostRuntime
 
 
 class PiRuntimeTests(unittest.TestCase):
@@ -168,9 +169,54 @@ class PiRuntimeTests(unittest.TestCase):
 
     def test_tmux_command_ignores_user_configuration(self):
         command = pi_runtime._tmux_command(Path("/tmp/pi.sock"), "has-session")
-        self.assertEqual(command[:5], [
-            "tmux", "-f", "/dev/null", "-S", "/tmp/pi.sock",
+        self.assertTrue(command[0].endswith("/tmux") or command[0] == "tmux")
+        self.assertEqual(command[1:5], [
+            "-f", "/dev/null", "-S", "/tmp/pi.sock",
         ])
+
+    def test_manifest_pins_tmux_pi_and_managed_path(self):
+        runtime = HostRuntime(
+            path=("/opt/pi/bin", "/opt/node/bin", "/usr/bin"),
+            executables={
+                "wh": "/opt/wh/bin/wh",
+                "pi": "/opt/pi/bin/pi",
+                "bun": "/opt/bun/bin/bun",
+                "node": "/opt/node/bin/node",
+                "tmux": "/opt/tmux/bin/tmux",
+                "tailscale": "/opt/tailscale/bin/tailscale",
+                "zellij": None,
+            },
+            _schema_version=1,
+            _generated_at="2026-08-05T00:00:00+00:00",
+        )
+        completed = subprocess.CompletedProcess([], 0, "%42\n", "")
+        with tempfile.TemporaryDirectory() as directory:
+            socket = Path(directory) / "pi-tmux.sock"
+            cwd = Path(directory) / "repo"
+            cwd.mkdir()
+            with (
+                patch.object(pi_runtime, "_host_runtime", return_value=runtime),
+                patch.object(pi_runtime, "managed_tmux_socket_path", return_value=socket),
+                patch.object(pi_runtime, "_session_exists", return_value=True),
+                patch.object(pi_runtime, "_configure_managed_server"),
+                patch.object(pi_runtime, "_run_tmux", return_value=completed) as run,
+            ):
+                pi_runtime.start_managed_pi(
+                    name="manifest",
+                    pi_args=[],
+                    cwd=cwd,
+                    session_id="00000000-0000-4000-8000-000000000001",
+                )
+        launched = shlex.split(run.call_args.args[-1])
+        self.assertIn("PATH=/opt/pi/bin:/opt/node/bin:/usr/bin", launched)
+        self.assertIn("/opt/pi/bin/pi", launched)
+        with patch.object(pi_runtime, "_host_runtime", return_value=runtime):
+            self.assertEqual(
+                pi_runtime._tmux_command(Path("/tmp/pi.sock"), "has-session")[0],
+                "/opt/tmux/bin/tmux",
+            )
+            environment = pi_runtime._tmux_environment()
+        self.assertEqual(environment["PATH"], "/opt/pi/bin:/opt/node/bin:/usr/bin")
 
     def test_tmux_environment_strips_outer_multiplexer_context(self):
         with patch.dict(pi_runtime.os.environ, {
