@@ -134,16 +134,24 @@ just build-orch     # orchestrator only
 just build-worker   # worker only
 just build-web      # wh-web only
 just build-router   # stateless Pi routing classifier only
+
+just push           # build and push all four images
+just push-orch      # build and push the orchestrator only
+just push-worker    # build and push the worker only
+just push-web       # build and push wh-web only
+just push-router    # build and push the router only
 ```
 
-Every Docker build receives three ready-to-push tags automatically:
+Every Docker build receives three tags automatically:
 `xetaiz/<image>:latest`, `xetaiz/<image>:<branch>`, and
 `xetaiz/<image>:<branch>-<7-character-commit>`. A dirty worktree adds `-dirty`
 to the commit tag so an uncommitted image cannot be mistaken for an exact
 commit build. For example, `just build-orch` on clean `giga-wh` builds
 `xetaiz/wh-orch:latest`, `xetaiz/wh-orch:giga-wh`, and
-`xetaiz/wh-orch:giga-wh-<commit>`. Set `WH_IMAGE_NAMESPACE` to override
-`xetaiz` without editing the `justfile`.
+`xetaiz/wh-orch:giga-wh-<commit>`. Each `push-*` recipe first runs its matching
+build, then pushes all three tags, including `:latest`; this prevents Docker Hub's
+moving tag from lagging behind the immutable release tag. Set
+`WH_IMAGE_NAMESPACE` to override `xetaiz` without editing the `justfile`.
 
 ## Run the standalone web UI
 
