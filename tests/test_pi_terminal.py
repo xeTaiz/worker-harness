@@ -246,6 +246,30 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PiTerminalTests(unittest.TestCase):
+    def test_write_all_retries_partial_terminal_writes(self):
+        writes = []
+
+        def partial_write(fd, data):
+            chunk = bytes(data)
+            writes.append((fd, chunk))
+            return min(3, len(chunk))
+
+        with patch.object(pi_terminal.os, "write", side_effect=partial_write):
+            pi_terminal._write_all(7, b"terminal")
+
+        self.assertEqual(writes, [
+            (7, b"terminal"),
+            (7, b"minal"),
+            (7, b"al"),
+        ])
+
+    def test_write_all_rejects_zero_progress(self):
+        with (
+            patch.object(pi_terminal.os, "write", return_value=0),
+            self.assertRaisesRegex(OSError, "made no progress"),
+        ):
+            pi_terminal._write_all(7, b"terminal")
+
     def test_terminal_url_adds_initial_dimensions_and_preserves_query(self):
         self.assertEqual(
             pi_terminal.terminal_url("ws://host/attach?token=x", 52, 188),

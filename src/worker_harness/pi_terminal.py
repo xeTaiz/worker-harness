@@ -171,16 +171,27 @@ async def _send_resizes(websocket: Any, stdout_fd: int, changed: asyncio.Event) 
         changed.clear()
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    """Write one terminal frame completely, including partial PTY writes."""
+
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("terminal output write made no progress")
+        remaining = remaining[written:]
+
+
 async def _receive_output(websocket: Any, stdout_fd: int) -> str | None:
     try:
         async for message in websocket:
             if isinstance(message, bytes):
-                os.write(stdout_fd, message)
+                _write_all(stdout_fd, message)
                 continue
             try:
                 frame = json.loads(message)
             except json.JSONDecodeError:
-                os.write(stdout_fd, message.encode())
+                _write_all(stdout_fd, message.encode())
                 continue
             if frame.get("type") == "error":
                 detail = frame.get("detail") or frame.get("code") or "terminal relay reported an error"
