@@ -902,6 +902,17 @@ def attach(
 ):
     """Attach this terminal to a discovered Pi session; press Ctrl-] to detach."""
 
+    # Tmux popup format expansion varies across supported client versions.
+    # Prefer explicit CLI values for compatibility, but let the popup inject its
+    # authoritative invoking session/client as environment entries so `$N`
+    # session IDs never pass through an intermediate shell expansion.
+    picker_target_session = tmux_target_session or os.environ.get(
+        "WH_TMUX_TARGET_SESSION"
+    )
+    picker_target_client = tmux_target_client or os.environ.get(
+        "WH_TMUX_TARGET_CLIENT"
+    )
+
     async def run() -> None:
         from worker_harness.pi_zellij import is_immediate_zellij
 
@@ -909,7 +920,7 @@ def attach(
         if tmux_picker:
             if tmux_child or relative or here or loopback:
                 raise RuntimeError("--tmux-picker cannot be combined with attachment child modes")
-            if tmux_target_session is None or tmux_target_client is None:
+            if picker_target_session is None or picker_target_client is None:
                 raise RuntimeError("--tmux-picker requires its invoking tmux session and client")
             candidates = await _candidate_inventory()
             selected = (
@@ -922,8 +933,8 @@ def attach(
             await asyncio.to_thread(
                 open_or_focus_attachment_window,
                 selected,
-                tmux_target_session,
-                tmux_target_client,
+                picker_target_session,
+                picker_target_client,
             )
             return
         if tmux_child:

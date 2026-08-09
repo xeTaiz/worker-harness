@@ -437,6 +437,22 @@ class PiCliTests(unittest.TestCase):
             selected = pi._pick_session(rows)
         self.assertEqual(selected["id"], "second")
 
+    def test_tmux_picker_accepts_authoritative_locator_from_popup_environment(self):
+        opener = Mock(return_value="@7")
+        with (
+            patch.dict(pi.os.environ, {
+                "WH_TMUX_TARGET_SESSION": "$4",
+                "WH_TMUX_TARGET_CLIENT": "/dev/ttys009",
+            }),
+            patch.object(pi, "_candidate_inventory", new=AsyncMock(return_value=[self._session()])),
+            patch.object(pi, "_attachable_candidates", new=AsyncMock(return_value=[self._session()])),
+            patch.object(pi, "_pick_session", return_value=self._session()),
+            patch("worker_harness.pi_tmux.open_or_focus_attachment_window", new=opener),
+        ):
+            result = self.runner.invoke(pi.app, ["attach", "--tmux-picker"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        opener.assert_called_once_with(self._session(), "$4", "/dev/ttys009")
+
     def test_attach_in_zellij_opens_or_focuses_dedicated_tab(self):
         opener = AsyncMock(return_value=None)
         with (
