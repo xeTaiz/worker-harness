@@ -1,6 +1,7 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
 image_namespace := env_var_or_default("WH_IMAGE_NAMESPACE", "xetaiz")
+docker_build_network := env_var_or_default("WH_DOCKER_BUILD_NETWORK", "host")
 git_branch := `branch="$(git branch --show-current)"; printf '%s' "${branch:-detached}" | sed 's/[^A-Za-z0-9_.-]/-/g'`
 git_sha := `git rev-parse --short=7 HEAD`
 git_dirty := `if test -n "$(git status --porcelain)"; then printf '%s' '-dirty'; fi`
@@ -29,6 +30,7 @@ all: build build-singularity dist
 build-orch:
     @echo "[just build-orch] Building {{orchestrator_repo}} with tags latest, {{git_branch}}, and {{release_tag}}"
     @docker build \
+        --network {{docker_build_network}} \
         -t {{orchestrator_repo}}:latest \
         -t {{orchestrator_repo}}:{{git_branch}} \
         -t {{orchestrator_repo}}:{{release_tag}} \
@@ -37,6 +39,7 @@ build-orch:
 build-worker:
     @echo "[just build-worker] Building {{worker_repo}} with tags latest, {{git_branch}}, and {{release_tag}}"
     @docker build \
+        --network {{docker_build_network}} \
         -t {{worker_repo}}:latest \
         -t {{worker_repo}}:{{git_branch}} \
         -t {{worker_repo}}:{{release_tag}} \
@@ -45,6 +48,7 @@ build-worker:
 build-web:
     @echo "[just build-web] Building {{web_repo}} with tags latest, {{git_branch}}, and {{release_tag}}"
     @docker build \
+        --network {{docker_build_network}} \
         -t {{web_repo}}:latest \
         -t {{web_repo}}:{{git_branch}} \
         -t {{web_repo}}:{{release_tag}} \
@@ -53,6 +57,7 @@ build-web:
 build-router:
     @echo "[just build-router] Building {{router_repo}} with tags latest, {{git_branch}}, and {{release_tag}}"
     @docker build \
+        --network {{docker_build_network}} \
         -t {{router_repo}}:latest \
         -t {{router_repo}}:{{git_branch}} \
         -t {{router_repo}}:{{release_tag}} \

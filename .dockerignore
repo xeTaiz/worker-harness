@@ -1,0 +1,19 @@
+# The root build context is shared by the orchestrator, wh-web, and router
+# images. Keep it allowlisted so local SIFs, caches, git history, and
+# deployment data can never be sent to the Docker daemon.
+**
+
+!pyproject.toml
+!src/
+!src/**
+!orchestrator_container/
+!orchestrator_container/**
+!web/
+!web/**
+!web_container/
+!web_container/**
+!router_service/
+!router_service/**
+
+**/__pycache__/
+**/*.py[cod]

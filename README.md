@@ -152,6 +152,11 @@ commit build. For example, `just build-orch` on clean `giga-wh` builds
 build, then pushes all three tags, including `:latest`; this prevents Docker Hub's
 moving tag from lagging behind the immutable release tag. Set
 `WH_IMAGE_NAMESPACE` to override `xetaiz` without editing the `justfile`.
+Docker builds use host networking by default so hosts whose resolver is managed
+by Tailscale can resolve package registries during the build. Set
+`WH_DOCKER_BUILD_NETWORK=default` when the Docker bridge has working DNS.
+Root build contexts are allowlisted by `.dockerignore`, excluding local SIFs,
+caches, Git history, and deployment data.
 
 ## Run the standalone web UI
 
