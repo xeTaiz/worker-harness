@@ -74,6 +74,50 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(direction, expected)
                 self.assertEqual(websocket.sent, [b"before"])
 
+    async def test_unexpected_close_reports_transport_diagnostics(self):
+        websocket = FakeWebSocket()
+        websocket.close_code = 1006
+        websocket.close_reason = "network lost"
+        master_fd, slave_fd = pty.openpty()
+        try:
+            with patch.object(
+                pi_terminal,
+                "connect",
+                return_value=FakeConnection(websocket),
+            ):
+                with self.assertRaisesRegex(
+                    pi_terminal.TerminalRelayUnavailable,
+                    r"transport=direct duration=.*fallback_used=no .*close_code=1006 .*close_reason=network lost",
+                ):
+                    await pi_terminal.attach_terminal(
+                        "ws://direct/attach",
+                        stdin_fd=slave_fd,
+                        stdout_fd=slave_fd,
+                    )
+        finally:
+            os.close(master_fd)
+            os.close(slave_fd)
+
+    async def test_normal_close_exits_without_transport_error(self):
+        websocket = FakeWebSocket()
+        websocket.close_code = 1000
+        websocket.close_reason = "terminal detached"
+        master_fd, slave_fd = pty.openpty()
+        try:
+            with patch.object(
+                pi_terminal,
+                "connect",
+                return_value=FakeConnection(websocket),
+            ):
+                self.assertIsNone(await pi_terminal.attach_terminal(
+                    "ws://direct/attach",
+                    stdin_fd=slave_fd,
+                    stdout_fd=slave_fd,
+                ))
+        finally:
+            os.close(master_fd)
+            os.close(slave_fd)
+
     async def test_attach_falls_back_to_gateway_and_returns_selector_when_replaced(self):
         direct = "ws://direct/attach"
         gateway = "ws://gateway/attach"

@@ -59,6 +59,8 @@ wh host doctor                       # validate from a clean SSH-like environmen
 wh pi start --name research          # new Pi in the hidden managed tmux backend
 wh pi attach                         # interactive fzf picker
 wh pi attach <id-prefix-or-name>     # select directly
+wh launch                             # machine/cwd → running/history/new picker
+wh pi resume <exact-id> --cwd /repo  # identity-safe target-local resume
 ```
 
 `uv tool install` intentionally cannot run project post-install hooks. On an
@@ -92,9 +94,16 @@ Zellij inside itself. Remote clients prefer the direct Tailnet relay and fall
 back to the orchestrator gateway. `--stream` remains as a compatibility no-op.
 
 The companion tmux dotfiles reserve `Ctrl-a` as a Worker Harness prefix while
-leaving tmux's normal `Ctrl-b` prefix unchanged: `Ctrl-a Ctrl-a` opens the
-picker, `Ctrl-a Ctrl-j/Ctrl-l` cycles next, `Ctrl-a Ctrl-h/Ctrl-k` cycles
-previous, and `Ctrl-a x` detaches. In Zellij, `Alt-a` and `Ctrl-a Ctrl-a` open
+leaving tmux's normal `Ctrl-b` prefix unchanged. `Ctrl-a Ctrl-a` opens a
+transient popup picker, then creates or focuses one dedicated WH-owned window by
+exact Pi UUID. Only that invoking tmux client is switched. The window title and
+Catppuccin status entry retain the state glyph and use blue/green/red/gray for
+working/idle/error/disconnected; ordinary windows are untouched. `Ctrl-a
+Ctrl-j/Ctrl-l` cycles next, `Ctrl-a Ctrl-h/Ctrl-k` cycles previous, and `Ctrl-a
+x` detaches. A dedicated attachment retries bounded unexpected transport
+closures; `Ctrl-]` remains an intentional close. Transport failures report the
+direct/gateway path, duration, fallback use, and close code/reason. In Zellij,
+`Alt-a` and `Ctrl-a Ctrl-a` open
 the picker in a floating pane. A managed/remote/delegated selection opens one
 single-pane tab (`π ● name` working, `π ✓ name` idle, `π ! name` error, `π ?
 name` disconnected), while reopening that session focuses its existing tab.
@@ -104,6 +113,16 @@ Zellij sources still focus their original pane. Picker order is Global, Local
 delegated workers. `Alt-u/y`, prefix Ctrl-j/l/h/k, and in-stream `Ctrl-^`/
 `Ctrl-_` cycle through that same order. Zellij keeps its existing `Ctrl-b`
 tmux-emulation mode entry as well.
+
+After `wh launch` selects a machine and cwd, its interactive action picker shows
+active Worker Harness sessions, inactive target-local Pi histories, and Start
+new. Active sessions attach without relaunching. Previous sessions are listed
+through the installed Pi `SessionManager.list(cwd)` API, which requires Pi
+`>=0.83.0,<1.0.0`; opaque IDs are re-resolved on the target and refused if
+already active before Pi is invoked with exact `--session`. Stored names are
+preserved by default. SSH errors include the destination and failing phase, and
+all operator-controlled paths, names, IDs, and Pi arguments remain argv/shell
+quoted.
 
 Tailscale SSH policy is also required (see `headscale-policy.example.json`).
 

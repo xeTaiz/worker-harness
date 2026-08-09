@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 import typer
-from unittest.mock import ANY, AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from typer.testing import CliRunner
 
@@ -626,6 +626,44 @@ class PiCliTests(unittest.TestCase):
         request.assert_awaited_once_with("GET", "/api/v1/pi/sessions")
         terminal.assert_not_awaited()
 
+    def test_resume_refuses_active_exact_id_before_target_history_lookup(self):
+        request = AsyncMock(return_value=[{"id": "history-1", "state": "idle"}])
+        with (
+            patch.object(pi, "_request", new=request),
+            patch("worker_harness.pi_history.resolve_session_history") as resolve,
+        ):
+            result = self.runner.invoke(
+                pi.app,
+                ["resume", "history-1", "--cwd", "/repo", "--no-attach"],
+            )
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("already active", result.output)
+        resolve.assert_not_called()
+
+    def test_resume_preserves_stored_name_and_returns_exact_id(self):
+        managed = pi_runtime.ManagedPiSession(
+            "history-1", "Stored name", Path("/tmp/pi.sock"), "%7"
+        )
+        _state["output"] = "json"
+        with (
+            patch.object(pi, "_request", new=AsyncMock(return_value=[])),
+            patch(
+                "worker_harness.pi_history.resolve_session_history",
+                return_value={"id": "history-1", "name": "Stored name", "cwd": "/repo"},
+            ),
+            patch("worker_harness.pi_runtime.resume_managed_pi", return_value=managed) as resume,
+            patch("worker_harness.pi_runtime.wait_for_managed_route", new=AsyncMock(return_value={})),
+        ):
+            result = self.runner.invoke(
+                pi.app,
+                ["resume", "history-1", "--cwd", "/repo", "--no-attach"],
+            )
+        self.assertEqual(result.exit_code, 0, result.output)
+        payload = json.loads(result.output)
+        self.assertEqual(payload["session_id"], "history-1")
+        self.assertTrue(payload["resumed"])
+        self.assertEqual(resume.call_args.kwargs["name"], "Stored name")
+
     def test_attach_reports_unavailable_session(self):
         request = AsyncMock(side_effect=[
             [self._session()],
@@ -651,6 +689,47 @@ class PiCliTests(unittest.TestCase):
             "/api/v1/pi/sessions/interactive-session-id:prompt",
             {"message": "continue", "deliver_as": "steer"},
         )
+
+
+class PiAttachReconnectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_owned_tmux_window_reconnects_after_transport_failure(self):
+        from worker_harness.pi_terminal import TerminalRelayUnavailable
+
+        terminal = AsyncMock(side_effect=[
+            TerminalRelayUnavailable("transport=direct"),
+            None,
+        ])
+        request = AsyncMock(return_value={
+            "attachable": True,
+            "protocol_version": 2,
+            "direct_websocket_url": "ws://direct/retry",
+            "gateway_websocket_url": "ws://gateway/retry",
+        })
+        update = Mock(return_value=True)
+
+        async def watcher(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(pi, "_request", new=request),
+            patch.object(pi, "_mark_attach_pane"),
+            patch.object(pi.asyncio, "sleep", new=AsyncMock()),
+            patch("worker_harness.pi_terminal.focus_local_zellij_session", new=AsyncMock(return_value=False)),
+            patch("worker_harness.pi_terminal.attach_terminal", new=terminal),
+            patch("worker_harness.pi_tmux.current_attachment_window", return_value="@3"),
+            patch("worker_harness.pi_tmux.update_attachment_window", new=update),
+            patch("worker_harness.pi_zellij_state.watch_session_state", new=watcher),
+        ):
+            await pi._run_attach_loop(
+                {"id": "session-1", "name": "Repo", "state": "idle"},
+                initial_websocket_url="ws://direct/first",
+                tmux_window=True,
+            )
+        self.assertEqual(terminal.await_count, 2)
+        request.assert_awaited_once_with(
+            "GET", "/api/v1/pi/sessions/session-1/attach-info"
+        )
+        self.assertTrue(any(call.args[1] == "disconnected" for call in update.call_args_list))
 
 
 if __name__ == "__main__":

@@ -344,7 +344,26 @@ When an in-tab attachment cycles to another Pi:
 - Plain Zellij-hosted Pi, tmux, bare terminal, PWA, delegated worker runtime, terminal protocol, and orchestrator schema remain compatible.
 - Reload/restart order for rollout: install/update `wh`; update KDL; restart host relay to revision 12; `/reload` existing managed Pi bridges so they advertise `managed_runtime`; reload/restart Zellij configuration. New managed Pi sessions advertise the field immediately.
 
-## 9. Out of scope
+## 9. Tmux persistent-window extension — implemented
+
+- `Ctrl-a Ctrl-a` uses `display-popup` only for fzf selection. The popup passes
+  exact invoking tmux session/client IDs to hidden `--tmux-picker` mode.
+- A process-shared private lock serializes find/create by tmux socket, target
+  session, and Pi UUID. Reuse requires an exact UUID pane marker, WH ownership,
+  a live pane PID, and a non-dead pane.
+- New streams run in one real `--tmux-child` window. Only `switch-client -c`
+  focuses the invoking client; session-wide selection is forbidden.
+- SSE state projection reuses `watch_session_state()`. Titles preserve the exact
+  glyph contract and per-window status colors are working `#89b4fa`, idle
+  `#a6e3a1`, error `#f38ba8`, disconnected `#6c7086`.
+- Catppuccin's generated formats remain the fallback for non-WH windows. Only
+  windows carrying `@wh_pi_owned=1` use the state-colored format.
+- Dedicated Zellij/tmux attachments retry four bounded unexpected transport
+  failures after the initial attempt. Intentional Ctrl-] detach never retries.
+  Final diagnostics include transport, duration, fallback use, close code, and
+  close reason.
+
+## 10. Out of scope
 
 - Per-tab background colors or replacing Zellij's built-in tab bar.
 - A WASM plugin.

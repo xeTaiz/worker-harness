@@ -21,16 +21,19 @@ This is an explicit operator action. It does not add an orchestrator remote-exec
    Other tagged service identities are not launch targets in v1.
 3. The local Tailnet node sorts first in the standard section. Online nodes sort before offline nodes, then by short MagicDNS label/hostname.
 4. Both sections use the same SSH launch mechanism. Worker-tagged selection does not silently invoke delegation; if its SSH environment lacks the interactive `wh`/Pi/bridge prerequisites, launch fails normally.
-5. The transport is ordinary `ssh` over the Tailnet/MagicDNS. No target-side helper or agent is introduced.
+5. The transport is ordinary `ssh` over the Tailnet/MagicDNS. No host daemon or orchestrator execution endpoint is introduced. The installed `wh` CLI provides bounded target-local history list/resume subcommands.
 6. SSH destination defaults to the short MagicDNS label. OpenSSH configuration supplies per-host user/key policy; `--ssh-user` can override it. For matched worker records, their advertised `ssh_user` is the fallback when no explicit override is supplied.
 7. Working-directory choices are:
    - target `$HOME`;
    - each immediate child directory of target `~/Dev`, when it exists;
    - `Manual path…`, whose prompt defaults to target `$HOME`.
-8. The default human name is the selected directory basename. The launcher supplies it explicitly to `wh pi start`; generated session UUID remains authoritative and duplicate names are allowed.
-9. The launcher executes target-side existing `wh --output json pi start --no-attach --name … -- [PI_ARGS…]` after `cd -- CWD`. Remote shell values are quoted with `shlex.quote`; the local target bypasses SSH and executes argv directly.
-10. The target must already have SSH, `wh`, Pi, its bridge extension, tmux/Bun, orchestrator configuration, and host-relay/Tailscale Serve prerequisites. `wh host setup` and `wh host doctor` now capture and validate the target's non-interactive runtime per `specs/HOST_RUNTIME_SETUP.md`; launch still performs no automatic bootstrap and surfaces target failures through bounded stdout/stderr.
-11. After target `wh pi start` returns its generated UUID, the operator polls the existing orchestrator registry until that exact session is active and attachable, then reuses the existing direct-first/gateway-fallback and dedicated/reused Zellij attachment flow.
+8. After machine/cwd selection, interactive launch groups actions as Running sessions, Previous sessions, and Start new. Explicit/scripted name or Pi arguments retain deterministic new-session behavior.
+9. Running sessions come from the orchestrator and attach directly. Previous histories come from target-local Pi `SessionManager.list(cwd)`, require package version `>=0.83.0,<1.0.0`, exclude every currently active ID, and preserve stored names.
+10. Resume sends only an opaque ID to the target. The target re-runs `SessionManager.list(cwd)`, requires one exact match under `~/.pi/agent/sessions`, rejects active IDs, and invokes Pi with exact `--session`; it never accepts a client-supplied history path.
+11. Start new defaults the human name to the directory basename. The launcher executes target-side `wh --output json pi start --no-attach --name … -- [PI_ARGS…]`; generated UUID remains authoritative and duplicate names are allowed.
+12. Remote shell values are quoted with `shlex.quote`/`shlex.join`; the local target bypasses SSH and executes argv directly. SSH errors name the destination, phase, and duration with bounded output.
+13. The target must already have SSH, `wh`, Pi, its bridge extension, tmux/Bun, orchestrator configuration, and host-relay/Tailscale Serve prerequisites. `wh host setup` and `wh host doctor` capture and validate the target's non-interactive runtime; launch performs no automatic bootstrap.
+14. After start/resume returns the exact UUID, the operator polls the existing orchestrator registry until active/attachable, then reuses direct-first/gateway-fallback and dedicated/reused attachment flow.
 
 ## CLI
 
@@ -71,7 +74,7 @@ The launcher runs a fixed POSIX shell command locally or through SSH. It emits N
 1. `$HOME`;
 2. sorted immediate children of `$HOME/Dev` when that directory exists.
 
-The command does not recursively scan home, execute project files, or require a remote Worker Harness helper. The local fzf adds the synthetic `Manual path…` option.
+The directory command does not recursively scan home or execute project files. The local fzf adds the synthetic `Manual path…` option. History lookup is a separate installed Worker Harness helper and runs only after cwd selection.
 
 ## Launch and registration
 
@@ -79,11 +82,12 @@ The command does not recursively scan home, execute project files, or require a 
 2. Resolve SSH destination/user.
 3. Query target directory choices unless `--cwd` is supplied.
 4. Prompt for manual path if chosen.
-5. Default name to `PurePath(cwd).name`, with a safe `Pi` fallback.
-6. Run local or SSH launch command and parse its JSON `{session_id, name, …}`.
-7. Poll `GET /api/v1/pi/sessions/{session_id}` for the exact UUID until active/attachable or timeout. Poll no faster than once per second and honor `429 Retry-After` without replacing a more useful prior registration state in the final diagnostic.
-8. With `--no-attach`, print the launch result including machine and cwd.
-9. Otherwise reuse the existing Pi attachment path; in immediate Zellij create/focus the dedicated state-named tab.
+5. Load active orchestrator sessions and bounded target-local histories for that exact cwd.
+6. Choose attach running, resume previous, or start new.
+7. For resume, re-resolve the opaque ID target-side and preserve its stored name. For new, default name to `PurePath(cwd).name` with a safe `Pi` fallback.
+8. Run local or SSH target command and parse its JSON `{session_id, name, …}`.
+9. Poll `GET /api/v1/pi/sessions/{session_id}` for the exact UUID until active/attachable or timeout. Poll no faster than once per second and honor `429 Retry-After`.
+10. With `--no-attach`, print action, machine, cwd, and exact session ID. Otherwise reuse the existing dedicated attachment path.
 
 ## Security and failure semantics
 
@@ -92,7 +96,8 @@ The command does not recursively scan home, execute project files, or require a 
 - Never disable SSH host-key checking.
 - Never interpolate unquoted machine/user/path/name/Pi arguments into the remote shell command.
 - Machine selectors may not start with `-`; pass `--` before the SSH destination where supported by the local OpenSSH CLI.
-- A nonzero SSH/target command exit is failure. Include bounded stdout/stderr in the error.
+- A nonzero SSH/target command exit is failure. Include bounded stdout/stderr plus SSH destination, phase, and duration in the error.
+- Session history paths never cross the SSH boundary. Exact IDs are re-resolved under the selected cwd and active IDs fail closed.
 - Malformed or missing JSON is failure.
 - Registration timeout does not claim the target Pi stopped; report its UUID, state that launch succeeded remotely, and direct the operator to the target bridge orchestrator URL/connectivity before attaching by session ID.
 
@@ -106,5 +111,7 @@ The command does not recursively scan home, execute project files, or require a 
 - Local launch bypasses SSH and uses target cwd.
 - Remote nonzero exit and malformed JSON surface bounded diagnostics.
 - Registration polling uses exact UUID and does not infer readiness from terminal output.
+- Target history helper checks Pi version/API, cwd/path containment, bounded output, exact-ID re-resolution, and active-ID refusal.
+- Action picker groups active/history/new, filters active histories, preserves names, and quotes resume commands.
 - `--no-attach` output and immediate-Zellij/terminal attachment reuse.
 - Existing non-live suite and installed-fzf tests remain green.

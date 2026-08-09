@@ -145,6 +145,23 @@ class LaunchCommandTests(unittest.TestCase):
         self.assertEqual(launch.ssh_destination(worker, "override"), "override@camel")
         self.assertEqual(launch.ssh_destination(self.remote_machine()), "camel")
 
+    def test_ssh_failure_reports_destination_phase_and_duration(self):
+        with (
+            patch.object(launch, "ssh_command", return_value=["ssh", "camel", "remote"]),
+            patch.object(
+                launch,
+                "_run_command",
+                side_effect=launch.RemoteCommandError("permission denied"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                launch.RemoteCommandError,
+                r"destination=camel phase=start duration=.*permission denied",
+            ):
+                launch._run_ssh_phase(
+                    "camel", "remote", phase="start", timeout=10
+                )
+
     def test_remote_directory_query_parses_home_and_dev_children(self):
         completed = subprocess.CompletedProcess(
             [], 0, b"/home/u\0/home/u/Dev/A\0/home/u/Dev/B C\0", b""
@@ -271,6 +288,86 @@ class LaunchCommandTests(unittest.TestCase):
                     pi_args=[],
                     timeout=30,
                 )
+
+    def test_target_history_remote_command_is_quoted_and_bounded(self):
+        completed = subprocess.CompletedProcess([], 0, json.dumps([{
+            "id": "history-1", "cwd": "/home/u/Repo",
+        }]).encode(), b"")
+        with (
+            patch.object(launch, "ssh_command", return_value=["ssh", "camel", "remote"]) as ssh,
+            patch.object(launch, "_run_command", return_value=completed),
+        ):
+            rows = launch.list_target_history(
+                self.remote_machine(),
+                destination="camel",
+                cwd="/home/u/Repo",
+                timeout=30,
+            )
+        self.assertEqual(rows[0]["id"], "history-1")
+        remote = ssh.call_args.args[1]
+        self.assertIn("pi history-list --cwd /home/u/Repo", shlex_split_once(remote)[2])
+
+    def test_target_resume_uses_exact_id_and_no_attach(self):
+        completed = subprocess.CompletedProcess([], 0, json.dumps({
+            "session_id": "history-1", "name": "Stored",
+        }).encode(), b"")
+        with (
+            patch.object(launch, "ssh_command", return_value=["ssh", "camel", "remote"]) as ssh,
+            patch.object(launch, "_run_command", return_value=completed),
+        ):
+            result = launch.run_target_resume(
+                self.remote_machine(),
+                destination="camel",
+                cwd="/home/u/Repo",
+                history={"id": "history-1"},
+                timeout=30,
+            )
+        self.assertEqual(result["session_id"], "history-1")
+        script = shlex_split_once(ssh.call_args.args[1])[2]
+        self.assertIn("pi resume history-1 --cwd /home/u/Repo --no-attach", script)
+
+    def test_active_sessions_match_exact_target_and_cwd(self):
+        machine = self.remote_machine()
+        rows = [
+            {"id": "yes", "session_type": "interactive", "state": "idle", "cwd": "/repo", "host": "KW"},
+            {"id": "wrong-cwd", "session_type": "interactive", "state": "idle", "cwd": "/other", "host": "KW"},
+            {"id": "wrong-host", "session_type": "interactive", "state": "idle", "cwd": "/repo", "host": "other"},
+            {"id": "stopped", "session_type": "interactive", "state": "stopped", "cwd": "/repo", "host": "KW"},
+        ]
+        self.assertEqual(
+            [row["id"] for row in launch._active_sessions_for_target(rows, machine, "/repo")],
+            ["yes"],
+        )
+
+    def test_action_picker_without_fzf_preserves_start_new_fallback(self):
+        with patch.object(launch.shutil, "which", return_value=None):
+            self.assertEqual(
+                launch.pick_launch_action(
+                    [{"id": "active"}], [{"id": "history"}]
+                ),
+                ("new", None),
+            )
+
+    def test_action_picker_groups_running_previous_and_new(self):
+        def choose_previous(command, **kwargs):
+            records = kwargs["input"].rstrip("\0").split("\0")
+            selected = next(record for record in records if record.startswith("resume:history-1\t"))
+            return subprocess.CompletedProcess(command, 0, selected + "\0", "")
+
+        with (
+            patch.object(launch.shutil, "which", return_value="/usr/bin/fzf"),
+            patch.object(launch.subprocess, "run", side_effect=choose_previous) as run,
+        ):
+            action, row = launch.pick_launch_action(
+                [{"id": "active-1", "name": "Live", "state": "working"}],
+                [{"id": "history-1", "name": "Stored", "modified_at": "2026-08-09T10:00:00Z"}],
+            )
+        self.assertEqual(action, "resume")
+        self.assertEqual(row["id"], "history-1")
+        records = run.call_args.kwargs["input"]
+        self.assertIn("Running sessions\n", records)
+        self.assertIn("Previous sessions\n", records)
+        self.assertIn("Start new\n", records)
 
     def test_defaults_name_to_directory_basename(self):
         self.assertEqual(launch.default_session_name("/home/u/Dev/DRRT"), "DRRT")

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -11,9 +13,10 @@ import shutil
 import stat
 import subprocess
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 from urllib.parse import quote
 
 MANAGED_TMUX_SESSION = "wh-pi"
@@ -54,6 +57,46 @@ def managed_tmux_socket_path() -> Path:
         return Path(configured).expanduser()
     runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/worker-harness-{os.getuid()}"
     return Path(runtime) / "worker-harness" / "pi-tmux.sock"
+
+
+def _prepare_managed_runtime(socket: Path) -> None:
+    if not os.environ.get("XDG_RUNTIME_DIR") and not os.environ.get("WH_PI_MANAGED_TMUX_SOCKET"):
+        fallback_root = socket.parent.parent
+        fallback_root.mkdir(parents=False, exist_ok=True, mode=0o700)
+        metadata = fallback_root.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise RuntimeError(f"unsafe managed Pi runtime directory: {fallback_root}")
+        fallback_root.chmod(0o700)
+    socket.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = socket.parent.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise RuntimeError(f"unsafe managed Pi socket directory: {socket.parent}")
+    socket.parent.chmod(0o700)
+
+
+@contextmanager
+def _resume_identity_lock(session_id: str) -> Iterator[None]:
+    socket = managed_tmux_socket_path()
+    _prepare_managed_runtime(socket)
+    lock_dir = socket.parent / "pi-resume-locks"
+    lock_dir.mkdir(mode=0o700, exist_ok=True)
+    metadata = lock_dir.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise RuntimeError(f"unsafe Pi resume lock directory: {lock_dir}")
+    lock_dir.chmod(0o700)
+    digest = hashlib.sha256(session_id.encode("utf8")).hexdigest()
+    flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(lock_dir / f"{digest}.lock", flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise RuntimeError("unsafe Pi resume identity lock")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def local_relay_websocket_url(session_id: str) -> str:
@@ -158,6 +201,27 @@ def _session_exists(socket: Path) -> bool:
     return _run_tmux(socket, "has-session", "-t", MANAGED_TMUX_SESSION, check=False).returncode == 0
 
 
+def _managed_session_id_is_live(socket: Path, session_id: str) -> bool:
+    if not _session_exists(socket):
+        return False
+    result = _run_tmux(
+        socket,
+        "list-panes",
+        "-s",
+        "-t",
+        MANAGED_TMUX_SESSION,
+        "-F",
+        "#{pane_dead}\t#{@wh_pi_session_id}",
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    return any(
+        line.split("\t", 1) == ["0", session_id]
+        for line in result.stdout.splitlines()
+    )
+
+
 def _configure_managed_server(socket: Path) -> None:
     for key in ("ZELLIJ", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID"):
         _run_tmux(socket, "set-environment", "-g", "-u", key, check=False)
@@ -207,6 +271,7 @@ def start_managed_pi(
     cols: int = 80,
     session_id: str | None = None,
     executable: str | None = None,
+    _resume_existing: bool = False,
 ) -> ManagedPiSession:
     """Create one detached Pi window in the dedicated hidden tmux server."""
 
@@ -220,32 +285,25 @@ def start_managed_pi(
         raise RuntimeError("Pi session name cannot be empty")
     pi_executable = executable or _real_pi_executable()
     socket = managed_tmux_socket_path()
-    if not os.environ.get("XDG_RUNTIME_DIR") and not os.environ.get("WH_PI_MANAGED_TMUX_SOCKET"):
-        fallback_root = socket.parent.parent
-        fallback_root.mkdir(parents=False, exist_ok=True, mode=0o700)
-        metadata = fallback_root.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
-            raise RuntimeError(f"unsafe managed Pi runtime directory: {fallback_root}")
-        fallback_root.chmod(0o700)
-    socket.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    metadata = socket.parent.lstat()
-    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
-        raise RuntimeError(f"unsafe managed Pi socket directory: {socket.parent}")
-    socket.parent.chmod(0o700)
+    _prepare_managed_runtime(socket)
+    if _resume_existing and _managed_session_id_is_live(socket, session_id):
+        raise RuntimeError(f"Pi session {session_id} is already active in the managed runtime")
 
     runtime = _host_runtime()
     runtime_assignments = (
         [f"PATH={os.pathsep.join(runtime.path)}"] if runtime is not None else []
+    )
+    identity_args = (
+        ["--session", session_id]
+        if _resume_existing
+        else ["--session-id", session_id, "--name", display_name]
     )
     command = shlex.join([
         "env",
         "WH_MANAGED_PI=1",
         *runtime_assignments,
         pi_executable,
-        "--session-id",
-        session_id,
-        "--name",
-        display_name,
+        *identity_args,
         *pi_args,
     ])
     dimensions = ["-x", str(max(1, cols)), "-y", str(max(1, rows))]
@@ -333,9 +391,49 @@ def start_managed_pi(
     pane_id = created.stdout.strip().splitlines()[-1] if created.stdout.strip() else ""
     if not _PANE_ID.fullmatch(pane_id):
         raise RuntimeError(f"tmux did not return a stable pane ID: {pane_id!r}")
+    _run_tmux(
+        socket,
+        "set-option",
+        "-p",
+        "-t",
+        pane_id,
+        "@wh_pi_session_id",
+        session_id,
+    )
     if socket.exists():
         socket.chmod(0o600)
     return ManagedPiSession(session_id, display_name, socket, pane_id)
+
+
+def resume_managed_pi(
+    *,
+    session_id: str,
+    name: str,
+    cwd: Path,
+    pi_args: Sequence[str] = (),
+    rows: int = 24,
+    cols: int = 80,
+    executable: str | None = None,
+) -> ManagedPiSession:
+    """Resume one already target-resolved exact Pi history ID."""
+
+    if (
+        not session_id
+        or session_id.startswith("-")
+        or any(character in session_id for character in "\0\r\n")
+    ):
+        raise RuntimeError("exact Pi session ID is invalid")
+    with _resume_identity_lock(session_id):
+        return start_managed_pi(
+            name=name,
+            pi_args=pi_args,
+            cwd=cwd,
+            rows=rows,
+            cols=cols,
+            session_id=session_id,
+            executable=executable,
+            _resume_existing=True,
+        )
 
 
 def managed_pane_is_live(session: ManagedPiSession) -> bool:

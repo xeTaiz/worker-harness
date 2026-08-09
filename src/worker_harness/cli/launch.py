@@ -319,6 +319,32 @@ def _run_command(
     return result
 
 
+def _run_ssh_phase(
+    destination: str,
+    remote_command: str,
+    *,
+    phase: str,
+    timeout: float,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one SSH phase with bounded destination/phase/duration diagnostics."""
+
+    started = time.monotonic()
+    try:
+        return _run_command(
+            ssh_command(
+                destination,
+                remote_command,
+                connect_timeout=min(10, max(1, int(timeout))),
+            ),
+            timeout=timeout,
+        )
+    except RemoteCommandError as exc:
+        raise RemoteCommandError(
+            f"SSH destination={destination} phase={phase} "
+            f"duration={time.monotonic() - started:.2f}s: {exc}"
+        ) from exc
+
+
 def list_working_directories(
     machine: LaunchMachine,
     *,
@@ -341,8 +367,10 @@ def list_working_directories(
     if destination is None:
         raise RuntimeError("remote machine requires an SSH destination")
     remote = "sh -lc " + shlex.quote(_DIRECTORY_SCRIPT)
-    result = _run_command(
-        ssh_command(destination, remote, connect_timeout=min(10, max(1, int(timeout)))),
+    result = _run_ssh_phase(
+        destination,
+        remote,
+        phase="list-directories",
         timeout=timeout,
     )
     paths = [
@@ -414,23 +442,10 @@ def default_session_name(cwd: str) -> str:
     return PurePosixPath(cwd.rstrip("/")).name or "Pi"
 
 
-def build_remote_launch_command(cwd: str, name: str, pi_args: Sequence[str]) -> str:
-    """Build the one strictly quoted target-side shell command."""
+def _build_remote_wh_command(cwd: str, argv: Sequence[str]) -> str:
+    """Build one strictly quoted target-side Worker Harness command."""
 
     cwd = validate_working_directory(cwd)
-    if not name.strip() or "\0" in name:
-        raise RuntimeError("Pi session name may not be empty")
-    argv = [
-        "--output",
-        "json",
-        "pi",
-        "start",
-        "--no-attach",
-        "--name",
-        name,
-    ]
-    if pi_args:
-        argv.extend(("--", *pi_args))
     script = "\n".join((
         "set -eu",
         "wh_bin=$(command -v wh 2>/dev/null || true)",
@@ -445,6 +460,25 @@ def build_remote_launch_command(cwd: str, name: str, pi_args: Sequence[str]) -> 
         f'exec "$wh_bin" {shlex.join(argv)}',
     ))
     return "sh -lc " + shlex.quote(script)
+
+
+def build_remote_launch_command(cwd: str, name: str, pi_args: Sequence[str]) -> str:
+    """Build the one strictly quoted target-side new-session command."""
+
+    if not name.strip() or "\0" in name:
+        raise RuntimeError("Pi session name may not be empty")
+    argv = [
+        "--output",
+        "json",
+        "pi",
+        "start",
+        "--no-attach",
+        "--name",
+        name,
+    ]
+    if pi_args:
+        argv.extend(("--", *pi_args))
+    return _build_remote_wh_command(cwd, argv)
 
 
 def _parse_launch_result(result: subprocess.CompletedProcess[bytes]) -> dict[str, Any]:
@@ -494,11 +528,95 @@ def run_target_launch(
         if destination is None:
             raise RuntimeError("remote machine requires an SSH destination")
         remote = build_remote_launch_command(cwd, name, pi_args)
-        result = _run_command(
-            ssh_command(destination, remote, connect_timeout=min(10, max(1, int(timeout)))),
+        result = _run_ssh_phase(
+            destination,
+            remote,
+            phase="start",
             timeout=timeout,
         )
     return _parse_launch_result(result)
+
+
+def list_target_history(
+    machine: LaunchMachine,
+    *,
+    destination: str | None,
+    cwd: str,
+    timeout: float,
+) -> list[dict[str, Any]]:
+    """List target-local, version-checked SessionManager history metadata."""
+
+    cwd = validate_working_directory(cwd)
+    if machine.local:
+        from worker_harness.pi_history import list_session_history
+
+        return list_session_history(cwd)
+    if destination is None:
+        raise RuntimeError("remote machine requires an SSH destination")
+    remote = _build_remote_wh_command(
+        cwd,
+        ["--output", "json", "pi", "history-list", "--cwd", cwd],
+    )
+    result = _run_ssh_phase(
+        destination,
+        remote,
+        phase="list-history",
+        timeout=timeout,
+    )
+    try:
+        rows = json.loads(result.stdout.decode("utf8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise RemoteCommandError("target returned malformed Pi history JSON") from exc
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise RemoteCommandError("target returned an invalid Pi history list")
+    return rows
+
+
+def run_target_resume(
+    machine: LaunchMachine,
+    *,
+    destination: str | None,
+    cwd: str,
+    history: dict[str, Any],
+    timeout: float,
+) -> dict[str, Any]:
+    """Re-resolve and resume one exact history ID on its owning target."""
+
+    cwd = validate_working_directory(cwd)
+    session_id = str(history.get("id") or "")
+    if not session_id or session_id.startswith("-") or any(c in session_id for c in "\0\r\n"):
+        raise RuntimeError("invalid exact Pi history ID")
+    argv = [
+        "--output",
+        "json",
+        "pi",
+        "resume",
+        session_id,
+        "--cwd",
+        cwd,
+        "--no-attach",
+        "--timeout",
+        str(timeout),
+    ]
+    if machine.local:
+        wh = shutil.which("wh")
+        if not wh:
+            raise RuntimeError("wh is not installed or not on PATH")
+        result = _run_command([wh, *argv], cwd=cwd, timeout=timeout + 5)
+    else:
+        if destination is None:
+            raise RuntimeError("remote machine requires an SSH destination")
+        remote = _build_remote_wh_command(cwd, argv)
+        result = _run_ssh_phase(
+            destination,
+            remote,
+            phase="resume",
+            timeout=timeout + 5,
+        )
+    payload = _parse_launch_result(result)
+    if str(payload.get("session_id") or "") != session_id:
+        raise RemoteCommandError("target resumed a different Pi session ID")
+    return payload
 
 
 async def wait_for_registered_session(
@@ -564,6 +682,133 @@ async def _load_worker_records() -> list[dict[str, Any]]:
     return workers if isinstance(workers, list) else []
 
 
+async def _load_registered_sessions() -> list[dict[str, Any]]:
+    from worker_harness.cli import pi
+
+    rows = await pi._request("GET", "/api/v1/pi/sessions")
+    return rows if isinstance(rows, list) else []
+
+
+def _active_sessions_for_target(
+    rows: Sequence[dict[str, Any]],
+    machine: LaunchMachine,
+    cwd: str,
+) -> list[dict[str, Any]]:
+    identifiers = {
+        machine.alias.casefold(),
+        machine.hostname.casefold(),
+        machine.dns_name.rstrip(".").casefold(),
+        *(address.casefold() for address in machine.addresses),
+    }
+    if machine.local:
+        import socket
+
+        identifiers.update((socket.gethostname().casefold(), "localhost", "127.0.0.1"))
+    result = []
+    for row in rows:
+        if (
+            str(row.get("session_type") or "") != "interactive"
+            or str(row.get("state") or "") not in _ACTIVE_STATES
+            or str(row.get("cwd") or "") != cwd
+        ):
+            continue
+        locations = {
+            str(row.get("host") or "").rstrip(".").casefold(),
+            str(row.get("terminal_host") or "").rstrip(".").casefold(),
+        }
+        if identifiers.intersection(locations):
+            result.append(dict(row))
+    return sorted(
+        result,
+        key=lambda row: (
+            0 if str(row.get("state")) == "working" else 1,
+            str(row.get("name") or "").casefold(),
+            str(row.get("id") or ""),
+        ),
+    )
+
+
+def _clean_picker_text(value: object) -> str:
+    return " ".join(str(value or "").replace("\0", " ").split())
+
+
+def pick_launch_action(
+    active: Sequence[dict[str, Any]],
+    history: Sequence[dict[str, Any]],
+) -> tuple[str, dict[str, Any] | None]:
+    """Choose Running, Previous, or Start new after machine/cwd selection."""
+
+    fzf = shutil.which("fzf")
+    if not fzf:
+        # Preserve the pre-history behavior on minimal hosts: lack of an
+        # optional picker must never prevent starting a new managed Pi.
+        return "new", None
+    records: dict[str, tuple[str, dict[str, Any] | None]] = {}
+    lines: list[str] = []
+    for index, row in enumerate(active):
+        key = f"attach:{row.get('id')}"
+        records[key] = ("attach", dict(row))
+        prefix = "Running sessions\n" if index == 0 else ""
+        branch = "└─" if index == len(active) - 1 else "├─"
+        lines.append(
+            f"{key}\t{prefix}  {branch} {_clean_picker_text(row.get('state')):7}  "
+            f"{_clean_picker_text(row.get('name') or row.get('task') or 'Pi')}"
+        )
+    for index, row in enumerate(history):
+        key = f"resume:{row.get('id')}"
+        records[key] = ("resume", dict(row))
+        prefix = "Previous sessions\n" if index == 0 else ""
+        branch = "└─" if index == len(history) - 1 else "├─"
+        label = row.get("name") or row.get("first_message") or "Pi"
+        lines.append(
+            f"{key}\t{prefix}  {branch} {_clean_picker_text(row.get('modified_at'))[:19]:19}  "
+            f"{_clean_picker_text(label)}"
+        )
+    records["new"] = ("new", None)
+    lines.append("new\tStart new\n  └─ ＋   New managed Pi session")
+    result = subprocess.run(
+        [
+            fzf,
+            "--height=100%",
+            "--layout=reverse",
+            "--border",
+            "--sync",
+            "--no-sort",
+            "--no-hscroll",
+            "--read0",
+            "--print0",
+            "--delimiter=\\t",
+            "--with-nth=2",
+            "--nth=1",
+            "--header=PI SESSION",
+            "--prompt=Action › ",
+        ],
+        input="\0".join(lines) + "\0",
+        text=True,
+        stdout=subprocess.PIPE,
+        check=False,
+    )
+    selected = result.stdout.rstrip("\0")
+    if result.returncode == 130 or not selected:
+        raise typer.Abort()
+    if result.returncode != 0:
+        raise RuntimeError(f"fzf launch action picker failed with exit code {result.returncode}")
+    key = selected.split("\t", 1)[0]
+    if key not in records:
+        raise RuntimeError("fzf returned an unknown launch action")
+    return records[key]
+
+
+async def _attach_selected_session(selected: dict[str, Any]) -> None:
+    from worker_harness.cli import pi
+    from worker_harness.pi_zellij import is_immediate_zellij
+
+    if is_immediate_zellij():
+        await pi._open_in_zellij(selected)
+    else:
+        await pi._run_attach_loop(selected)
+
+
 async def launch_managed_pi(
     *,
     machine_selector: str | None,
@@ -595,6 +840,77 @@ async def launch_managed_pi(
     else:
         cwd = validate_working_directory(cwd)
 
+    interactive_action = os.isatty(0) and name is None and not pi_args
+    action: str = "new"
+    chosen: dict[str, Any] | None = None
+    if interactive_action:
+        try:
+            registered = await _load_registered_sessions()
+        except RuntimeError as exc:
+            console.print(f"[yellow]Running Pi sessions unavailable:[/] {exc}")
+            registered = []
+        active = _active_sessions_for_target(registered, machine, cwd)
+        histories: list[dict[str, Any]] = []
+        try:
+            histories = await asyncio.to_thread(
+                list_target_history,
+                machine,
+                destination=destination,
+                cwd=cwd,
+                timeout=timeout,
+            )
+        except (RuntimeError, RemoteCommandError) as exc:
+            console.print(f"[yellow]Previous Pi sessions unavailable:[/] {exc}")
+        active_ids = {
+            str(row.get("id") or "")
+            for row in registered
+            if str(row.get("state") or "") in _ACTIVE_STATES
+        }
+        histories = [
+            row for row in histories
+            if str(row.get("id") or "") not in active_ids
+            and str(row.get("cwd") or "") == cwd
+        ]
+        action, chosen = pick_launch_action(active, histories)
+    if action == "attach":
+        assert chosen is not None
+        if attach_after_start:
+            await _attach_selected_session(chosen)
+        return {
+            "session_id": str(chosen.get("id") or ""),
+            "name": str(chosen.get("name") or chosen.get("task") or "Pi"),
+            "machine": machine.alias,
+            "machine_dns": machine.dns_name,
+            "cwd": cwd,
+            "action": "attach",
+        }
+    if action == "resume":
+        assert chosen is not None
+        resumed = await asyncio.to_thread(
+            run_target_resume,
+            machine,
+            destination=destination,
+            cwd=cwd,
+            history=chosen,
+            timeout=timeout,
+        )
+        session_id = str(resumed["session_id"])
+        selected = await wait_for_registered_session(
+            session_id,
+            timeout=timeout,
+            require_attachable=attach_after_start,
+        )
+        result = {
+            **resumed,
+            "machine": machine.alias,
+            "machine_dns": machine.dns_name,
+            "cwd": cwd,
+            "action": "resume",
+        }
+        if attach_after_start:
+            await _attach_selected_session(selected)
+        return result
+
     default_name = default_session_name(cwd)
     if name is None:
         name = typer.prompt("Pi name", default=default_name) if os.isatty(0) else default_name
@@ -622,15 +938,10 @@ async def launch_managed_pi(
         "machine": machine.alias,
         "machine_dns": machine.dns_name,
         "cwd": cwd,
+        "action": "new",
     }
     if attach_after_start:
-        from worker_harness.cli import pi
-        from worker_harness.pi_zellij import is_immediate_zellij
-
-        if is_immediate_zellij():
-            await pi._open_in_zellij(selected)
-        else:
-            await pi._run_attach_loop(selected)
+        await _attach_selected_session(selected)
     return result
 
 
@@ -679,8 +990,10 @@ def launch(
             if _output_mode() == "json":
                 console.print(json.dumps(result, indent=2))
             else:
+                action = str(result.get("action") or "new")
+                verb = {"attach": "Selected", "resume": "Resumed"}.get(action, "Started")
                 console.print(
-                    f"[green]Started Pi[/] {result.get('name') or name} on "
+                    f"[green]{verb} Pi[/] {result.get('name') or name} on "
                     f"@{result['machine']}:{result['cwd']} "
                     f"([dim]{result['session_id']}[/])"
                 )

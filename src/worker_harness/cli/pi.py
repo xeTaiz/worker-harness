@@ -6,6 +6,7 @@ import asyncio
 import functools
 import hashlib
 import json
+import logging
 import os
 import shutil
 import signal
@@ -23,6 +24,7 @@ from rich.table import Table
 
 app = typer.Typer(help="Inspect and message registered Pi sessions")
 console = Console()
+logger = logging.getLogger(__name__)
 
 _ACTIVE_STATES = {"working", "idle"}
 _PICKER_CONTEXT_WIDTH = 28
@@ -553,10 +555,16 @@ async def _run_attach_loop(
     *,
     initial_websocket_url: str | None = None,
     zellij_tab: bool = False,
+    tmux_window: bool = False,
 ) -> None:
     """Run the native attachment/cycling loop for one selected session."""
 
-    from worker_harness.pi_terminal import attach_terminal, focus_local_zellij_session
+    from worker_harness.pi_terminal import (
+        TerminalRelayUnavailable,
+        attach_terminal,
+        focus_local_zellij_session,
+    )
+    from worker_harness.pi_tmux import current_attachment_window, update_attachment_window
     from worker_harness.pi_zellij import current_tab_context, rename_tab
     from worker_harness.pi_zellij_state import watch_session_state
 
@@ -570,6 +578,7 @@ async def _run_attach_loop(
         except (NotImplementedError, RuntimeError):
             pass
 
+    reconnect_attempts = 0
     try:
         while True:
             session_id = str(selected.get("id") or "")
@@ -581,20 +590,39 @@ async def _run_attach_loop(
             if await focus_local_zellij_session(session_id):
                 return
             state_watcher: asyncio.Task[None] | None = None
+            update_state = None
             if zellij_tab and (tab_context := current_tab_context()) is not None:
                 tab_id, _pane_id = tab_context
 
                 async def update_tab(state: str, *, target_tab: int = tab_id, label: str = name) -> None:
                     await asyncio.to_thread(rename_tab, target_tab, label, state)
 
+                update_state = update_tab
+            elif tmux_window and (window_id := current_attachment_window()) is not None:
+
+                async def update_window(
+                    state: str,
+                    *,
+                    target_window: str = window_id,
+                    label: str = name,
+                ) -> None:
+                    await asyncio.to_thread(
+                        update_attachment_window,
+                        label,
+                        state,
+                        target_window,
+                    )
+
+                update_state = update_window
+            if update_state is not None:
                 state_watcher = asyncio.create_task(
                     watch_session_state(
                         _base_url(),
                         session_id,
                         str(selected.get("state") or "disconnected"),
-                        update_tab,
+                        update_state,
                     ),
-                    name=f"pi-tab-state-{session_id[:12]}",
+                    name=f"pi-window-state-{session_id[:12]}",
                 )
             try:
                 if initial_websocket_url is not None:
@@ -615,15 +643,31 @@ async def _run_attach_loop(
                         info.get("direct_websocket_url") or info.get("websocket_url") or ""
                     )
                     gateway_websocket_url = str(info.get("gateway_websocket_url") or "") or None
-                direction = await attach_terminal(
-                    websocket_url,
-                    fallback_websocket_url=gateway_websocket_url,
-                    cycle_requests=cycle_requests,
-                )
+                try:
+                    direction = await attach_terminal(
+                        websocket_url,
+                        fallback_websocket_url=gateway_websocket_url,
+                        cycle_requests=cycle_requests,
+                    )
+                except TerminalRelayUnavailable as exc:
+                    if update_state is None or reconnect_attempts >= 4:
+                        raise
+                    reconnect_attempts += 1
+                    logger.warning(
+                        "Pi attachment %s reconnect %d/4 after %s",
+                        session_id,
+                        reconnect_attempts,
+                        exc,
+                    )
+                    if update_state is not None:
+                        await update_state("disconnected")
+                    await asyncio.sleep(min(0.5 * (2 ** (reconnect_attempts - 1)), 4.0))
+                    continue
             finally:
                 if state_watcher is not None:
                     state_watcher.cancel()
                     await asyncio.gather(state_watcher, return_exceptions=True)
+            reconnect_attempts = 0
             if direction is None:
                 return
             if direction == "select":
@@ -724,6 +768,111 @@ def start(
         raise typer.Exit(1) from exc
 
 
+@app.command("history-list", hidden=True)
+def history_list(
+    cwd: str = typer.Option(..., "--cwd", help="Absolute target working directory"),
+):
+    """Return bounded target-local Pi SessionManager history metadata."""
+
+    try:
+        from worker_harness.pi_history import list_session_history
+
+        sys.stdout.write(json.dumps(list_session_history(cwd), separators=(",", ":")) + "\n")
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+
+
+@app.command(
+    "resume",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def resume(
+    ctx: typer.Context,
+    session_id: str = typer.Argument(..., help="Exact target-local Pi session ID"),
+    cwd: str = typer.Option(..., "--cwd", help="Absolute working directory containing the history"),
+    name: str | None = typer.Option(None, "--name", "-n", help="Window name override"),
+    attach_after_start: bool = typer.Option(
+        True,
+        "--attach/--no-attach",
+        help="Attach after the resumed route is ready",
+    ),
+    timeout: float = typer.Option(
+        10.0,
+        "--timeout",
+        min=0.1,
+        help="Seconds to wait for the local Pi terminal route",
+    ),
+):
+    """Resume one inactive, exact target-local Pi history safely."""
+
+    async def run() -> dict:
+        from worker_harness.pi_history import resolve_session_history
+        from worker_harness.pi_runtime import resume_managed_pi, wait_for_managed_route
+
+        rows = await _request("GET", "/api/v1/pi/sessions")
+        if any(
+            str(row.get("id") or "") == session_id
+            and str(row.get("state") or "") in _ACTIVE_STATES
+            for row in rows
+        ):
+            raise RuntimeError(f"Pi session {session_id} is already active")
+        history = await asyncio.to_thread(resolve_session_history, cwd, session_id)
+        history_name = str(history.get("name") or "").strip()
+        display_name = (name or history_name or Path(cwd).name or "Pi").strip()
+        terminal_size = shutil.get_terminal_size(fallback=(80, 24))
+        managed = await asyncio.to_thread(
+            resume_managed_pi,
+            session_id=session_id,
+            name=display_name,
+            cwd=Path(cwd),
+            pi_args=list(ctx.args),
+            rows=terminal_size.lines,
+            cols=terminal_size.columns,
+        )
+        await wait_for_managed_route(managed, timeout=timeout)
+        result = {
+            "session_id": managed.session_id,
+            "name": managed.name,
+            "tmux_socket": str(managed.tmux_socket),
+            "tmux_pane_id": managed.tmux_pane_id,
+            "resumed": True,
+        }
+        if attach_after_start:
+            selected = {
+                "id": managed.session_id,
+                "name": managed.name,
+                "state": "idle",
+            }
+            from worker_harness.pi_runtime import local_relay_websocket_url
+            from worker_harness.pi_zellij import is_immediate_zellij
+
+            if is_immediate_zellij():
+                await _open_in_zellij(selected, loopback=True)
+            else:
+                await _run_attach_loop(
+                    selected,
+                    initial_websocket_url=local_relay_websocket_url(managed.session_id),
+                )
+        return result
+
+    try:
+        result = asyncio.run(run())
+        if not attach_after_start:
+            if _output_mode() == "json":
+                console.print(json.dumps(result, indent=2))
+            else:
+                console.print(
+                    f"[green]Resumed Pi[/] {result['name']} "
+                    f"([dim]{result['session_id']}[/])"
+                )
+    except typer.Abort:
+        raise
+    except (RuntimeError, KeyboardInterrupt) as exc:
+        console.print(f"[red]{exc or 'Pi resume interrupted'}[/]")
+        raise typer.Exit(1) from exc
+
+
 @app.command("attach")
 def attach(
     target: str | None = typer.Argument(None, help="Session ID, unique ID prefix, or exact session name"),
@@ -742,6 +891,14 @@ def attach(
     loopback: bool = typer.Option(False, "--loopback", hidden=True),
     session_name: str | None = typer.Option(None, "--session-name", hidden=True),
     session_state: str | None = typer.Option(None, "--session-state", hidden=True),
+    tmux_picker: bool = typer.Option(False, "--tmux-picker", hidden=True),
+    tmux_child: bool = typer.Option(False, "--tmux-child", hidden=True),
+    tmux_target_session: str | None = typer.Option(
+        None, "--tmux-target-session", hidden=True
+    ),
+    tmux_target_client: str | None = typer.Option(
+        None, "--tmux-target-client", hidden=True
+    ),
 ):
     """Attach this terminal to a discovered Pi session; press Ctrl-] to detach."""
 
@@ -749,7 +906,39 @@ def attach(
         from worker_harness.pi_zellij import is_immediate_zellij
 
         _ = stream  # retained for compatibility with existing shortcuts/scripts
-        if relative:
+        if tmux_picker:
+            if tmux_child or relative or here or loopback:
+                raise RuntimeError("--tmux-picker cannot be combined with attachment child modes")
+            if tmux_target_session is None or tmux_target_client is None:
+                raise RuntimeError("--tmux-picker requires its invoking tmux session and client")
+            candidates = await _candidate_inventory()
+            selected = (
+                _resolve_session(candidates, target)
+                if target
+                else _pick_session(await _attachable_candidates(candidates))
+            )
+            from worker_harness.pi_tmux import open_or_focus_attachment_window
+
+            await asyncio.to_thread(
+                open_or_focus_attachment_window,
+                selected,
+                tmux_target_session,
+                tmux_target_client,
+            )
+            return
+        if tmux_child:
+            if relative or here or loopback or not target or session_name is None:
+                raise RuntimeError("--tmux-child requires one exact session and its name")
+            from worker_harness.pi_tmux import current_attachment_window
+
+            if current_attachment_window() is None:
+                raise RuntimeError("--tmux-child requires a Worker Harness-owned tmux window")
+            selected = {
+                "id": target,
+                "name": session_name,
+                "state": session_state or "disconnected",
+            }
+        elif relative:
             if relative not in {"next", "previous"} or not target:
                 raise RuntimeError("--relative requires TARGET and either next or previous")
             selected = await _cycle_session(target, relative)
@@ -777,11 +966,13 @@ def attach(
             session_id = str(selected.get("id") or "")
             await _relay_request({"action": "describe", "session_id": session_id})
             initial_url = local_relay_websocket_url(session_id)
-        await _run_attach_loop(
-            selected,
-            initial_websocket_url=initial_url,
-            zellij_tab=here and is_immediate_zellij(),
-        )
+        attach_options = {
+            "initial_websocket_url": initial_url,
+            "zellij_tab": here and is_immediate_zellij(),
+        }
+        if tmux_child:
+            attach_options["tmux_window"] = True
+        await _run_attach_loop(selected, **attach_options)
 
     try:
         asyncio.run(run())

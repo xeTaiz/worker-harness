@@ -61,7 +61,7 @@ class PiRuntimeTests(unittest.TestCase):
                 )
         self.assertEqual(managed.tmux_pane_id, "%42")
         configure.assert_called_once_with(socket)
-        command_args = run.call_args.args
+        command_args = run.call_args_list[0].args
         self.assertEqual(command_args[:2], (socket, "new-window"))
         launched = shlex.split(command_args[-1])
         self.assertEqual(launched, [
@@ -77,6 +77,13 @@ class PiRuntimeTests(unittest.TestCase):
             "hello world",
             "$(still-nope)",
         ])
+        self.assertEqual(
+            run.call_args_list[-1].args[1:],
+            (
+                "set-option", "-p", "-t", "%42", "@wh_pi_session_id",
+                "00000000-0000-4000-8000-000000000001",
+            ),
+        )
 
     def test_first_window_creates_owner_session_with_initial_dimensions(self):
         completed = subprocess.CompletedProcess([], 0, "%7\n", "")
@@ -98,7 +105,9 @@ class PiRuntimeTests(unittest.TestCase):
                     executable="/usr/bin/pi",
                 )
         self.assertEqual(managed.name, f"{Path(directory).name}-abcdef12")
-        args = run.call_args.args
+        args = next(
+            call.args for call in run.call_args_list if "new-session" in call.args
+        )
         self.assertIn("new-session", args)
         self.assertIn("-x", args)
         self.assertIn("177", args)
@@ -120,7 +129,7 @@ class PiRuntimeTests(unittest.TestCase):
                 patch.object(pi_runtime, "managed_tmux_socket_path", return_value=socket),
                 patch.object(pi_runtime, "_session_exists", side_effect=[False, True]),
                 patch.object(pi_runtime, "_configure_managed_server") as configure,
-                patch.object(pi_runtime, "_run_tmux", side_effect=[failed, created]) as run,
+                patch.object(pi_runtime, "_run_tmux", side_effect=[failed, created, created]) as run,
             ):
                 managed = pi_runtime.start_managed_pi(
                     name="concurrent",
@@ -134,6 +143,54 @@ class PiRuntimeTests(unittest.TestCase):
         self.assertIn("new-session", run.call_args_list[0].args)
         self.assertEqual(run.call_args_list[1].args[1], "new-window")
         configure.assert_called_once_with(socket)
+
+    def test_resume_uses_exact_session_without_reassigning_identity_or_name(self):
+        created = subprocess.CompletedProcess([], 0, "%21\n", "")
+        marked = subprocess.CompletedProcess([], 0, "", "")
+        with tempfile.TemporaryDirectory() as directory:
+            socket = Path(directory) / "pi-tmux.sock"
+            cwd = Path(directory) / "repo"
+            cwd.mkdir()
+            with (
+                patch.object(pi_runtime, "managed_tmux_socket_path", return_value=socket),
+                patch.object(pi_runtime, "_managed_session_id_is_live", return_value=False),
+                patch.object(pi_runtime, "_session_exists", return_value=True),
+                patch.object(pi_runtime, "_configure_managed_server"),
+                patch.object(pi_runtime, "_run_tmux", side_effect=[created, marked]) as run,
+            ):
+                managed = pi_runtime.resume_managed_pi(
+                    session_id="exact-history-id",
+                    name="Stored name",
+                    cwd=cwd,
+                    executable="/usr/bin/pi",
+                )
+        launched = shlex.split(run.call_args_list[0].args[-1])
+        self.assertEqual(launched, [
+            "env", "WH_MANAGED_PI=1", "/usr/bin/pi", "--session", "exact-history-id",
+        ])
+        self.assertNotIn("--session-id", launched)
+        self.assertNotIn("--name", launched)
+        self.assertEqual(
+            run.call_args_list[1].args[1:],
+            ("set-option", "-p", "-t", "%21", "@wh_pi_session_id", "exact-history-id"),
+        )
+        self.assertEqual(managed.session_id, "exact-history-id")
+        self.assertEqual(managed.name, "Stored name")
+
+    def test_resume_refuses_id_already_live_in_managed_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            socket = Path(directory) / "pi-tmux.sock"
+            with (
+                patch.object(pi_runtime, "managed_tmux_socket_path", return_value=socket),
+                patch.object(pi_runtime, "_managed_session_id_is_live", return_value=True),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "already active"):
+                    pi_runtime.resume_managed_pi(
+                        session_id="exact-history-id",
+                        name="Stored",
+                        cwd=Path(directory),
+                        executable="/usr/bin/pi",
+                    )
 
     def test_managed_server_configures_global_and_owner_options(self):
         completed = subprocess.CompletedProcess([], 0, "", "")
@@ -207,7 +264,7 @@ class PiRuntimeTests(unittest.TestCase):
                     cwd=cwd,
                     session_id="00000000-0000-4000-8000-000000000001",
                 )
-        launched = shlex.split(run.call_args.args[-1])
+        launched = shlex.split(run.call_args_list[0].args[-1])
         self.assertIn("PATH=/opt/pi/bin:/opt/node/bin:/usr/bin", launched)
         self.assertIn("/opt/pi/bin/pi", launched)
         with patch.object(pi_runtime, "_host_runtime", return_value=runtime):

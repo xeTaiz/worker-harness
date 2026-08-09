@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import termios
+import time
 import tty
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,6 +23,10 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 DETACH_BYTE = b"\x1d"  # Ctrl-]
 NEXT_BYTE = b"\x1e"  # Ctrl-^, consumed locally by Zellij/native attachments
 PREVIOUS_BYTE = b"\x1f"  # Ctrl-_, consumed locally by Zellij/native attachments
+
+
+class TerminalRelayUnavailable(RuntimeError):
+    """A transport-level attachment failure that a dedicated window may retry."""
 
 
 def _relay_socket_path() -> Path:
@@ -247,7 +252,10 @@ async def attach_terminal(
 
     try:
         last_error: BaseException | None = None
+        started = time.monotonic()
         for index, candidate_url in enumerate(websocket_urls):
+            transport = "direct" if index == 0 else "gateway"
+            connected_at = time.monotonic()
             try:
                 async with connect(
                     candidate_url,
@@ -277,23 +285,50 @@ async def attach_terminal(
                         await asyncio.gather(*pending, return_exceptions=True)
                         if cycle_task in done:
                             direction = cycle_task.result()
+                        elif input_task in done:
+                            # Ctrl-] or stdin EOF is authoritative even if the
+                            # relay closes in the same event-loop turn.
+                            direction = input_task.result()
                         elif output_task in done:
                             direction = output_task.result()
-                        elif input_task in done:
-                            direction = input_task.result()
+                            if direction is None:
+                                code = getattr(websocket, "close_code", None)
+                                if code == 1000:
+                                    return None
+                                reason = getattr(websocket, "close_reason", None) or "stream ended"
+                                raise TerminalRelayUnavailable(
+                                    "terminal relay disconnected: "
+                                    f"transport={transport} duration={time.monotonic() - connected_at:.2f}s "
+                                    f"fallback_used={'yes' if index else 'no'} "
+                                    f"close_code={code if code is not None else 'unknown'} "
+                                    f"close_reason={reason}"
+                                )
                         else:
                             direction = None
                         for task in done:
                             if task not in {cycle_task, output_task, input_task}:
                                 task.result()
                         return direction
+            except TerminalRelayUnavailable as exc:
+                last_error = exc
+                if index + 1 < len(websocket_urls):
+                    continue
+                raise
             except (OSError, WebSocketException, asyncio.TimeoutError) as exc:
                 last_error = exc
                 if index + 1 < len(websocket_urls):
                     continue
-                raise RuntimeError(f"terminal relay unavailable: {exc}") from exc
+                code = getattr(getattr(exc, "rcvd", None), "code", None)
+                reason = getattr(getattr(exc, "rcvd", None), "reason", None)
+                raise TerminalRelayUnavailable(
+                    "terminal relay unavailable: "
+                    f"transport={transport} duration={time.monotonic() - started:.2f}s "
+                    f"fallback_used={'yes' if index else 'no'} "
+                    f"close_code={code if code is not None else 'unknown'} "
+                    f"close_reason={reason or str(exc) or 'unknown'}"
+                ) from exc
         if last_error is not None:
-            raise RuntimeError(f"terminal relay unavailable: {last_error}") from last_error
+            raise TerminalRelayUnavailable(f"terminal relay unavailable: {last_error}") from last_error
         return None
     finally:
         if signal_installed:
