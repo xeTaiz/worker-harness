@@ -203,6 +203,7 @@ class PiCliTests(unittest.TestCase):
         self.assertIn("--with-nth=2", command)
         self.assertIn("--nth=1", command)
         self.assertIn("--no-hscroll", command)
+        self.assertNotIn("--no-sort", command)
         self.assertIn("--read0", command)
         self.assertIn("--print0", command)
         record = run.call_args.kwargs["input"].split("\0", 1)[0]
@@ -280,6 +281,36 @@ class PiCliTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0)
                 self.assertTrue(result.stdout.startswith("drrt\t"))
+
+    @unittest.skipUnless(pi.shutil.which("fzf"), "fzf is not installed")
+    def test_installed_fzf_ranks_exact_match_above_earlier_weak_match(self):
+        rows = pi._attach_candidates([
+            {**self._session(), "id": "archive", "name": "A DRRT archive"},
+            {**self._session(), "id": "exact", "name": "DRRT"},
+        ], local_host="local")
+        captured: dict[str, object] = {}
+
+        def capture(command, **kwargs):
+            captured["command"] = command
+            captured["input"] = kwargs["input"]
+            return subprocess.CompletedProcess(command, 130, "", "")
+
+        with (
+            patch.object(pi.shutil, "which", return_value=pi.shutil.which("fzf")),
+            patch.object(pi.subprocess, "run", side_effect=capture),
+        ):
+            with self.assertRaises(typer.Abort):
+                pi._pick_session(rows)
+
+        result = subprocess.run(
+            [*captured["command"], "--filter=DRRT"],
+            input=captured["input"],
+            text=True,
+            stdout=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(result.stdout.startswith("exact\t"))
 
     def test_picker_abbreviates_global_and_delegated_types(self):
         rows = pi._attach_candidates([

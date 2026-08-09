@@ -65,7 +65,7 @@ Options:
 
 ## Machine picker
 
-Use NUL-delimited multiline fzf records so section headings are attached to their first selectable machine, never independently selectable. Show online/offline state, type (`I` standard, `W` worker), hostname, short MagicDNS label, OS, and IP. Search covers every visible field.
+Use NUL-delimited multiline fzf records so section headings are attached to their first selectable machine, never independently selectable. Show online/offline state, type (`I` standard, `W` worker), hostname, short MagicDNS label, OS, and IP. Search covers every visible field. Keep fzf ranking enabled so nonempty queries select the highest-scoring machine, directory, or Running/Previous/New action; empty queries preserve the designed section order and initial cursor.
 
 Offline machines remain visible for inventory completeness; selecting one is allowed and fails through the normal SSH path.
 

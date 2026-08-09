@@ -119,7 +119,7 @@ class SessionStateTracker:
     rendered state changed.
     """
 
-    __slots__ = ("_state", "_error_in_turn", "_sticky_error", "_last_event_type")
+    __slots__ = ("_state", "_sticky_error", "_last_event_type")
 
     def __init__(self, initial_state: str | None) -> None:
         if initial_state == WORKING:
@@ -128,9 +128,6 @@ class SessionStateTracker:
             self._state = IDLE
         else:
             self._state = DISCONNECTED
-        # Tracks whether the current agent turn has recorded any error event.
-        # ``agent-settled`` flips to ``idle`` only when this is False.
-        self._error_in_turn = False
         # Sticky error survives ``agent-settled`` and is cleared only by the
         # next ``agent-start``.
         self._sticky_error = False
@@ -143,10 +140,6 @@ class SessionStateTracker:
     @property
     def sticky_error(self) -> bool:
         return self._sticky_error
-
-    @property
-    def error_in_turn(self) -> bool:
-        return self._error_in_turn
 
     @property
     def last_event_type(self) -> str | None:
@@ -163,18 +156,16 @@ class SessionStateTracker:
 
         if event_type == "agent-start":
             self._sticky_error = False
-            self._error_in_turn = False
             return self._set_state(WORKING)
 
         if event_type == "agent-settled":
             new_state = ERROR if self._sticky_error else IDLE
             return self._set_state(new_state)
 
+        # A failed tool call is recoverable work inside an agent turn. Pi often
+        # continues immediately, so projecting it as a session-level sticky
+        # error would show ``!`` while the agent is still productively working.
         if event_type == "tool-end":
-            if _payload_truthy(payload, "is_error", "isError"):
-                self._sticky_error = True
-                self._error_in_turn = True
-                return self._set_state(ERROR)
             return False
 
         if event_type == "message-end":
@@ -182,13 +173,11 @@ class SessionStateTracker:
                 payload, "is_error", "isError", "errorMessage", "error_message"
             ):
                 self._sticky_error = True
-                self._error_in_turn = True
                 return self._set_state(ERROR)
             return False
 
         if event_type == "control-error":
             self._sticky_error = True
-            self._error_in_turn = True
             return self._set_state(ERROR)
 
         return False

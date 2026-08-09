@@ -115,6 +115,7 @@ class LaunchInventoryTests(unittest.TestCase):
         self.assertIn("--read0", command)
         self.assertIn("--print0", command)
         self.assertIn("--bind=load:pos(1)", command)
+        self.assertNotIn("--no-sort", command)
         records = run.call_args.kwargs["input"].rstrip("\0").split("\0")
         self.assertIn("Standard machines\n  ├─", records[0])
         self.assertNotIn("Standard machines\n", records[1])
@@ -193,11 +194,12 @@ class LaunchCommandTests(unittest.TestCase):
 
         with (
             patch.object(launch.shutil, "which", return_value="/usr/bin/fzf"),
-            patch.object(launch.subprocess, "run", side_effect=choose_manual),
+            patch.object(launch.subprocess, "run", side_effect=choose_manual) as run,
             patch.object(launch.typer, "prompt", return_value="/home/u/Dev/manual") as prompt,
         ):
             selected = launch.pick_working_directory(["/home/u", "/home/u/Dev/A"])
         self.assertEqual(selected, "/home/u/Dev/manual")
+        self.assertNotIn("--no-sort", run.call_args.args[0])
         prompt.assert_called_once_with("Working directory", default="/home/u")
 
     def test_remote_launch_command_quotes_every_operator_value(self):
@@ -365,6 +367,7 @@ class LaunchCommandTests(unittest.TestCase):
         self.assertEqual(action, "resume")
         self.assertEqual(row["id"], "history-1")
         records = run.call_args.kwargs["input"]
+        self.assertNotIn("--no-sort", run.call_args.args[0])
         self.assertIn("Running sessions\n", records)
         self.assertIn("Previous sessions\n", records)
         self.assertIn("Start new\n", records)

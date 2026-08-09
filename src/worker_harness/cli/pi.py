@@ -513,7 +513,6 @@ def _pick_session(rows: list[dict]) -> dict:
         "--layout=reverse",
         "--border",
         "--sync",
-        "--no-sort",
         "--no-hscroll",
         "--ansi",
         "--read0",

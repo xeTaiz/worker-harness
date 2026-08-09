@@ -28,7 +28,7 @@ class ZellijStateTests(unittest.TestCase):
         self.assertTrue(tracker.feed({"event_type": "agent-start", "payload": {}}))
         self.assertEqual(tracker.state, state.WORKING)
         self.assertTrue(tracker.feed({
-            "event_type": "tool-end", "payload": {"is_error": True},
+            "event_type": "message-end", "payload": {"errorMessage": "bad"},
         }))
         self.assertEqual(tracker.state, state.ERROR)
         self.assertFalse(tracker.feed({"event_type": "agent-settled", "payload": {}}))
@@ -38,9 +38,18 @@ class ZellijStateTests(unittest.TestCase):
         self.assertTrue(tracker.feed({"event_type": "agent-settled", "payload": {}}))
         self.assertEqual(tracker.state, state.IDLE)
 
-    def test_all_error_shapes(self):
+    def test_failed_tool_call_does_not_turn_productive_work_into_sticky_error(self):
+        tracker = state.SessionStateTracker(state.WORKING)
+        self.assertFalse(tracker.feed({
+            "event_type": "tool-end", "payload": {"is_error": True},
+        }))
+        self.assertEqual(tracker.state, state.WORKING)
+        self.assertFalse(tracker.sticky_error)
+        self.assertTrue(tracker.feed({"event_type": "agent-settled", "payload": {}}))
+        self.assertEqual(tracker.state, state.IDLE)
+
+    def test_all_session_error_shapes(self):
         events = [
-            {"event_type": "tool-end", "payload": {"isError": True}},
             {"event_type": "message-end", "payload": {"errorMessage": "bad"}},
             {"event_type": "message-end", "payload": {"message": {"is_error": True}}},
             {"event_type": "control-error", "payload": {}},
@@ -49,6 +58,11 @@ class ZellijStateTests(unittest.TestCase):
             with self.subTest(event=event):
                 tracker = state.SessionStateTracker(state.WORKING)
                 self.assertTrue(tracker.feed(event))
+                self.assertEqual(tracker.state, state.ERROR)
+                self.assertTrue(tracker.sticky_error)
+                self.assertFalse(tracker.feed({
+                    "event_type": "agent-settled", "payload": {},
+                }))
                 self.assertEqual(tracker.state, state.ERROR)
 
     def test_sse_parser_handles_fragmentation_crlf_comments_and_cursor(self):

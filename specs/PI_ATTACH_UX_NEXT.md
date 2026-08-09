@@ -246,7 +246,7 @@ KW60898  @camel
 - Type is one unambiguous letter: `I` interactive, `D` delegated, `G` global router.
 - The visible name is capped at 16 cells and the full path remains on the right.
 - Repeat a fixed-width, dimmed `machine @tailnet` context column on every child, before the name, so the full path remains the rightmost column. If filtering removes the first child/heading, the surviving result still identifies its machine and Tailnet identity; searching either machine or Tailnet label matches every child in the group.
-- Use `--ansi --read0 --print0 --with-nth=2 --nth=1`: fzf strips the dimming escape codes for matching and applies `--nth` after the `--with-nth` transformation, so referring to original hidden field indexes would make every query return zero matches.
+- Use `--ansi --read0 --print0 --with-nth=2 --nth=1`: fzf strips the dimming escape codes for matching and applies `--nth` after the `--with-nth` transformation, so referring to original hidden field indexes would make every query return zero matches. Leave fuzzy ranking enabled (do not use `--no-sort`) so a typed query selects the highest-scoring match; an empty query retains inventory order and the Local initial cursor.
 - Preserve full session ID as the hidden selection key and disable horizontal scroll so the aligned leading columns remain stable.
 
 Search covers the complete visible multiline record, including heading/context, displayed name, full path, and Tailnet label. Do not add selectable separator/header rows.
@@ -283,8 +283,9 @@ Honor event sequence/`Last-Event-ID`, reconnect with bounded exponential backoff
 Event mapping:
 
 - `agent-start` → working and clear prior error;
-- `agent-settled` → idle unless the current turn has recorded an error;
-- `tool-end` with `payload.is_error`, `message-end` carrying `isError`/`errorMessage`, or `control-error` → error;
+- `agent-settled` → idle unless the current turn has recorded a session-level error;
+- failed `tool-end` events remain working because tool failures are recoverable within an active agent turn;
+- `message-end` carrying `isError`/`errorMessage` or `control-error` → sticky error;
 - next `agent-start` clears sticky error;
 - stopped source closes the child/tab through normal terminal teardown rather than rendering a permanent stopped tab.
 
@@ -307,7 +308,7 @@ When an in-tab attachment cycles to another Pi:
 
 - Event parser handles replay, comments/keep-alive, fragmented lines, and reconnect cursor.
 - Working → idle title transition.
-- Tool/message/control error becomes sticky error through settle.
+- Failed tool calls remain working; message/control errors become sticky through settle.
 - Next agent-start clears error.
 - Debounce avoids repeated rename calls.
 - Watcher loss does not interrupt terminal bytes.
