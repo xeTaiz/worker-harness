@@ -48,6 +48,7 @@ class PiRuntimeTests(unittest.TestCase):
             cwd.mkdir()
             with (
                 patch.object(pi_runtime, "managed_tmux_socket_path", return_value=socket),
+                patch.object(pi_runtime, "_host_runtime", return_value=None),
                 patch.object(pi_runtime, "_session_exists", return_value=True),
                 patch.object(pi_runtime, "_configure_managed_server") as configure,
                 patch.object(pi_runtime, "_run_tmux", return_value=completed) as run,
@@ -153,6 +154,7 @@ class PiRuntimeTests(unittest.TestCase):
             cwd.mkdir()
             with (
                 patch.object(pi_runtime, "managed_tmux_socket_path", return_value=socket),
+                patch.object(pi_runtime, "_host_runtime", return_value=None),
                 patch.object(pi_runtime, "_managed_session_id_is_live", return_value=False),
                 patch.object(pi_runtime, "_session_exists", return_value=True),
                 patch.object(pi_runtime, "_configure_managed_server"),
@@ -283,7 +285,7 @@ class PiRuntimeTests(unittest.TestCase):
             "ZELLIJ_SESSION_NAME": "outer",
             "ZELLIJ_PANE_ID": "4",
             "KEEP": "yes",
-        }, clear=True):
+        }, clear=True), patch.object(pi_runtime, "_host_runtime", return_value=None):
             environment = pi_runtime._tmux_environment()
         self.assertEqual(environment, {"KEEP": "yes"})
 

@@ -240,13 +240,13 @@ class HostRuntimeLoadWriteTests(unittest.TestCase):
             self.assertEqual(host_runtime.default_manifest_path(), expected)
 
     def test_load_host_runtime_required_false_returns_none_when_missing(self):
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertIsNone(host_runtime.load_host_runtime(required=False))
+        missing = self.root / "missing" / "host-runtime.json"
+        self.assertIsNone(host_runtime.load_host_runtime(required=False, path=missing))
 
     def test_load_host_runtime_required_true_raises_when_missing(self):
-        with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(host_runtime.HostRuntimeError):
-                host_runtime.load_host_runtime(required=True)
+        missing = self.root / "missing" / "host-runtime.json"
+        with self.assertRaises(host_runtime.HostRuntimeError):
+            host_runtime.load_host_runtime(required=True, path=missing)
 
     def test_load_host_runtime_round_trips_payload(self):
         runtime = host_runtime.capture_host_runtime()
