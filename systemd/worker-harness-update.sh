@@ -38,21 +38,23 @@ systemctl --user restart worker-harness.service
 echo "restart issued" >>"$LOG"
 
 # A single `active` poll races a Type=simple service: systemd marks the
-# process active before its entrypoint has necessarily survived startup.
-# Require ten uninterrupted active polls, allowing up to twenty seconds for
-# the service to reach that stable state. This preserves .old when a SIF
-# starts briefly and then enters Restart= failure loop.
+# wrapper active before its entrypoint has necessarily survived startup.
+# An Apptainer instance with no valid %startscript can also leave only appinit
+# alive forever while systemd still reports active. Require both the service
+# and the actual worker daemon to remain live for ten uninterrupted polls.
+# This preserves .old for images that start an empty/broken instance.
 HEALTHY=no
 ACTIVE_STREAK=0
 for attempt in $(seq 1 20); do
   sleep 1
   state=$(systemctl --user is-active worker-harness.service 2>/dev/null || true)
-  if [ "$state" = "active" ]; then
+  daemon_pid=$(pgrep -f '^python3? /worker_daemon.py$' | head -n 1 || true)
+  if [ "$state" = "active" ] && [ -n "$daemon_pid" ]; then
     ACTIVE_STREAK=$((ACTIVE_STREAK + 1))
   else
     ACTIVE_STREAK=0
   fi
-  echo "  poll $attempt: state=$state active_streak=$ACTIVE_STREAK/10" >>"$LOG"
+  echo "  poll $attempt: state=$state daemon=${daemon_pid:-missing} active_streak=$ACTIVE_STREAK/10" >>"$LOG"
   if [ "$ACTIVE_STREAK" -ge 10 ]; then
     HEALTHY=yes
     break
