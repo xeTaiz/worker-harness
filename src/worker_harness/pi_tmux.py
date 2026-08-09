@@ -79,6 +79,18 @@ def _validate_tmux_session(value: object) -> str:
     return text
 
 
+def validate_attachment_target(
+    target_session: object,
+    target_client: object,
+) -> tuple[str, str]:
+    """Validate an exact invoking tmux session/client before side effects."""
+
+    return (
+        _validate_tmux_session(target_session),
+        _validate_text(target_client, "tmux target client", reject_option=True),
+    )
+
+
 def _tmux_executable() -> str:
     return shutil.which("tmux") or "tmux"
 
@@ -260,8 +272,9 @@ def open_or_focus_attachment_window(
 ) -> str:
     """Reuse or create one WH-owned attachment window, then focus one client."""
 
-    target_session = _validate_tmux_session(target_session)
-    target_client = _validate_text(target_client, "tmux target client", reject_option=True)
+    target_session, target_client = validate_attachment_target(
+        target_session, target_client
+    )
     pi_session_id = _validate_text(
         selected.get("id"), "Pi session ID", reject_option=True
     )

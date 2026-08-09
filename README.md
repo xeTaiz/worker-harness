@@ -96,8 +96,11 @@ back to the orchestrator gateway. `--stream` remains as a compatibility no-op.
 The companion tmux dotfiles reserve `Ctrl-a` as a Worker Harness prefix while
 leaving tmux's normal `Ctrl-b` prefix unchanged. `Ctrl-a Ctrl-a` opens a
 transient popup picker, then creates or focuses one dedicated WH-owned window by
-exact Pi UUID. Only that invoking tmux client is switched. The window title and
-Catppuccin status entry retain the state glyph and use blue/green/red/gray for
+exact Pi UUID. `Ctrl-a Ctrl-s` opens the same transient handoff for `wh launch`;
+running-session attach, history resume, and new-session launch all finish in the
+same dedicated/reused window rather than inside the popup. Only that invoking
+tmux client is switched. The window title and Catppuccin status entry retain the
+state glyph and use blue/green/red/gray for
 working/idle/error/disconnected; ordinary windows are untouched. `Ctrl-a
 Ctrl-j/Ctrl-l` cycles next, `Ctrl-a Ctrl-h/Ctrl-k` cycles previous, and `Ctrl-a
 x` detaches. A dedicated attachment retries bounded unexpected transport

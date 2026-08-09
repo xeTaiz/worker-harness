@@ -799,11 +799,27 @@ def pick_launch_action(
     return records[key]
 
 
-async def _attach_selected_session(selected: dict[str, Any]) -> None:
+async def _attach_selected_session(
+    selected: dict[str, Any],
+    *,
+    tmux_target_session: str | None = None,
+    tmux_target_client: str | None = None,
+) -> None:
     from worker_harness.cli import pi
     from worker_harness.pi_zellij import is_immediate_zellij
 
-    if is_immediate_zellij():
+    if (tmux_target_session is None) != (tmux_target_client is None):
+        raise RuntimeError("tmux launch handoff requires an exact session and client")
+    if tmux_target_session is not None and tmux_target_client is not None:
+        from worker_harness.pi_tmux import open_or_focus_attachment_window
+
+        await asyncio.to_thread(
+            open_or_focus_attachment_window,
+            selected,
+            tmux_target_session,
+            tmux_target_client,
+        )
+    elif is_immediate_zellij():
         await pi._open_in_zellij(selected)
     else:
         await pi._run_attach_loop(selected)
@@ -818,8 +834,22 @@ async def launch_managed_pi(
     attach_after_start: bool,
     timeout: float,
     pi_args: Sequence[str],
+    tmux_target_session: str | None = None,
+    tmux_target_client: str | None = None,
 ) -> dict[str, Any]:
     """Run the complete select → SSH launch → registration → attach flow."""
+
+    if (tmux_target_session is None) != (tmux_target_client is None):
+        raise RuntimeError("tmux launch handoff requires an exact session and client")
+    if tmux_target_session is not None and tmux_target_client is not None:
+        if not attach_after_start:
+            raise RuntimeError("tmux launch handoff requires attachment")
+        from worker_harness.pi_tmux import validate_attachment_target
+
+        tmux_target_session, tmux_target_client = validate_attachment_target(
+            tmux_target_session,
+            tmux_target_client,
+        )
 
     workers = await _load_worker_records()
     machines = await asyncio.to_thread(tailscale_launch_machines, workers)
@@ -875,7 +905,11 @@ async def launch_managed_pi(
     if action == "attach":
         assert chosen is not None
         if attach_after_start:
-            await _attach_selected_session(chosen)
+            await _attach_selected_session(
+                chosen,
+                tmux_target_session=tmux_target_session,
+                tmux_target_client=tmux_target_client,
+            )
         return {
             "session_id": str(chosen.get("id") or ""),
             "name": str(chosen.get("name") or chosen.get("task") or "Pi"),
@@ -908,7 +942,11 @@ async def launch_managed_pi(
             "action": "resume",
         }
         if attach_after_start:
-            await _attach_selected_session(selected)
+            await _attach_selected_session(
+                selected,
+                tmux_target_session=tmux_target_session,
+                tmux_target_client=tmux_target_client,
+            )
         return result
 
     default_name = default_session_name(cwd)
@@ -941,7 +979,11 @@ async def launch_managed_pi(
         "action": "new",
     }
     if attach_after_start:
-        await _attach_selected_session(selected)
+        await _attach_selected_session(
+            selected,
+            tmux_target_session=tmux_target_session,
+            tmux_target_client=tmux_target_client,
+        )
     return result
 
 
@@ -971,10 +1013,26 @@ def launch(
         min=1.0,
         help="Seconds allowed for each target operation and registration",
     ),
+    tmux_picker: bool = typer.Option(False, "--tmux-picker", hidden=True),
 ) -> None:
     """Launch a managed Pi on a standard or wh-worker Tailnet machine."""
 
     try:
+        tmux_target_session = None
+        tmux_target_client = None
+        if tmux_picker:
+            if not attach_after_start:
+                raise RuntimeError("--tmux-picker cannot be combined with --no-attach")
+            tmux_target_session = os.environ.get("WH_TMUX_TARGET_SESSION")
+            tmux_target_client = os.environ.get("WH_TMUX_TARGET_CLIENT")
+            if not tmux_target_session or not tmux_target_client:
+                raise RuntimeError("--tmux-picker requires its invoking tmux session and client")
+            from worker_harness.pi_tmux import validate_attachment_target
+
+            tmux_target_session, tmux_target_client = validate_attachment_target(
+                tmux_target_session,
+                tmux_target_client,
+            )
         result = asyncio.run(launch_managed_pi(
             machine_selector=machine,
             cwd=cwd,
@@ -983,6 +1041,8 @@ def launch(
             attach_after_start=attach_after_start,
             timeout=timeout,
             pi_args=list(ctx.args),
+            tmux_target_session=tmux_target_session,
+            tmux_target_client=tmux_target_client,
         ))
         if not attach_after_start:
             from worker_harness.cli.pi import _output_mode

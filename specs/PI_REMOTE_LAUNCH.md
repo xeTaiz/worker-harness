@@ -34,6 +34,7 @@ This is an explicit operator action. It does not add an orchestrator remote-exec
 12. Remote shell values are quoted with `shlex.quote`/`shlex.join`; the local target bypasses SSH and executes argv directly. SSH errors name the destination, phase, and duration with bounded output.
 13. The target must already have SSH, `wh`, Pi, its bridge extension, tmux/Bun, orchestrator configuration, and host-relay/Tailscale Serve prerequisites. `wh host setup` and `wh host doctor` capture and validate the target's non-interactive runtime; launch performs no automatic bootstrap.
 14. After start/resume returns the exact UUID, the operator polls the existing orchestrator registry until active/attachable, then reuses direct-first/gateway-fallback and dedicated/reused attachment flow.
+15. The companion tmux binding `Ctrl-a Ctrl-s` runs `wh launch --tmux-picker` in a transient popup. It captures the exact invoking tmux session/client before launch and hands every successful Running/Previous/New action to the normal UUID-owned attachment window; the popup never becomes the durable terminal container. Errors remain visible in the popup.
 
 ## CLI
 
@@ -60,6 +61,7 @@ Options:
 - `--attach/--no-attach`: attach after registration, default attach.
 - `--timeout`: SSH/start and orchestrator-registration timeout.
 - remaining arguments after `--` pass to Pi, subject to `wh pi start`'s existing identity/resume conflict rejection.
+- hidden `--tmux-picker`: dotfiles integration that requires the captured invoking tmux session/client and cannot be combined with `--no-attach`.
 
 ## Machine picker
 
@@ -114,4 +116,5 @@ The directory command does not recursively scan home or execute project files. T
 - Target history helper checks Pi version/API, cwd/path containment, bounded output, exact-ID re-resolution, and active-ID refusal.
 - Action picker groups active/history/new, filters active histories, preserves names, and quotes resume commands.
 - `--no-attach` output and immediate-Zellij/terminal attachment reuse.
+- tmux popup handoff for active attach, resumed history, and new launch; exact invoking-client focus, UUID window reuse, incomplete-locator refusal, and normal non-tmux behavior.
 - Existing non-live suite and installed-fzf tests remain green.

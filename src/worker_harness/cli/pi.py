@@ -922,6 +922,14 @@ def attach(
                 raise RuntimeError("--tmux-picker cannot be combined with attachment child modes")
             if picker_target_session is None or picker_target_client is None:
                 raise RuntimeError("--tmux-picker requires its invoking tmux session and client")
+            from worker_harness.pi_tmux import validate_attachment_target
+
+            validated_target_session, validated_target_client = (
+                validate_attachment_target(
+                    picker_target_session,
+                    picker_target_client,
+                )
+            )
             candidates = await _candidate_inventory()
             selected = (
                 _resolve_session(candidates, target)
@@ -933,8 +941,8 @@ def attach(
             await asyncio.to_thread(
                 open_or_focus_attachment_window,
                 selected,
-                picker_target_session,
-                picker_target_client,
+                validated_target_session,
+                validated_target_client,
             )
             return
         if tmux_child:

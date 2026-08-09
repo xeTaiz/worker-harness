@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import typer
@@ -376,12 +376,48 @@ class LaunchCommandTests(unittest.TestCase):
             launch.validate_working_directory("~/Dev")
 
 
+class LaunchTmuxHandoffTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tmux_handoff_opens_or_focuses_exact_invoking_client(self):
+        selected = {"id": "session-1", "name": "Repo", "state": "idle"}
+        opener = Mock(return_value="@7")
+        with patch(
+            "worker_harness.pi_tmux.open_or_focus_attachment_window", new=opener
+        ):
+            await launch._attach_selected_session(
+                selected,
+                tmux_target_session="$4",
+                tmux_target_client="/dev/ttys009",
+            )
+        opener.assert_called_once_with(selected, "$4", "/dev/ttys009")
+
+    async def test_tmux_handoff_refuses_incomplete_locator(self):
+        with self.assertRaisesRegex(RuntimeError, "exact session and client"):
+            await launch._attach_selected_session(
+                {"id": "session-1"}, tmux_target_session="$4"
+            )
+
+    async def test_normal_terminal_attach_remains_unchanged(self):
+        selected = {"id": "session-1", "name": "Repo", "state": "idle"}
+        terminal = AsyncMock()
+        with (
+            patch("worker_harness.pi_zellij.is_immediate_zellij", return_value=False),
+            patch("worker_harness.cli.pi._run_attach_loop", new=terminal),
+        ):
+            await launch._attach_selected_session(selected)
+        terminal.assert_awaited_once_with(selected)
+
+
 class LaunchCliTests(unittest.TestCase):
-    def test_cli_forwards_pi_arguments_after_separator(self):
+    @staticmethod
+    def _app() -> typer.Typer:
         app = typer.Typer()
         app.command(
             context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
         )(launch.launch)
+        return app
+
+    def test_cli_forwards_pi_arguments_after_separator(self):
+        app = self._app()
         launched = {
             "session_id": "session-1",
             "name": "Repo",
@@ -407,6 +443,62 @@ class LaunchCliTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["pi_args"], [
             "--offline", "--model", "test/model",
         ])
+
+    def test_cli_tmux_picker_passes_exact_popup_locator(self):
+        launched = {
+            "session_id": "session-1",
+            "name": "Repo",
+            "machine": "camel",
+            "machine_dns": "camel.hs.example",
+            "cwd": "/home/u/Dev/Repo",
+        }
+        with (
+            patch.dict(launch.os.environ, {
+                "WH_TMUX_TARGET_SESSION": "$4",
+                "WH_TMUX_TARGET_CLIENT": "/dev/ttys009",
+            }),
+            patch.object(
+                launch, "launch_managed_pi", new=AsyncMock(return_value=launched)
+            ) as run,
+        ):
+            result = CliRunner().invoke(self._app(), [
+                "--tmux-picker",
+                "--machine", "camel",
+                "--cwd", "/home/u/Dev/Repo",
+                "--name", "Repo",
+            ])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(run.call_args.kwargs["tmux_target_session"], "$4")
+        self.assertEqual(run.call_args.kwargs["tmux_target_client"], "/dev/ttys009")
+
+    def test_cli_tmux_picker_requires_complete_locator_and_attach(self):
+        with patch.dict(launch.os.environ, {}, clear=True):
+            missing = CliRunner().invoke(self._app(), ["--tmux-picker"])
+        self.assertEqual(missing.exit_code, 1)
+        self.assertIn("requires its invoking tmux session and client", missing.output)
+
+        with patch.dict(launch.os.environ, {
+            "WH_TMUX_TARGET_SESSION": "$4",
+            "WH_TMUX_TARGET_CLIENT": "/dev/ttys009",
+        }):
+            detached = CliRunner().invoke(
+                self._app(), ["--tmux-picker", "--no-attach"]
+            )
+        self.assertEqual(detached.exit_code, 1)
+        self.assertIn("cannot be combined with --no-attach", detached.output)
+
+        launcher = AsyncMock()
+        with (
+            patch.dict(launch.os.environ, {
+                "WH_TMUX_TARGET_SESSION": "#{session_id}",
+                "WH_TMUX_TARGET_CLIENT": "/dev/ttys009",
+            }),
+            patch.object(launch, "launch_managed_pi", new=launcher),
+        ):
+            invalid = CliRunner().invoke(self._app(), ["--tmux-picker"])
+        self.assertEqual(invalid.exit_code, 1)
+        self.assertIn("exact tmux session ID", invalid.output)
+        launcher.assert_not_awaited()
 
 
 class _FakeAsyncClient:
