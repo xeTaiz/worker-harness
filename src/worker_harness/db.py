@@ -26,6 +26,7 @@ from .models import (
     PiSessionState,
     PiSessionType,
     PortForward,
+    MarimoSession,
     Worker,
     WorkerJobReport,
     WorkerRegistration,
@@ -167,6 +168,22 @@ class Database:
                 remote_port INTEGER NOT NULL,
                 service_name TEXT DEFAULT '',
                 pid INTEGER DEFAULT 0,
+                created_at INTEGER DEFAULT 0
+            )
+        """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS marimo_sessions (
+                id TEXT PRIMARY KEY,
+                worker_id TEXT REFERENCES workers(id),
+                notebook_path TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                tunnel_id TEXT NOT NULL,
+                local_port INTEGER NOT NULL,
+                remote_port INTEGER NOT NULL,
+                bind_host TEXT NOT NULL,
+                url TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ready',
                 created_at INTEGER DEFAULT 0
             )
         """)
@@ -1128,6 +1145,47 @@ class Database:
             created_at=row["created_at"],
         )
 
+    # ── Marimo Sessions ────────────────────────────────────────────────
+
+    async def insert_marimo_session(self, session: MarimoSession) -> None:
+        await self._db.execute(
+            """INSERT INTO marimo_sessions
+               (id, worker_id, notebook_path, environment, job_id, tunnel_id,
+                local_port, remote_port, bind_host, url, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session.id, session.worker_id, session.notebook_path,
+                session.environment, session.job_id, session.tunnel_id,
+                session.local_port, session.remote_port, session.bind_host,
+                session.url, session.status, session.created_at,
+            ),
+        )
+        await self._db.commit()
+
+    async def get_marimo_session(self, session_id: str) -> MarimoSession | None:
+        row = await self._db.execute_fetchall(
+            "SELECT * FROM marimo_sessions WHERE id = ?", (session_id,)
+        )
+        return self._row_to_marimo(row[0]) if row else None
+
+    async def list_marimo_sessions(self, worker_id: str | None = None) -> list[MarimoSession]:
+        query = "SELECT * FROM marimo_sessions"
+        params: list = []
+        if worker_id:
+            query += " WHERE worker_id = ?"
+            params.append(worker_id)
+        query += " ORDER BY created_at DESC"
+        rows = await self._db.execute_fetchall(query, params)
+        return [self._row_to_marimo(row) for row in rows]
+
+    async def delete_marimo_session(self, session_id: str) -> None:
+        await self._db.execute("DELETE FROM marimo_sessions WHERE id = ?", (session_id,))
+        await self._db.commit()
+
+    @staticmethod
+    def _row_to_marimo(row: aiosqlite.Row) -> MarimoSession:
+        return MarimoSession(**dict(row))
+
     # ── Failures ───────────────────────────────────────────────────────
 
     async def insert_failure(self, failure: Failure) -> None:
@@ -1163,6 +1221,9 @@ class Database:
         )
         cursor = await self._db.execute(
             "DELETE FROM port_forwards WHERE worker_id = ?", (worker_id,)
+        )
+        cursor = await self._db.execute(
+            "DELETE FROM marimo_sessions WHERE worker_id = ?", (worker_id,)
         )
         cursor = await self._db.execute(
             "DELETE FROM workers WHERE id = ?", (worker_id,)

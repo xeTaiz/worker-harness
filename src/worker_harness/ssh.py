@@ -418,9 +418,19 @@ async def ssh_download_bytes(
                 await _terminate_async_process(proc)
 
 
-async def ssh_port_forward(worker: Worker, local_port: int, remote_port: int) -> subprocess.Popen:
+async def ssh_port_forward(
+    worker: Worker,
+    local_port: int,
+    remote_port: int,
+    *,
+    bind_host: str = "0.0.0.0",
+) -> subprocess.Popen:
     """Start a persistent port-forward tunnel to the worker. Returns the
     Popen handle. The caller (heartbeat.py) registers it in TunnelRegistry.
+
+    ``bind_host`` controls the orchestrator-side listener. Generic tunnels
+    retain the legacy all-interface default; service primitives should bind
+    explicitly to the orchestrator's Tailnet address.
 
     The per-worker SSH lane is held only during SSH connection setup; the
     returned Popen runs independently and is NOT in the lane.
@@ -428,8 +438,9 @@ async def ssh_port_forward(worker: Worker, local_port: int, remote_port: int) ->
     from .metrics import get_metrics
     metrics = get_metrics()
     args = _ssh_base_args(worker) + [
+        "-o", "ExitOnForwardFailure=yes",
         "-N", "-g",
-        "-L", f"0.0.0.0:{local_port}:localhost:{remote_port}",
+        "-L", f"{bind_host}:{local_port}:localhost:{remote_port}",
     ]
     started = time.monotonic()
     async with _lanes_or_default().acquire(worker.id, timeout=10.0):

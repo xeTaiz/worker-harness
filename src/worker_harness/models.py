@@ -360,6 +360,23 @@ class PortForward(BaseModel):
     created_at: int = 0
 
 
+# ── Marimo Service ────────────────────────────────────────────────────
+
+class MarimoSession(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    worker_id: str
+    notebook_path: str
+    environment: str
+    job_id: str
+    tunnel_id: str
+    local_port: int
+    remote_port: int
+    bind_host: str
+    url: str
+    status: str = "ready"
+    created_at: int = 0
+
+
 # ── Failure ───────────────────────────────────────────────────────────
 
 class Failure(BaseModel):

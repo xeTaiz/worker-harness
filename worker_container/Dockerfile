@@ -44,7 +44,7 @@ WORKDIR /workspace
 COPY worker_daemon.py pi_relay.py pi_job_server.py /
 
 COPY entrypoint.sh /entrypoint.sh
-COPY wh-data-export wh-data-import wh-pi-release-activate /usr/local/lib/worker-harness/
-RUN chmod +x /entrypoint.sh /usr/local/lib/worker-harness/wh-data-export /usr/local/lib/worker-harness/wh-data-import /usr/local/lib/worker-harness/wh-pi-release-activate
+COPY wh-data-export wh-data-import wh-pi-release-activate wh-marimo-launch /usr/local/lib/worker-harness/
+RUN chmod +x /entrypoint.sh /usr/local/lib/worker-harness/wh-data-export /usr/local/lib/worker-harness/wh-data-import /usr/local/lib/worker-harness/wh-pi-release-activate /usr/local/lib/worker-harness/wh-marimo-launch
 
 ENTRYPOINT ["/entrypoint.sh"]

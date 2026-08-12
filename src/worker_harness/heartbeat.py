@@ -38,6 +38,13 @@ from .db import Database
 from .job import JobManager
 from .lanes import LaneTimeout, WorkerLanes
 from .metrics import Metrics, set_global_metrics
+from .marimo import (
+    allocate_local_port,
+    allocate_worker_port,
+    build_launch_command,
+    tailnet_bind_host,
+    wait_until_ready,
+)
 from .models import (
     JobKind,
     JobStatus,
@@ -53,6 +60,7 @@ from .models import (
     PiSessionState,
     PiSessionType,
     PortForward,
+    MarimoSession,
     WorkerJobReportBatch,
     WorkerRegistration,
     WorkerStatus,
@@ -92,6 +100,13 @@ class TunnelCreateRequest(BaseModel):
     local_port: int
     remote_port: int
     name: str = ""
+
+
+class MarimoCreateRequest(BaseModel):
+    worker_id: str
+    notebook_path: str
+    environment: str
+    ready_timeout: float = 45.0
 
 
 # 10 MB — larger transfers should use direct rsync over tailnet SSH
@@ -1667,6 +1682,162 @@ def create_app(db: Database, router_client=None) -> FastAPI:
             "already_terminal": False,
             "status": updated.status.value if updated else None,
         }
+
+    async def stop_marimo_session(session: MarimoSession) -> None:
+        job = await db.get_job(session.job_id)
+        worker = await db.get_worker(session.worker_id)
+        if job and worker and job.status in (JobStatus.RUNNING, JobStatus.PENDING):
+            if not await jm.stop_job(worker, job.id):
+                raise RuntimeError(f"failed to stop marimo job {job.id}")
+
+        entry = app.state.tunnels.remove(session.tunnel_id)
+        if entry:
+            await asyncio.to_thread(TunnelRegistry.stop, entry)
+        await db.delete_port_forward(session.tunnel_id)
+        await db.delete_marimo_session(session.id)
+        await app.state.cache.invalidate("tunnels:list")
+
+    @app.post("/api/v1/marimo", status_code=201)
+    async def marimo_create(payload: MarimoCreateRequest):
+        worker = await resolve_worker(payload.worker_id)
+        if not worker:
+            raise HTTPException(status_code=404, detail=f"Worker not found: {payload.worker_id}")
+        if not 1 <= payload.ready_timeout <= 300:
+            raise HTTPException(status_code=422, detail="ready_timeout must be between 1 and 300 seconds")
+
+        try:
+            remote_port = await allocate_worker_port(worker)
+            bind_host = tailnet_bind_host()
+            local_port = allocate_local_port(bind_host)
+            command = build_launch_command(
+                notebook_path=payload.notebook_path,
+                environment=payload.environment,
+                port=remote_port,
+            )
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        job = await jm.start_job(worker, command, name=f"marimo-{uuid4().hex[:12]}", pty_enabled=False)
+        if job.status == JobStatus.FAILED:
+            raise HTTPException(status_code=502, detail="failed to start marimo worker process")
+
+        pf = PortForward(
+            worker_id=worker.id,
+            local_port=local_port,
+            remote_port=remote_port,
+            service_name=f"marimo:{payload.notebook_path}",
+            created_at=int(datetime.now(timezone.utc).timestamp()),
+        )
+        proc = None
+        registered = False
+        try:
+            proc = await ssh_port_forward(
+                worker, local_port, remote_port, bind_host=bind_host
+            )
+            if proc.poll() is not None:
+                raise RuntimeError(f"SSH tunnel exited immediately (code={proc.returncode})")
+            pf.pid = proc.pid
+            await db.insert_port_forward(pf)
+            app.state.tunnels.add(TunnelProcess(
+                id=pf.id,
+                worker_id=worker.id,
+                local_port=local_port,
+                remote_port=remote_port,
+                proc=proc,
+                created_at=pf.created_at,
+            ))
+            registered = True
+            await wait_until_ready(bind_host, local_port, payload.ready_timeout)
+            session = MarimoSession(
+                worker_id=worker.id,
+                notebook_path=payload.notebook_path,
+                environment=payload.environment,
+                job_id=job.id,
+                tunnel_id=pf.id,
+                local_port=local_port,
+                remote_port=remote_port,
+                bind_host=bind_host,
+                url=f"http://{bind_host}:{local_port}",
+                status="ready",
+                created_at=pf.created_at,
+            )
+            await db.insert_marimo_session(session)
+        except BaseException as exc:
+            async def cleanup_failed_start() -> None:
+                entry = app.state.tunnels.remove(pf.id) if registered else None
+                if entry:
+                    await asyncio.to_thread(TunnelRegistry.stop, entry)
+                elif proc is not None:
+                    transient = TunnelProcess(
+                        id=pf.id, worker_id=worker.id, local_port=local_port,
+                        remote_port=remote_port, proc=proc, created_at=pf.created_at,
+                    )
+                    await asyncio.to_thread(TunnelRegistry.stop, transient)
+                try:
+                    await db.delete_port_forward(pf.id)
+                except Exception:
+                    log.exception("Failed to delete marimo tunnel row %s during rollback", pf.id)
+                try:
+                    await jm.stop_job(worker, job.id)
+                except Exception:
+                    log.exception("Failed to stop marimo job %s during rollback", job.id)
+
+            cleanup_task = asyncio.create_task(cleanup_failed_start())
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await cleanup_task
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise HTTPException(status_code=502, detail=f"marimo startup failed: {exc}") from exc
+
+        await app.state.cache.invalidate("tunnels:list")
+        return {**session.model_dump(mode="json"), "worker_name": worker.name}
+
+    @app.get("/api/v1/marimo")
+    async def marimo_list(worker_id: str | None = None):
+        sessions = await db.list_marimo_sessions(worker_id=worker_id)
+        workers = {worker.id: worker for worker in await db.list_workers()}
+        result = []
+        for session in sessions:
+            job = await db.get_job(session.job_id)
+            worker = workers.get(session.worker_id)
+            if job and worker and job.status in (JobStatus.RUNNING, JobStatus.PENDING):
+                job = await jm.refresh_job_status(worker, job)
+            entry = app.state.tunnels.get(session.tunnel_id)
+            tunnel_live = bool(entry and entry.proc.poll() is None)
+            item = session.model_dump(mode="json")
+            item["status"] = "ready" if job and job.status == JobStatus.RUNNING and tunnel_live else "stopped"
+            item["worker_name"] = worker.name if worker else None
+            result.append(item)
+        return result
+
+    @app.get("/api/v1/marimo/{session_id}")
+    async def marimo_get(session_id: str):
+        session = await db.get_marimo_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail=f"Marimo session not found: {session_id}")
+        worker = await db.get_worker(session.worker_id)
+        job = await db.get_job(session.job_id)
+        if job and worker and job.status in (JobStatus.RUNNING, JobStatus.PENDING):
+            job = await jm.refresh_job_status(worker, job)
+        entry = app.state.tunnels.get(session.tunnel_id)
+        tunnel_live = bool(entry and entry.proc.poll() is None)
+        item = session.model_dump(mode="json")
+        item["status"] = "ready" if job and job.status == JobStatus.RUNNING and tunnel_live else "stopped"
+        item["worker_name"] = worker.name if worker else None
+        return item
+
+    @app.delete("/api/v1/marimo/{session_id}")
+    async def marimo_delete(session_id: str):
+        session = await db.get_marimo_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail=f"Marimo session not found: {session_id}")
+        try:
+            await stop_marimo_session(session)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {"session_id": session_id, "removed": True}
 
     @app.post("/api/v1/tunnels")
     async def tunnels_create(payload: TunnelCreateRequest):

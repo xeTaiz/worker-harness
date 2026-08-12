@@ -17,6 +17,7 @@ From: nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
     worker_container/wh-data-export /wh-data-export
     worker_container/wh-data-import /wh-data-import
     worker_container/wh-pi-release-activate /wh-pi-release-activate
+    worker_container/wh-marimo-launch /wh-marimo-launch
 
 %post
     set -eux
@@ -59,6 +60,7 @@ From: nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
     install -m 0755 /wh-data-export /usr/local/lib/worker-harness/wh-data-export
     install -m 0755 /wh-data-import /usr/local/lib/worker-harness/wh-data-import
     install -m 0755 /wh-pi-release-activate /usr/local/lib/worker-harness/wh-pi-release-activate
+    install -m 0755 /wh-marimo-launch /usr/local/lib/worker-harness/wh-marimo-launch
     chmod +x /entrypoint.sh
 
     # Make sure /usr/local/cuda/bin and /usr/local/nvidia/bin survive into

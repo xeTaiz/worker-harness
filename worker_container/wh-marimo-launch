@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Launch marimo against a caller-owned Python environment without modifying it.
+set -euo pipefail
+
+readonly MARIMO_VERSION="0.23.16"
+
+usage() {
+  echo "usage: wh-marimo-launch --notebook ABSOLUTE_PATH --environment ABSOLUTE_PATH --port PORT" >&2
+  exit 2
+}
+
+fail() {
+  echo "wh-marimo-launch: $*" >&2
+  exit 2
+}
+
+notebook=""
+environment=""
+port=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --notebook)
+      [[ $# -ge 2 ]] || usage
+      notebook=$2
+      shift 2
+      ;;
+    --environment)
+      [[ $# -ge 2 ]] || usage
+      environment=$2
+      shift 2
+      ;;
+    --port)
+      [[ $# -ge 2 ]] || usage
+      port=$2
+      shift 2
+      ;;
+    *) usage ;;
+  esac
+done
+
+[[ -n "$notebook" && -n "$environment" && -n "$port" ]] || usage
+[[ "$notebook" != *$'\n'* && "$notebook" != *$'\r'* ]] || fail "notebook path must not contain newlines"
+[[ "$environment" != *$'\n'* && "$environment" != *$'\r'* ]] || fail "environment path must not contain newlines"
+[[ "$notebook" == /* ]] || fail "notebook path must be absolute"
+[[ "$environment" == /* ]] || fail "environment path must be absolute"
+[[ "$port" =~ ^[0-9]+$ ]] || fail "port must be an integer between 1 and 65535"
+(( 10#$port >= 1 && 10#$port <= 65535 )) || fail "port must be an integer between 1 and 65535"
+
+if [[ -d "$environment" ]]; then
+  target_python="${environment%/}/bin/python"
+else
+  target_python=$environment
+fi
+[[ -f "$target_python" && -x "$target_python" ]] || fail "target Python does not exist or is not executable: $target_python"
+
+notebook_parent=${notebook%/*}
+[[ -n "$notebook_parent" ]] || notebook_parent="/"
+if [[ ! -d "$notebook_parent" ]]; then
+  # Create at most the notebook's immediate parent. Its parent is treated as
+  # the caller-owned project root and must already exist.
+  project_root=${notebook_parent%/*}
+  [[ -n "$project_root" ]] || project_root="/"
+  [[ -d "$project_root" ]] || fail "notebook project root does not exist: $project_root"
+  mkdir -- "$notebook_parent" || fail "could not create notebook parent: $notebook_parent"
+fi
+
+uv_bin=$(command -v uv) || fail "image-provided uv is not available"
+exec "$uv_bin" run \
+  --no-project \
+  --python "$target_python" \
+  --with "marimo==${MARIMO_VERSION}" \
+  marimo edit "$notebook" \
+  --host 127.0.0.1 \
+  --port "$port" \
+  --headless \
+  --no-token

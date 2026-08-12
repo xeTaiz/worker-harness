@@ -42,6 +42,21 @@ Use tags to model roles:
 - The forwarded remote port is opened *inside* SSH; no extra Tailnet ACL rule is needed for that remote port.
 - Only add worker service-port ACLs if orchestrator must connect directly (without SSH forwarding).
 
+### Marimo service tunnels
+
+The first-class marimo primitive is deliberately narrower than generic tunnels:
+
+- marimo binds to `127.0.0.1` inside the worker;
+- the orchestrator's SSH forward binds only to its Tailnet IPv4 address;
+- the allocated listener is restricted to `18000-18999` by default;
+- no marimo token is used, so the Headscale/Tailscale ACL is the security boundary;
+- ACLs must allow authorized non-worker members to
+  `tag:wh-orchestrator:18000-18999` and must not grant `tag:wh-worker` that
+  destination range.
+
+`headscale-policy.marimo.example.json` is a least-privilege example. Applying
+and validating the live control-plane policy is a separate deployment step.
+
 ## 4) Naming/Discovery Strategy
 
 - Remove dependency on static orchestrator IP env values.
