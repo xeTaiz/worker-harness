@@ -48,7 +48,7 @@ class ReliabilityApiTests(unittest.TestCase):
             # A per-agent bucket permits its burst then responds 429, without
             # impacting another agent's bucket.
             limited_headers = {"X-Agent-Name": "limited-agent"}
-            for _ in range(10):
+            for _ in range(50):
                 self.assertEqual(client.get("/api/v1/workers", headers=limited_headers).status_code, 200)
             limited = client.get("/api/v1/workers", headers=limited_headers)
             self.assertEqual(limited.status_code, 429)
@@ -72,6 +72,10 @@ class ReliabilityApiTests(unittest.TestCase):
             self.assertGreaterEqual(body["cache"]["misses"], 1)
             self.assertIn("workers", body["lanes"])
             self.assertIn("agents", body["rate_limit"])
+            self.assertEqual(
+                body["rate_limit"]["agents"]["limited-agent"]["capacity"],
+                50,
+            )
             self.assertIn("tunnels", body)
             self.assertEqual(body["http"]["in_flight"], 1)  # this stats request itself
 

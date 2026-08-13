@@ -253,7 +253,7 @@ def _attach_candidates(
 
 
 async def _candidate_inventory() -> list[dict]:
-    rows = await _request("GET", "/api/v1/pi/sessions")
+    rows = await _request("GET", "/api/v1/pi/sessions?include_attach_info=true")
     workers: list[dict] = []
     if any(str(row.get("session_type") or "") == "delegated" for row in rows):
         try:
@@ -297,33 +297,26 @@ def _cycle_order(rows: list[dict], current_session_id: str, direction: str) -> l
 
 
 async def _attachable_candidates(rows: list[dict]) -> list[dict]:
-    async def available(row: dict) -> dict | None:
-        session_id = str(row.get("id") or "")
-        try:
-            info = await _request(
-                "GET", f"/api/v1/pi/sessions/{quote(session_id, safe='')}/attach-info"
-            )
-        except RuntimeError:
-            return None
-        return row if info.get("attachable") else None
+    """Filter one server-generated attachment snapshot without request fanout."""
 
-    checked = await asyncio.gather(*(available(row) for row in rows))
-    return [row for row in checked if row is not None]
+    missing = [str(row.get("id") or "") for row in rows if not isinstance(row.get("attach_info"), dict)]
+    if missing:
+        raise RuntimeError(
+            "session inventory did not include attachment information for "
+            + ", ".join(session_id[:12] or "<unknown>" for session_id in missing)
+        )
+    return [row for row in rows if row["attach_info"].get("attachable")]
 
 
 async def _cycle_session(current_session_id: str, direction: str) -> dict:
-    candidates = _cycle_order(
-        await _candidate_inventory(), current_session_id, direction
-    )
+    inventory = await _candidate_inventory()
+    candidates = _cycle_order(inventory, current_session_id, direction)
+    available_ids = {
+        str(row.get("id") or "")
+        for row in await _attachable_candidates(inventory)
+    }
     for candidate in candidates:
-        session_id = str(candidate.get("id") or "")
-        try:
-            info = await _request(
-                "GET", f"/api/v1/pi/sessions/{quote(session_id, safe='')}/attach-info"
-            )
-        except RuntimeError:
-            continue
-        if info.get("attachable"):
+        if str(candidate.get("id") or "") in available_ids:
             return candidate
     raise RuntimeError("no other attachable Pi sessions are registered")
 

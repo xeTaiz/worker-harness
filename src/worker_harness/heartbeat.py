@@ -483,7 +483,7 @@ def create_app(db: Database, router_client=None) -> FastAPI:
     # handlers, reaper, and /api/v1/_stats all see one coherent state.
     app.state.cache = TTLCache()
     app.state.lanes = WorkerLanes(max_concurrent=4, max_queue=32)
-    app.state.rate_limiter = AgentRateLimiter(capacity=10, refill_rate=1.0)
+    app.state.rate_limiter = AgentRateLimiter(capacity=50, refill_rate=1.0)
     app.state.metrics = Metrics()
     app.state.tunnels = TunnelRegistry()
     app.state.pi_gateway_lock = asyncio.Lock()
@@ -703,8 +703,29 @@ def create_app(db: Database, router_client=None) -> FastAPI:
         return {"acknowledged": True, "command_id": command_id}
 
     @app.get("/api/v1/pi/sessions")
-    async def pi_sessions_list(worker_id: str | None = None):
-        return [session.model_dump(mode="json") for session in await db.list_pi_sessions(worker_id)]
+    async def pi_sessions_list(
+        request: Request,
+        worker_id: str | None = None,
+        include_attach_info: bool = False,
+    ):
+        sessions = await db.list_pi_sessions(worker_id)
+        if not include_attach_info:
+            return [session.model_dump(mode="json") for session in sessions]
+        workers = {
+            worker.id: worker
+            for worker in await db.list_workers()
+        }
+        return [
+            {
+                **session.model_dump(mode="json"),
+                "attach_info": attach_info_with_gateway(
+                    session,
+                    workers.get(session.worker_id or ""),
+                    request,
+                ),
+            }
+            for session in sessions
+        ]
 
     async def router_config() -> PiRouterConfig:
         stored = await db.get_pi_router_config()
@@ -929,10 +950,7 @@ def create_app(db: Database, router_client=None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Pi session not found")
         return session.model_dump(mode="json")
 
-    async def resolve_pi_attach_info(session_id: str) -> dict[str, Any]:
-        session = await db.get_pi_session(session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Pi session not found")
+    def build_pi_attach_info(session: PiSession, worker=None) -> dict[str, Any]:
         if session.state not in {PiSessionState.WORKING, PiSessionState.IDLE}:
             return {
                 "session_id": session.id,
@@ -960,7 +978,6 @@ def create_app(db: Database, router_client=None) -> FastAPI:
             }
         if session.session_type != PiSessionType.DELEGATED or not session.worker_id:
             return {"session_id": session.id, "attachable": False, "reason": "Session has no terminal transport"}
-        worker = await db.get_worker(session.worker_id)
         if not worker:
             return {"session_id": session.id, "attachable": False, "reason": "Worker not found"}
         if worker.status != WorkerStatus.ONLINE:
@@ -988,17 +1005,35 @@ def create_app(db: Database, router_client=None) -> FastAPI:
             "direct_websocket_url": direct_url,
         }
 
-    @app.get("/api/v1/pi/sessions/{session_id}/attach-info")
-    async def pi_session_attach_info(session_id: str, request: Request):
-        info = await resolve_pi_attach_info(session_id)
+    def attach_info_with_gateway(
+        session: PiSession,
+        worker,
+        request: Request,
+    ) -> dict[str, Any]:
+        info = build_pi_attach_info(session, worker)
         if info.get("attachable"):
             forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
             scheme = "wss" if (forwarded_proto or request.url.scheme) == "https" else "ws"
             info["gateway_websocket_url"] = (
                 f"{scheme}://{request.url.netloc}/api/v1/pi/sessions/"
-                f"{quote(session_id, safe='')}/attach-gateway"
+                f"{quote(session.id, safe='')}/attach-gateway"
             )
         return info
+
+    async def resolve_pi_attach_info(session_id: str) -> dict[str, Any]:
+        session = await db.get_pi_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        worker = await db.get_worker(session.worker_id) if session.worker_id else None
+        return build_pi_attach_info(session, worker)
+
+    @app.get("/api/v1/pi/sessions/{session_id}/attach-info")
+    async def pi_session_attach_info(session_id: str, request: Request):
+        session = await db.get_pi_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        worker = await db.get_worker(session.worker_id) if session.worker_id else None
+        return attach_info_with_gateway(session, worker, request)
 
     @app.websocket("/api/v1/pi/sessions/{session_id}/attach-gateway")
     async def pi_session_attach_gateway(websocket: WebSocket, session_id: str) -> None:

@@ -1,7 +1,7 @@
 """Per-agent rate limiting using token bucket.
 
 Each agent (identified by X-Agent-Name header or peer IP fallback) gets its
-own bucket with capacity=10 and refill rate=1 token/second (≈60 req/min).
+own bucket with capacity=50 and refill rate=1 token/second (≈60 req/min sustained).
 
 On exhaustion, RateLimited is raised; the FastAPI middleware translates to
 HTTP 429 + Retry-After.
@@ -87,7 +87,7 @@ class AgentRateLimiter:
     def __init__(
         self,
         *,
-        capacity: float = 10.0,
+        capacity: float = 50.0,
         refill_rate: float = 1.0,
     ) -> None:
         self._capacity = capacity

@@ -329,6 +329,60 @@ class PiSessionsApiTests(unittest.TestCase):
         self.assertFalse(unavailable.json()["attachable"])
         self.assertIn("host relay", unavailable.json()["reason"])
 
+    def test_session_list_can_include_one_batched_attachability_snapshot(self):
+        asyncio.run(self.db.insert_pi_session(PiSession(
+            id="attach-child",
+            worker_id="archdome",
+            session_type=PiSessionType.DELEGATED,
+            state=PiSessionState.IDLE,
+        )))
+        asyncio.run(self.db.register_interactive_pi_session(PiBridgeRegister(
+            session_id="interactive-terminal",
+            incarnation="interactive-incarnation",
+            terminal_attachable=True,
+            terminal_host="100.64.0.2",
+            terminal_port=27888,
+            terminal_protocol_version=2,
+        )))
+        asyncio.run(self.db.register_interactive_pi_session(PiBridgeRegister(
+            session_id="interactive-no-terminal",
+            incarnation="interactive-no-terminal-incarnation",
+        )))
+        with TestClient(self.app) as client:
+            response = client.get(
+                "/api/v1/pi/sessions",
+                params={"include_attach_info": "true"},
+                headers={"x-forwarded-proto": "https"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        rows = {row["id"]: row for row in response.json()}
+        self.assertTrue(rows["attach-child"]["attach_info"]["attachable"])
+        self.assertEqual(
+            rows["attach-child"]["attach_info"]["direct_websocket_url"],
+            "ws://100.64.0.89:27888/v1/sessions/attach-child/attach",
+        )
+        self.assertEqual(
+            rows["attach-child"]["attach_info"]["gateway_websocket_url"],
+            "wss://testserver/api/v1/pi/sessions/attach-child/attach-gateway",
+        )
+        self.assertTrue(rows["interactive-terminal"]["attach_info"]["attachable"])
+        self.assertFalse(rows["interactive-no-terminal"]["attach_info"]["attachable"])
+        self.assertIn(
+            "host relay",
+            rows["interactive-no-terminal"]["attach_info"]["reason"],
+        )
+
+    def test_session_list_default_shape_does_not_include_attach_info(self):
+        asyncio.run(self.db.register_interactive_pi_session(PiBridgeRegister(
+            session_id="plain-list-shape",
+            incarnation="plain-list-incarnation",
+        )))
+        with TestClient(self.app) as client:
+            response = client.get("/api/v1/pi/sessions")
+        self.assertEqual(response.status_code, 200, response.text)
+        row = next(item for item in response.json() if item["id"] == "plain-list-shape")
+        self.assertNotIn("attach_info", row)
+
     def test_gateway_url_dimensions_preserve_existing_query(self):
         self.assertEqual(
             _terminal_url_with_dimensions("ws://relay/attach?token=x", 52, 188),

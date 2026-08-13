@@ -448,15 +448,21 @@ class PiCliTests(unittest.TestCase):
         }, loopback=True)
         attach_loop.assert_not_awaited()
 
-    def test_attach_picker_filters_non_attachable_sessions(self):
-        rows = [self._session(), {**self._session(), "id": "offline"}]
-        request = AsyncMock(side_effect=[
-            {"session_id": "interactive-session-id", "attachable": True},
-            {"session_id": "offline", "attachable": False, "reason": "relay offline"},
-        ])
-        with patch.object(pi, "_request", new=request):
-            selected = asyncio.run(pi._attachable_candidates(rows))
+    def test_attach_picker_filters_batched_attachability_snapshot(self):
+        rows = [
+            {**self._session(), "attach_info": {"attachable": True}},
+            {
+                **self._session(),
+                "id": "offline",
+                "attach_info": {"attachable": False, "reason": "relay offline"},
+            },
+        ]
+        selected = asyncio.run(pi._attachable_candidates(rows))
         self.assertEqual([row["id"] for row in selected], ["interactive-session-id"])
+
+    def test_attach_picker_fails_closed_when_snapshot_lacks_attach_info(self):
+        with self.assertRaisesRegex(RuntimeError, "did not include attachment information"):
+            asyncio.run(pi._attachable_candidates([self._session()]))
 
     def test_attach_picker_maps_full_fzf_row_back_to_session(self):
         rows = [self._session(), {**self._session(), "id": "second", "name": "other"}]
@@ -563,15 +569,18 @@ class PiCliTests(unittest.TestCase):
     def test_attach_cycles_to_next_available_session(self):
         first = {**self._session(), "id": "first"}
         second = {**self._session(), "id": "second", "name": "second-agent"}
+        inventory = [
+            {**first, "attach_info": {"attachable": True}},
+            {**second, "attach_info": {"attachable": True}},
+        ]
         request = AsyncMock(side_effect=[
-            [first, second],
+            inventory,
             {
                 "attachable": True,
                 "protocol_version": 2,
                 "websocket_url": "ws://relay/first",
             },
-            [first, second],
-            {"attachable": True},
+            inventory,
             {
                 "attachable": True,
                 "protocol_version": 2,
@@ -591,14 +600,28 @@ class PiCliTests(unittest.TestCase):
             ["ws://relay/first", "ws://relay/second"],
         )
 
+    def test_cycle_anchors_on_current_session_when_it_becomes_unavailable(self):
+        first = {**self._session(), "id": "first"}
+        current = {**self._session(), "id": "current"}
+        third = {**self._session(), "id": "third"}
+        inventory = [
+            {**first, "attach_info": {"attachable": True}},
+            {**current, "attach_info": {"attachable": False, "reason": "relay offline"}},
+            {**third, "attach_info": {"attachable": True}},
+        ]
+        with patch.object(pi, "_candidate_inventory", new=AsyncMock(return_value=inventory)):
+            next_session = asyncio.run(pi._cycle_session("current", "next"))
+            previous_session = asyncio.run(pi._cycle_session("current", "previous"))
+        self.assertEqual(next_session["id"], "third")
+        self.assertEqual(previous_session["id"], "first")
+
     def test_replacement_returns_attachment_window_to_picker(self):
         first = {**self._session(), "id": "first"}
         second = {**self._session(), "id": "second", "name": "second-agent"}
         request = AsyncMock(side_effect=[
-            [first],
+            [{**first, "attach_info": {"attachable": True}}],
             {"attachable": True, "protocol_version": 2, "websocket_url": "ws://relay/first"},
-            [second],
-            {"attachable": True},
+            [{**second, "attach_info": {"attachable": True}}],
             {"attachable": True, "protocol_version": 2, "websocket_url": "ws://relay/second"},
         ])
         terminal = AsyncMock(side_effect=["select", None])
@@ -618,9 +641,9 @@ class PiCliTests(unittest.TestCase):
     def test_relative_attach_can_focus_the_next_local_session(self):
         first = {**self._session(), "id": "first"}
         second = {**self._session(), "id": "second"}
-        request = AsyncMock(side_effect=[
-            [first, second],
-            {"attachable": True},
+        request = AsyncMock(return_value=[
+            {**first, "attach_info": {"attachable": True}},
+            {**second, "attach_info": {"attachable": True}},
         ])
         focus = AsyncMock(return_value=True)
         with (
@@ -670,7 +693,9 @@ class PiCliTests(unittest.TestCase):
             result = self.runner.invoke(pi.app, ["attach", "repo-agent", "--stream"])
         self.assertEqual(result.exit_code, 0, result.output)
         focus.assert_awaited_once_with("interactive-session-id")
-        request.assert_awaited_once_with("GET", "/api/v1/pi/sessions")
+        request.assert_awaited_once_with(
+            "GET", "/api/v1/pi/sessions?include_attach_info=true"
+        )
         terminal.assert_not_awaited()
 
     def test_resume_refuses_active_exact_id_before_target_history_lookup(self):

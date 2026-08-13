@@ -53,7 +53,7 @@ Four new modules + one edit set, integrated into the existing `serve` /
                 ┌──────────────────────────────┐
    Agent ──HTTP─►  FastAPI (heartbeat.py)      │
                 │                              │
-                │  ┌─ RateLimit (per agent)    │  ← 60 req/min, burst 10
+                │  ┌─ RateLimit (per agent)    │  ← 60 req/min, burst 50
                 │  │                           │
                 │  ├─ Cache (TTL, per route)   │  ← 5s for workers_list
                 │  │                           │
@@ -205,7 +205,7 @@ class TokenBucket:
     def try_consume(self, n: int = 1) -> bool
 
 class AgentRateLimiter:
-    def __init__(self, *, capacity=10, refill_rate=1.0): ...   # 60 req/min, burst 10
+    def __init__(self, *, capacity=50, refill_rate=1.0): ...   # 60 req/min sustained, burst 50
     def check(self, agent_name: str) -> None                  # raises RateLimited
     def stats() -> dict                                        # per-agent remaining + last-refill
 ```
