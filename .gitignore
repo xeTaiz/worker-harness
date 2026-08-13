@@ -11,3 +11,4 @@ dist/.env
 /worker-harness-worker.sif
 /worker-harness-giga-wh.sif
 /.pi-subagents/
+/zellij_plugins/wh-tab-bar/target
