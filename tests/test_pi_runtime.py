@@ -86,6 +86,30 @@ class PiRuntimeTests(unittest.TestCase):
             ),
         )
 
+    def test_first_window_on_older_tmux_uses_xterm_extended_keys(self):
+        completed = subprocess.CompletedProcess([], 0, "%7\n", "")
+        with tempfile.TemporaryDirectory() as directory:
+            socket = Path(directory) / "pi-tmux.sock"
+            with (
+                patch.object(pi_runtime, "managed_tmux_socket_path", return_value=socket),
+                patch.object(pi_runtime, "_session_exists", return_value=False),
+                patch.object(pi_runtime, "_tmux_supports_csi_u", return_value=False),
+                patch.object(pi_runtime, "_configure_managed_server"),
+                patch.object(pi_runtime, "_run_tmux", return_value=completed) as run,
+            ):
+                pi_runtime.start_managed_pi(
+                    name="older-tmux",
+                    pi_args=[],
+                    cwd=Path(directory),
+                    session_id="abcdef12-0000-4000-8000-000000000001",
+                    executable="/usr/bin/pi",
+                )
+        args = next(call.args for call in run.call_args_list if "new-session" in call.args)
+        new_session_index = args.index("new-session")
+        self.assertLess(args.index("extended-keys"), new_session_index)
+        self.assertNotIn("extended-keys-format", args)
+        self.assertNotIn(pi_runtime.MANAGED_TMUX_EXTENDED_KEYS_FORMAT, args)
+
     def test_first_window_creates_owner_session_with_initial_dimensions(self):
         completed = subprocess.CompletedProcess([], 0, "%7\n", "")
         with tempfile.TemporaryDirectory() as directory:
@@ -93,6 +117,7 @@ class PiRuntimeTests(unittest.TestCase):
             with (
                 patch.object(pi_runtime, "managed_tmux_socket_path", return_value=socket),
                 patch.object(pi_runtime, "_session_exists", return_value=False),
+                patch.object(pi_runtime, "_tmux_supports_csi_u", return_value=True),
                 patch.object(pi_runtime, "_configure_managed_server") as configure,
                 patch.object(pi_runtime, "_run_tmux", return_value=completed) as run,
             ):
@@ -117,6 +142,9 @@ class PiRuntimeTests(unittest.TestCase):
         new_session_index = args.index("new-session")
         self.assertEqual(args[1], "start-server")
         self.assertLess(args.index("mouse"), new_session_index)
+        self.assertLess(args.index("extended-keys"), new_session_index)
+        self.assertLess(args.index("extended-keys-format"), new_session_index)
+        self.assertLess(args.index(pi_runtime.MANAGED_TMUX_EXTENDED_KEYS_FORMAT), new_session_index)
         self.assertLess(args.index("history-limit"), new_session_index)
         self.assertLess(args.index(str(pi_runtime.MANAGED_TMUX_HISTORY_LIMIT)), new_session_index)
         configure.assert_called_once_with(socket)
@@ -196,12 +224,23 @@ class PiRuntimeTests(unittest.TestCase):
 
     def test_managed_server_configures_global_and_owner_options(self):
         completed = subprocess.CompletedProcess([], 0, "", "")
-        with patch.object(pi_runtime, "_run_tmux", return_value=completed) as run:
+        with (
+            patch.object(pi_runtime, "_tmux_supports_csi_u", return_value=True),
+            patch.object(pi_runtime, "_run_tmux", return_value=completed) as run,
+        ):
             pi_runtime._configure_managed_server(Path("/tmp/pi.sock"))
         commands = [call.args[1:] for call in run.call_args_list]
         history_limit = str(pi_runtime.MANAGED_TMUX_HISTORY_LIMIT)
         self.assertIn(("set-option", "-g", "status", "off"), commands)
         self.assertIn(("set-option", "-g", "mouse", "on"), commands)
+        self.assertIn(("set-option", "-g", "extended-keys", "on"), commands)
+        self.assertIn(
+            (
+                "set-option", "-g", "extended-keys-format",
+                pi_runtime.MANAGED_TMUX_EXTENDED_KEYS_FORMAT,
+            ),
+            commands,
+        )
         self.assertIn(("set-option", "-g", "history-limit", history_limit), commands)
         self.assertIn(
             ("set-option", "-t", pi_runtime.MANAGED_TMUX_SESSION, "status", "off"),
@@ -225,6 +264,90 @@ class PiRuntimeTests(unittest.TestCase):
             ("set-option", "-t", pi_runtime.MANAGED_TMUX_SESSION, "window-size", "latest"),
             commands,
         )
+
+    def test_managed_server_uses_xterm_extended_keys_on_older_tmux(self):
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            patch.object(pi_runtime, "_tmux_supports_csi_u", return_value=False),
+            patch.object(pi_runtime, "_run_tmux", return_value=completed) as run,
+        ):
+            pi_runtime._configure_managed_server(Path("/tmp/pi.sock"))
+        commands = [call.args[1:] for call in run.call_args_list]
+        self.assertIn(("set-option", "-g", "extended-keys", "on"), commands)
+        self.assertFalse(any("extended-keys-format" in command for command in commands))
+
+    def test_tmux_csi_u_support_requires_version_3_5(self):
+        for version, supported in (
+            ("tmux 3.2a\n", False),
+            ("tmux 3.4\n", False),
+            ("tmux 3.5\n", True),
+            ("tmux 3.6a\n", True),
+            ("unexpected\n", False),
+        ):
+            with self.subTest(version=version), patch.object(
+                pi_runtime.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, version, ""),
+            ), patch.object(pi_runtime, "_tmux_executable", return_value="tmux"), patch.object(
+                pi_runtime, "_tmux_environment", return_value={}
+            ):
+                self.assertEqual(pi_runtime._tmux_supports_csi_u(), supported)
+
+    def test_real_tmux_accepts_managed_extended_key_options(self):
+        executable = pi_runtime.shutil.which("tmux")
+        if not executable:
+            self.skipTest("tmux is not installed")
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            pi_runtime, "_host_runtime", return_value=None
+        ):
+            socket = Path(directory) / "pi.sock"
+            created = subprocess.run(
+                [
+                    executable,
+                    "-f", "/dev/null", "-S", str(socket),
+                    "new-session", "-d", "-s", pi_runtime.MANAGED_TMUX_SESSION,
+                    "sleep 30",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            try:
+                pi_runtime._configure_managed_server(socket)
+                extended = subprocess.run(
+                    [executable, "-S", str(socket), "show", "-gv", "extended-keys"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(extended.returncode, 0, extended.stderr)
+                self.assertEqual(extended.stdout.strip(), "on")
+                if pi_runtime._tmux_supports_csi_u():
+                    key_format = subprocess.run(
+                        [
+                            executable, "-S", str(socket), "show", "-gv",
+                            "extended-keys-format",
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(key_format.returncode, 0, key_format.stderr)
+                    self.assertEqual(
+                        key_format.stdout.strip(),
+                        pi_runtime.MANAGED_TMUX_EXTENDED_KEYS_FORMAT,
+                    )
+            finally:
+                subprocess.run(
+                    [executable, "-S", str(socket), "kill-server"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
 
     def test_tmux_command_ignores_user_configuration(self):
         command = pi_runtime._tmux_command(Path("/tmp/pi.sock"), "has-session")

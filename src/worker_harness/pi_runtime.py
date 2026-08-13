@@ -21,8 +21,10 @@ from urllib.parse import quote
 
 MANAGED_TMUX_SESSION = "wh-pi"
 MANAGED_TMUX_HISTORY_LIMIT = 50_000
+MANAGED_TMUX_EXTENDED_KEYS_FORMAT = "csi-u"
 _ROUTE_POLL_SECONDS = 0.1
 _PANE_ID = re.compile(r"^%\d+$")
+_TMUX_VERSION = re.compile(r"^tmux (\d+)\.(\d+)")
 _CONFLICTING_PI_OPTIONS = {
     "--session",
     "--session-id",
@@ -170,6 +172,26 @@ def _tmux_command(socket: Path, *args: str) -> list[str]:
     return [_tmux_executable(), "-f", "/dev/null", "-S", str(socket), *args]
 
 
+def _tmux_supports_csi_u() -> bool:
+    try:
+        result = subprocess.run(
+            [_tmux_executable(), "-V"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5.0,
+            check=False,
+            env=_tmux_environment(),
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    match = _TMUX_VERSION.match(result.stdout.strip())
+    return result.returncode == 0 and match is not None and tuple(
+        int(part) for part in match.groups()
+    ) >= (3, 5)
+
+
 def _run_tmux(
     socket: Path,
     *args: str,
@@ -228,8 +250,18 @@ def _configure_managed_server(socket: Path) -> None:
     # This server is exclusively Worker Harness-owned. Keep managed defaults
     # isolated from the user's tmux configuration, then reinforce the options
     # that attached clients depend on directly on the owner session.
+    supports_csi_u = _tmux_supports_csi_u()
     _run_tmux(socket, "set-option", "-g", "status", "off")
     _run_tmux(socket, "set-option", "-g", "mouse", "on")
+    _run_tmux(socket, "set-option", "-g", "extended-keys", "on")
+    if supports_csi_u:
+        _run_tmux(
+            socket,
+            "set-option",
+            "-g",
+            "extended-keys-format",
+            MANAGED_TMUX_EXTENDED_KEYS_FORMAT,
+        )
     _run_tmux(
         socket,
         "set-option",
@@ -330,6 +362,17 @@ def start_managed_pi(
         # server, before the first pane is allocated. In particular, tmux fixes
         # a pane's history limit at creation time, so configuring it after
         # new-session would leave the first managed Pi at the 2,000-line default.
+        extended_keys_format = (
+            [
+                "set-option",
+                "-g",
+                "extended-keys-format",
+                MANAGED_TMUX_EXTENDED_KEYS_FORMAT,
+                ";",
+            ]
+            if _tmux_supports_csi_u()
+            else []
+        )
         created = _run_tmux(
             socket,
             "start-server",
@@ -344,6 +387,12 @@ def start_managed_pi(
             "mouse",
             "on",
             ";",
+            "set-option",
+            "-g",
+            "extended-keys",
+            "on",
+            ";",
+            *extended_keys_format,
             "set-option",
             "-g",
             "history-limit",
