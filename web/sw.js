@@ -1,6 +1,6 @@
-const CACHE = "wh-pi-shell-v11";
+const CACHE = "wh-pi-shell-v15";
 const SHELL = [
-  "/", "/index.html", "/app.css", "/app.js", "/manifest.webmanifest", "/icon.svg", "/icon-maskable.svg",
+  "/", "/index.html", "/app.css?v=15", "/app.js?v=15", "/manifest.webmanifest", "/icon.svg", "/icon-maskable.svg",
   "/vendor/marked/marked.umd.js", "/vendor/dompurify/purify.min.js",
   "/vendor/katex/katex.min.js", "/vendor/katex/auto-render.min.js", "/vendor/katex/katex.min.css",
 ];

@@ -5,29 +5,18 @@ const detailView = $("#session-detail-view");
 const sessionList = $("#session-list");
 const emptyState = $("#empty-state");
 const transcript = $("#transcript");
-const meta = $("#session-meta");
 const sessionControls = $("#session-controls");
-const sessionModes = $("#session-modes");
-const transcriptMode = $("#transcript-mode");
-const terminalMode = $("#terminal-mode");
-const terminalPanel = $("#terminal-panel");
-const terminalOutput = $("#terminal-output");
-const terminalStatus = $("#terminal-status");
-const terminalReconnect = $("#terminal-reconnect");
-const terminalDisconnect = $("#terminal-disconnect");
-const terminalComposer = $("#terminal-composer");
-const terminalInput = $("#terminal-input");
 const modelControl = $("#model-control");
 const thinkingControl = $("#thinking-control");
 const controlStatus = $("#control-status");
-const backButton = $("#back");
 const refreshButton = $("#refresh");
 const title = $("#page-title");
 const subtitle = $("#page-subtitle");
-const sessionSwitcher = $("#session-switcher");
-const sessionPicker = $("#session-picker");
-const previousSession = $("#previous-session");
-const nextSession = $("#next-session");
+const agentSidebar = $("#agent-sidebar");
+const sidebarToggle = $("#sidebar-toggle");
+const sidebarClose = $("#sidebar-close");
+const sidebarBackdrop = $("#sidebar-backdrop");
+const mobileSidebar = window.matchMedia("(max-width: 759px)");
 const connectionDot = $("#connection-dot");
 const composer = $("#composer");
 const messageInput = $("#message");
@@ -58,18 +47,8 @@ const state = {
   items: new Map(),
   expanded: new Set(),
   settings: null,
-  attachInfo: null,
-  terminalSocket: null,
-  terminalCells: [[]],
-  terminalRow: 0,
-  terminalCol: 0,
-  terminalRows: 24,
-  terminalCols: 80,
-  terminalPending: "",
-  terminalSavedCursor: [0, 0],
-  terminalDecoder: new TextDecoder(),
-  viewMode: "transcript",
   navigation: 0,
+  sidebarOpen: false,
   showHistory: false,
   followLatest: true,
   installPrompt: null,
@@ -79,6 +58,8 @@ const state = {
   globalOpen: false,
   globalExpanded: new Set(),
   globalRenderTimer: null,
+  globalLoading: false,
+  globalGeneration: 0,
 };
 
 function node(tag, className, text) {
@@ -117,17 +98,6 @@ function isInternalSession(session) {
 
 function isHistoricalSession(session) {
   return ["stopped", "failed", "termination_unknown"].includes(session.state);
-}
-
-function switchableSessions() {
-  const sessions = state.sessions.filter((session) => !isInternalSession(session) && !isHistoricalSession(session));
-  if (state.selected && !isInternalSession(state.selected) && !sessions.some((session) => session.id === state.selected.id)) {
-    sessions.push(state.selected);
-  }
-  return sessions.sort((left, right) => {
-    const byLabel = sessionLabel(left).localeCompare(sessionLabel(right));
-    return byLabel || left.id.localeCompare(right.id);
-  });
 }
 
 async function api(path, options = {}) {
@@ -190,10 +160,16 @@ function renderSessionList() {
     historyToggle,
   );
   emptyState.classList.toggle("hidden", visible.length !== 0);
+  globalButton.classList.toggle("active", state.globalOpen);
+  globalButton.setAttribute("aria-current", state.globalOpen ? "page" : "false");
   for (const session of visible) {
-    const card = node("button", "session-card");
+    const card = node("button", `session-card${session.id === state.selected?.id ? " active" : ""}`);
     card.type = "button";
-    card.addEventListener("click", () => { location.hash = `session/${encodeURIComponent(session.id)}`; });
+    if (session.id === state.selected?.id) card.setAttribute("aria-current", "page");
+    card.addEventListener("click", () => {
+      setSidebarOpen(false);
+      location.hash = `session/${encodeURIComponent(session.id)}`;
+    });
     const head = node("div", "session-card-head");
     head.append(
       node("span", `state-dot ${session.state}`),
@@ -229,20 +205,28 @@ function globalInteractiveSessions() {
 
 function renderRouterControls() {
   const config = state.globalSnapshot?.config;
+  const selected = `${config?.provider || ""}::${config?.model || ""}`;
   routerModel.replaceChildren();
   for (const model of state.globalModels) {
     const option = node("option", "", `${model.name || model.id} · ${model.provider}`);
     option.value = `${model.provider}::${model.id}`;
-    option.selected = option.value === `${config?.provider}::${config?.model}`;
+    option.selected = option.value === selected;
     routerModel.append(option);
   }
-  if (config && !routerModel.value) {
+  if (config && ![...routerModel.options].some((option) => option.value === selected)) {
     const option = node("option", "", `${config.model} · ${config.provider}`);
-    option.value = `${config.provider}::${config.model}`;
+    option.value = selected;
     option.selected = true;
     routerModel.prepend(option);
   }
+  if (!routerModel.options.length) {
+    const option = node("option", "", "Models unavailable");
+    option.value = "";
+    routerModel.append(option);
+  }
+  routerModel.disabled = !state.globalModels.length;
   routerThinking.value = config?.thinking_level || "off";
+  routerThinking.disabled = !config;
   const latest = state.globalSnapshot?.latest_route;
   routerLatency.textContent = latest?.latency_ms
     ? `${latest.model} · ${latest.thinking_level} · ${latest.latency_ms} ms`
@@ -251,7 +235,7 @@ function renderRouterControls() {
 
 function renderGlobalTarget() {
   const selected = globalTarget.value;
-  globalTarget.replaceChildren(node("option", "", "Auto"));
+  globalTarget.replaceChildren(node("option", "", "Auto · choose semantically"));
   globalTarget.firstElementChild.value = "";
   for (const session of globalInteractiveSessions()) {
     const option = node("option", "", `${sessionLabel(session)} · ${session.host || "local"} · ${session.state}`);
@@ -264,6 +248,10 @@ function renderGlobalTarget() {
 function renderGlobal({ controls = true } = {}) {
   if (!state.globalSnapshot) return;
   const sessions = globalInteractiveSessions();
+  const activeIds = new Set(sessions.map((session) => session.id));
+  for (const id of state.globalExpanded) {
+    if (!activeIds.has(id)) state.globalExpanded.delete(id);
+  }
   if (controls) {
     renderRouterControls();
     renderGlobalTarget();
@@ -271,8 +259,8 @@ function renderGlobal({ controls = true } = {}) {
   globalRoster.replaceChildren();
   globalTurns.replaceChildren();
   if (!sessions.length) {
-    globalRoster.append(node("p", "empty-transcript", "No active interactive sessions."));
-    globalTurns.append(node("p", "empty-transcript", "Start Pi with the bridge to populate Global."));
+    globalRoster.append(node("p", "global-empty", "No active interactive sessions."));
+    globalTurns.append(node("p", "global-empty", "Start Pi with the bridge to populate Global."));
     return;
   }
   for (const session of sessions) {
@@ -280,22 +268,24 @@ function renderGlobal({ controls = true } = {}) {
     const identity = node("button", "global-agent-identity");
     identity.type = "button";
     identity.addEventListener("click", () => { location.hash = `session/${encodeURIComponent(session.id)}`; });
-    const titleRow = node("div", "global-agent-title");
-    titleRow.append(
+    const heading = node("div", "global-agent-title");
+    heading.append(
       node("span", `state-dot ${session.state}`),
       node("strong", "", sessionLabel(session)),
       node("span", "global-agent-host", session.host || "local"),
     );
-    const latest = String(session.latest_user_prompt || "No prompt captured yet");
-    identity.append(titleRow, node("p", "global-agent-prompt", latest.slice(-240)));
-    const badges = node("div", "global-agent-actions");
-    if (session.current_tool) badges.append(node("span", "tool-badge active", session.current_tool));
-    if (session.has_pending_messages) badges.append(node("span", "queued-badge", "queued"));
+    identity.append(heading, node("p", "global-agent-prompt", String(session.latest_user_prompt || "No prompt captured yet").slice(-240)));
+    const actions = node("div", "global-agent-actions");
+    if (session.current_tool) actions.append(node("span", "tool-badge active", session.current_tool));
+    for (const tool of (session.recent_tools || []).filter((tool) => tool !== session.current_tool).slice(0, 2)) {
+      actions.append(node("span", "tool-badge", tool));
+    }
+    if (session.has_pending_messages) actions.append(node("span", "queued-badge", "queued"));
     if (session.state === "working" || session.has_pending_messages) {
       const interrupt = node("button", "interrupt-button", "Interrupt");
       interrupt.type = "button";
-      interrupt.addEventListener("click", () => interruptSession(session.id));
-      badges.append(interrupt);
+      interrupt.addEventListener("click", () => void interruptSession(session.id));
+      actions.append(interrupt);
     }
     const sendHere = node("button", "send-here-button", "Send here");
     sendHere.type = "button";
@@ -303,12 +293,14 @@ function renderGlobal({ controls = true } = {}) {
       globalTarget.value = session.id;
       globalMessage.focus();
     });
-    badges.append(sendHere);
-    row.append(identity, badges);
+    actions.append(sendHere);
+    row.append(identity, actions);
     globalRoster.append(row);
   }
 
-  const ordered = [...sessions].sort((a, b) => (b.last_user_at || b.updated_at) - (a.last_user_at || a.updated_at));
+  const ordered = [...sessions]
+    .sort((a, b) => (b.last_user_at || b.updated_at || 0) - (a.last_user_at || a.updated_at || 0))
+    .slice(0, 24);
   for (const session of ordered) {
     const card = node("details", "global-turn-card");
     card.open = state.globalExpanded.has(session.id);
@@ -324,11 +316,10 @@ function renderGlobal({ controls = true } = {}) {
     const tools = node("div", "global-turn-tools");
     for (const tool of (session.recent_tools || []).slice(0, 3)) tools.append(node("span", "tool-badge", tool));
     if (session.current_tool) tools.append(node("span", "tool-badge active", `${session.current_tool} running`));
-    const metaRow = node("span", "global-turn-meta", `${relativeTime(session.last_user_at || session.updated_at)} · Expand`);
-    summary.append(heading, prompt, output, tools, metaRow);
-    card.append(summary);
-    const actions = node("div", "global-turn-expanded");
-    const open = node("button", "send-here-button", "Open full transcript");
+    const time = session.last_user_at || session.updated_at;
+    summary.append(heading, prompt, output, tools, node("span", "global-turn-meta", `${relativeTime(time)} · Expand`));
+    const expanded = node("div", "global-turn-expanded");
+    const open = node("button", "send-here-button", "Open transcript");
     open.type = "button";
     open.addEventListener("click", () => { location.hash = `session/${encodeURIComponent(session.id)}`; });
     const reply = node("button", "send-here-button", "Reply here");
@@ -337,8 +328,8 @@ function renderGlobal({ controls = true } = {}) {
       globalTarget.value = session.id;
       globalMessage.focus();
     });
-    actions.append(open, reply);
-    card.append(actions);
+    expanded.append(open, reply);
+    card.append(summary, expanded);
     globalTurns.append(card);
   }
 }
@@ -351,21 +342,26 @@ function scheduleGlobalRender() {
   }, 200);
 }
 
+function eventMessageText(payload) {
+  const message = payload.message || {};
+  return Array.isArray(message.content)
+    ? message.content.filter((block) => block?.type === "text").map((block) => String(block.text || "")).join("\n")
+    : "";
+}
+
 function applyGlobalEvent(sessionId, event) {
   const session = globalInteractiveSessions().find((item) => item.id === sessionId);
   if (!session) return;
   session.cursor = Math.max(Number(session.cursor) || 0, Number(event.sequence) || 0);
   const payload = event.payload || {};
   if (event.event_type === "message-end") {
-    const message = payload.message || {};
-    const text = Array.isArray(message.content)
-      ? message.content.filter((block) => block?.type === "text").map((block) => String(block.text || "")).join("\n")
-      : "";
-    if (message.role === "user" && text) {
+    const role = payload.message?.role;
+    const text = eventMessageText(payload);
+    if (role === "user" && text) {
       session.latest_user_prompt = text.slice(-500);
       session.assistant_tail = "";
       session.last_user_at = event.created_at;
-    } else if (message.role === "assistant" && text) {
+    } else if (role === "assistant" && text) {
       session.assistant_tail = text.slice(-1200);
     }
   } else if (event.event_type === "message-delta") {
@@ -399,26 +395,52 @@ function connectGlobalSources() {
   for (const session of globalInteractiveSessions()) {
     if (state.globalSources.has(session.id)) continue;
     const source = new EventSource(`/api/v1/pi/sessions/${encodeURIComponent(session.id)}/stream?after=${session.cursor || 0}`);
-    source.addEventListener("pi-event", (event) => {
-      try { applyGlobalEvent(session.id, JSON.parse(event.data)); } catch { /* malformed event */ }
+    source.addEventListener("pi-event", (incoming) => {
+      try { applyGlobalEvent(session.id, JSON.parse(incoming.data)); } catch { /* malformed event */ }
     });
     state.globalSources.set(session.id, source);
   }
 }
 
 async function loadGlobalSnapshot({ quiet = false } = {}) {
-  if (!quiet) setConnection("connecting");
+  if (state.globalLoading || !state.globalOpen) return;
+  const generation = state.globalGeneration;
+  state.globalLoading = true;
+  if (!quiet) {
+    setConnection("connecting");
+    globalStatus.textContent = "Loading Global…";
+  }
   try {
-    state.globalSnapshot = await api("/api/v1/pi/router/snapshot");
-    if (!state.globalModels.length) {
-      try { state.globalModels = (await api("/api/v1/pi/router/models")).models || []; } catch { /* sidecar may be offline */ }
+    const snapshot = await api("/api/v1/pi/router/snapshot");
+    if (!state.globalOpen || generation !== state.globalGeneration) return;
+    const existing = new Map(globalInteractiveSessions().map((session) => [session.id, session]));
+    snapshot.sessions = (Array.isArray(snapshot.sessions) ? snapshot.sessions : []).slice(0, 64).map((session) => {
+      const prior = existing.get(session.id);
+      return prior ? { ...prior, ...session, cursor: Math.max(Number(prior.cursor) || 0, Number(session.cursor) || 0) } : session;
+    });
+    state.globalSnapshot = snapshot;
+    try {
+      const models = await api("/api/v1/pi/router/models");
+      if (!state.globalOpen || generation !== state.globalGeneration) return;
+      state.globalModels = Array.isArray(models.models) ? models.models.slice(0, 256) : [];
+    } catch {
+      if (!state.globalOpen || generation !== state.globalGeneration) return;
+      state.globalModels = [];
     }
     renderGlobal();
     connectGlobalSources();
     setConnection("online");
+    if (!quiet) globalStatus.textContent = "";
   } catch (error) {
+    if (!state.globalOpen || generation !== state.globalGeneration) return;
     setConnection("offline");
     globalStatus.textContent = `Global unavailable: ${error.message}`;
+    if (!state.globalSnapshot) {
+      globalRoster.replaceChildren(node("p", "global-empty", "The semantic router is unavailable."));
+      globalTurns.replaceChildren();
+    }
+  } finally {
+    if (generation === state.globalGeneration) state.globalLoading = false;
   }
 }
 
@@ -434,24 +456,32 @@ async function interruptSession(sessionId) {
 async function openGlobal() {
   state.navigation += 1;
   closeStream();
-  disconnectTerminal();
   state.selected = null;
-  state.globalOpen = true;
+  if (!state.globalOpen) {
+    state.globalOpen = true;
+    state.globalGeneration += 1;
+  }
   listView.classList.add("hidden");
   detailView.classList.add("hidden");
   globalView.classList.remove("hidden");
-  backButton.classList.remove("hidden");
-  sessionSwitcher.classList.add("hidden");
-  refreshButton.classList.add("hidden");
+  document.body.classList.add("global-open");
   document.body.classList.remove("session-open");
   title.textContent = "Global";
-  subtitle.textContent = "Semantic router";
+  subtitle.textContent = "Semantic dispatcher · interactive sessions";
+  globalButton.classList.add("active");
+  globalButton.setAttribute("aria-current", "page");
+  if (mobileSidebar.matches) setSidebarOpen(false);
   await loadGlobalSnapshot();
 }
 
 function closeGlobal() {
   state.globalOpen = false;
+  state.globalLoading = false;
+  state.globalGeneration += 1;
   globalView.classList.add("hidden");
+  document.body.classList.remove("global-open");
+  globalButton.classList.remove("active");
+  globalButton.setAttribute("aria-current", "false");
   closeGlobalSources();
   if (state.globalRenderTimer) clearTimeout(state.globalRenderTimer);
   state.globalRenderTimer = null;
@@ -460,338 +490,25 @@ function closeGlobal() {
 function renderSessionHeader() {
   if (!state.selected) return;
   title.textContent = sessionLabel(state.selected);
-  subtitle.textContent = `${state.selected.session_type} · ${state.selected.state.replaceAll("_", " ")}`;
-  meta.replaceChildren();
-  for (const value of [state.selected.host, state.selected.cwd, state.selected.worker_id && `worker ${state.selected.worker_id.slice(0, 8)}`].filter(Boolean)) {
-    meta.append(node("span", "meta-chip", value));
+  subtitle.replaceChildren();
+  const context = [state.selected.host, state.selected.cwd].filter(Boolean);
+  if (context.length === 0) context.push(`${state.selected.session_type} · ${state.selected.state.replaceAll("_", " ")}`);
+  for (const [index, value] of context.entries()) {
+    if (index) subtitle.append(document.createTextNode(" · "));
+    subtitle.append(node("span", index === 0 ? "header-host" : "header-cwd", value));
   }
-  renderSessionSwitcher();
   renderSessionControls();
+  renderSessionList();
 }
 
-function renderSessionSwitcher() {
-  if (!state.selected) return;
-  const sessions = switchableSessions();
-  sessionPicker.replaceChildren();
-  for (const session of sessions) {
-    const option = node(
-      "option",
-      "",
-      `${sessionLabel(session)} · ${session.state.replaceAll("_", " ")} · ${session.id.slice(0, 6)}`,
-    );
-    option.value = session.id;
-    option.selected = session.id === state.selected.id;
-    sessionPicker.append(option);
-  }
-  previousSession.disabled = sessions.length < 2;
-  nextSession.disabled = sessions.length < 2;
-}
-
-function cycleSession(direction) {
-  if (!state.selected) return;
-  const sessions = switchableSessions();
-  if (sessions.length < 2) return;
-  const current = Math.max(0, sessions.findIndex((session) => session.id === state.selected.id));
-  const target = sessions[(current + direction + sessions.length) % sessions.length];
-  if (target) location.hash = `session/${encodeURIComponent(target.id)}`;
-}
-
-async function loadAttachInfo(sessionId) {
-  let info;
-  try {
-    info = await api(`/api/v1/pi/sessions/${encodeURIComponent(sessionId)}/attach-info`);
-  } catch (error) {
-    info = { attachable: false, reason: error.message };
-  }
-  if (state.selected?.id !== sessionId) return;
-  state.attachInfo = info;
-  const attachable = Boolean(state.attachInfo?.attachable);
-  sessionModes.classList.toggle("hidden", !attachable);
-  terminalMode.title = attachable ? "Attach directly to the worker terminal" : String(state.attachInfo?.reason || "Unavailable");
-}
-
-function setSessionMode(mode) {
-  const terminal = mode === "terminal" && state.attachInfo?.attachable;
-  state.viewMode = terminal ? "terminal" : "transcript";
-  transcript.classList.toggle("hidden", terminal);
-  terminalPanel.classList.toggle("hidden", !terminal);
-  composer.classList.toggle("hidden", terminal);
-  jumpLatest.classList.toggle("hidden", terminal || state.followLatest);
-  transcriptMode.classList.toggle("active", !terminal);
-  transcriptMode.setAttribute("aria-pressed", String(!terminal));
-  terminalMode.classList.toggle("active", terminal);
-  terminalMode.setAttribute("aria-pressed", String(terminal));
-  if (terminal) {
-    connectTerminal();
-    requestAnimationFrame(() => terminalOutput.focus());
-  }
-}
-
-function resetTerminalScreen(rows = state.terminalRows, cols = state.terminalCols) {
-  state.terminalRows = rows;
-  state.terminalCols = cols;
-  state.terminalCells = Array.from({ length: rows }, () => []);
-  state.terminalRow = 0;
-  state.terminalCol = 0;
-  state.terminalPending = "";
-  state.terminalSavedCursor = [0, 0];
-  terminalOutput.textContent = "";
-}
-
-function renderTerminalScreen() {
-  terminalOutput.textContent = state.terminalCells
-    .map((line) => line.join("").replace(/\s+$/, ""))
-    .join("\n")
-    .replace(/\n+$/, "");
-}
-
-function ensureTerminalLine(row = state.terminalRow) {
-  while (state.terminalCells.length <= row) state.terminalCells.push([]);
-  return state.terminalCells[row];
-}
-
-function terminalLineFeed() {
-  if (state.terminalRow >= state.terminalRows - 1) {
-    state.terminalCells.shift();
-    state.terminalCells.push([]);
-  } else {
-    state.terminalRow += 1;
-  }
-}
-
-function putTerminalCharacter(character) {
-  if (state.terminalCol >= state.terminalCols) {
-    state.terminalCol = 0;
-    terminalLineFeed();
-  }
-  const line = ensureTerminalLine();
-  while (line.length < state.terminalCol) line.push(" ");
-  line[state.terminalCol] = character;
-  state.terminalCol += 1;
-}
-
-function handleTerminalCsi(body, final) {
-  const privateMode = body.startsWith("?");
-  const clean = privateMode ? body.slice(1) : body;
-  const values = clean.split(";").map((value) => Number.parseInt(value, 10));
-  const value = (index = 0, fallback = 1) => Number.isFinite(values[index]) && values[index] !== 0 ? values[index] : fallback;
-  const clampCursor = () => {
-    state.terminalRow = Math.max(0, Math.min(state.terminalRows - 1, state.terminalRow));
-    state.terminalCol = Math.max(0, Math.min(state.terminalCols - 1, state.terminalCol));
-  };
-
-  if (final === "A") state.terminalRow -= value();
-  else if (final === "B") state.terminalRow += value();
-  else if (final === "C") state.terminalCol += value();
-  else if (final === "D") state.terminalCol -= value();
-  else if (final === "E") { state.terminalRow += value(); state.terminalCol = 0; }
-  else if (final === "F") { state.terminalRow -= value(); state.terminalCol = 0; }
-  else if (final === "G") state.terminalCol = value(0, 1) - 1;
-  else if (final === "d") state.terminalRow = value(0, 1) - 1;
-  else if (final === "H" || final === "f") {
-    state.terminalRow = value(0, 1) - 1;
-    state.terminalCol = value(1, 1) - 1;
-  } else if (final === "J") {
-    const mode = Number.isFinite(values[0]) ? values[0] : 0;
-    if (mode === 2 || mode === 3) {
-      state.terminalCells = Array.from({ length: state.terminalRows }, () => []);
-    } else if (mode === 0) {
-      ensureTerminalLine().splice(state.terminalCol);
-      for (let row = state.terminalRow + 1; row < state.terminalRows; row += 1) state.terminalCells[row] = [];
-    } else if (mode === 1) {
-      for (let row = 0; row < state.terminalRow; row += 1) state.terminalCells[row] = [];
-      ensureTerminalLine().fill(" ", 0, state.terminalCol + 1);
-    }
-  } else if (final === "K") {
-    const mode = Number.isFinite(values[0]) ? values[0] : 0;
-    const line = ensureTerminalLine();
-    if (mode === 0) line.splice(state.terminalCol);
-    else if (mode === 1) line.fill(" ", 0, state.terminalCol + 1);
-    else if (mode === 2) state.terminalCells[state.terminalRow] = [];
-  } else if (final === "P") {
-    ensureTerminalLine().splice(state.terminalCol, value());
-  } else if (final === "@") {
-    ensureTerminalLine().splice(state.terminalCol, 0, ...Array(value()).fill(" "));
-  } else if (final === "X") {
-    const line = ensureTerminalLine();
-    while (line.length < state.terminalCol + value()) line.push(" ");
-    line.fill(" ", state.terminalCol, state.terminalCol + value());
-  } else if (final === "s") {
-    state.terminalSavedCursor = [state.terminalRow, state.terminalCol];
-  } else if (final === "u") {
-    [state.terminalRow, state.terminalCol] = state.terminalSavedCursor;
-  }
-  // SGR colors and private mode changes are intentionally ignored; cursor and
-  // erase operations are retained so spinners and full-screen redraws update.
-  clampCursor();
-}
-
-function appendTerminalOutput(text) {
-  const input = state.terminalPending + text;
-  let index = 0;
-  while (index < input.length) {
-    const character = input[index];
-    if (character === "\x1b") {
-      if (index + 1 >= input.length) break;
-      const next = input[index + 1];
-      if (next === "[") {
-        let end = index + 2;
-        while (end < input.length && !(input.charCodeAt(end) >= 0x40 && input.charCodeAt(end) <= 0x7e)) end += 1;
-        if (end >= input.length) break;
-        handleTerminalCsi(input.slice(index + 2, end), input[end]);
-        index = end + 1;
-        continue;
-      }
-      if (next === "]") {
-        let end = index + 2;
-        while (end < input.length && input[end] !== "\x07" && !(input[end] === "\x1b" && input[end + 1] === "\\")) end += 1;
-        if (end >= input.length) break;
-        index = input[end] === "\x07" ? end + 1 : end + 2;
-        continue;
-      }
-      if (next === "(" || next === ")") {
-        if (index + 2 >= input.length) break;
-        index += 3;
-        continue;
-      }
-      if (next === "7") state.terminalSavedCursor = [state.terminalRow, state.terminalCol];
-      else if (next === "8") [state.terminalRow, state.terminalCol] = state.terminalSavedCursor;
-      else if (next === "c") resetTerminalScreen();
-      index += 2;
-      continue;
-    }
-    if (character === "\r") state.terminalCol = 0;
-    else if (character === "\n") terminalLineFeed();
-    else if (character === "\b") state.terminalCol = Math.max(0, state.terminalCol - 1);
-    else if (character === "\t") state.terminalCol = Math.min(state.terminalCols - 1, (Math.floor(state.terminalCol / 8) + 1) * 8);
-    else if (character >= " " && character !== "\x7f") putTerminalCharacter(character);
-    index += 1;
-  }
-  state.terminalPending = input.slice(index);
-  renderTerminalScreen();
-}
-
-function disconnectTerminal(reason = "Disconnected") {
-  const socket = state.terminalSocket;
-  state.terminalSocket = null;
-  if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, "client disconnect");
-  terminalStatus.textContent = reason;
-  terminalStatus.className = "";
-}
-
-function resizeTerminal() {
-  const rows = Math.min(1000, Math.max(8, Math.floor(terminalOutput.clientHeight / 18)));
-  const cols = Math.min(1000, Math.max(20, Math.floor(terminalOutput.clientWidth / 8)));
-  if (rows !== state.terminalRows || cols !== state.terminalCols) resetTerminalScreen(rows, cols);
-  const socket = state.terminalSocket;
-  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "resize", rows, cols }));
-}
-
-function terminalConnectionUrl(rawUrl) {
-  const url = new URL(rawUrl, window.location.href);
-  const rows = Math.min(1000, Math.max(8, Math.floor(terminalOutput.clientHeight / 18)));
-  const cols = Math.min(1000, Math.max(20, Math.floor(terminalOutput.clientWidth / 8)));
-  url.searchParams.set("rows", rows);
-  url.searchParams.set("cols", cols);
-  return url.toString();
-}
-
-function connectTerminal() {
-  if (!state.attachInfo?.attachable) return;
-  if (state.terminalSocket && state.terminalSocket.readyState <= WebSocket.OPEN) return;
-  const candidates = [
-    [state.attachInfo.gateway_websocket_url, "orchestrator gateway"],
-    [state.attachInfo.direct_websocket_url || state.attachInfo.websocket_url, "direct relay"],
-  ].filter(([url], index, rows) => url && rows.findIndex(([seen]) => seen === url) === index);
-  if (!candidates.length) return;
-
-  disconnectTerminal("Connecting…");
-  resetTerminalScreen();
-  state.terminalDecoder = new TextDecoder();
-  terminalStatus.className = "connecting";
-
-  const tryCandidate = (index) => {
-    const [rawUrl, transportLabel] = candidates[index];
-    const socket = new WebSocket(terminalConnectionUrl(rawUrl));
-    let opened = false;
-    let upstreamFailed = false;
-    let returnToSelector = false;
-    socket.binaryType = "arraybuffer";
-    state.terminalSocket = socket;
-    socket.addEventListener("open", () => {
-      if (state.terminalSocket !== socket) return;
-      opened = true;
-      terminalStatus.textContent = `Connected · ${transportLabel}`;
-      terminalStatus.className = "online";
-      resizeTerminal();
-    });
-    socket.addEventListener("message", async (event) => {
-      if (state.terminalSocket !== socket) return;
-      if (typeof event.data === "string") {
-        try {
-          const payload = JSON.parse(event.data);
-          if (payload.type === "status") {
-            if (payload.state === "replaced") {
-              returnToSelector = true;
-              terminalStatus.textContent = "Detached to make room for a newer attachment";
-              terminalStatus.className = "";
-              socket.close(1000, `${payload.state} acknowledged`);
-              setTimeout(() => {
-                if (state.terminalSocket === socket || state.terminalSocket === null) closeDetail();
-              }, 0);
-              return;
-            }
-            terminalStatus.textContent = `${payload.state || "connected"} · ${transportLabel}`;
-            terminalStatus.className = "online";
-          } else if (payload.type === "error") {
-            upstreamFailed = payload.code === "upstream_unavailable";
-            appendTerminalOutput(`\n[relay error: ${payload.detail || payload.message || payload.code || "unknown error"}]\n`);
-          }
-        } catch {
-          appendTerminalOutput(event.data);
-        }
-        return;
-      }
-      const bytes = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
-      appendTerminalOutput(state.terminalDecoder.decode(bytes, { stream: true }));
-    });
-    socket.addEventListener("close", (event) => {
-      if (state.terminalSocket !== socket) return;
-      state.terminalSocket = null;
-      if (!returnToSelector && index + 1 < candidates.length && (!opened || upstreamFailed)) {
-        terminalStatus.textContent = `Trying ${candidates[index + 1][1]}…`;
-        terminalStatus.className = "connecting";
-        tryCandidate(index + 1);
-        return;
-      }
-      if (event.code === 4410) {
-        terminalStatus.textContent = "Detached to make room for a newer attachment";
-        terminalStatus.className = "";
-        setTimeout(closeDetail, 0);
-        return;
-      }
-      terminalStatus.textContent = event.code === 1000 ? "Disconnected" : `Disconnected · code ${event.code}`;
-      terminalStatus.className = "";
-    });
-    socket.addEventListener("error", () => {
-      if (state.terminalSocket !== socket) return;
-      terminalStatus.textContent = "Connection failed";
-      terminalStatus.className = "error";
-    });
-  };
-
-  tryCandidate(0);
-}
-
-function sendTerminalInput(data) {
-  const socket = state.terminalSocket;
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    terminalStatus.textContent = "Not connected";
-    terminalStatus.className = "error";
-    return false;
-  }
-  socket.send(JSON.stringify({ type: "input", data }));
-  return true;
+function setSidebarOpen(open) {
+  state.sidebarOpen = Boolean(open);
+  agentSidebar.classList.toggle("open", state.sidebarOpen);
+  sidebarBackdrop.classList.toggle("hidden", !state.sidebarOpen);
+  sidebarToggle.setAttribute("aria-expanded", String(state.sidebarOpen));
+  sidebarToggle.setAttribute("aria-label", state.sidebarOpen ? "Hide agents" : "Show agents");
+  agentSidebar.inert = mobileSidebar.matches && !state.sidebarOpen;
+  document.body.classList.toggle("sidebar-open", state.sidebarOpen);
 }
 
 function renderSessionControls() {
@@ -821,21 +538,13 @@ async function openSession(id) {
   closeStream();
   listView.classList.add("hidden");
   detailView.classList.remove("hidden");
-  backButton.classList.remove("hidden");
-  sessionSwitcher.classList.remove("hidden");
   document.body.classList.add("session-open");
-  refreshButton.classList.add("hidden");
   transcript.replaceChildren(node("div", "empty-transcript", "Loading durable session history…"));
   state.cursor = 0;
   state.timeline = [];
   state.items.clear();
   state.expanded.clear();
   state.settings = null;
-  state.attachInfo = null;
-  resetTerminalScreen();
-  disconnectTerminal();
-  sessionModes.classList.add("hidden");
-  setSessionMode("transcript");
   sessionControls.classList.add("hidden");
   controlStatus.textContent = "";
   state.followLatest = true;
@@ -844,9 +553,7 @@ async function openSession(id) {
     state.selected = state.sessions.find((session) => session.id === id) || await api(`/api/v1/pi/sessions/${encodeURIComponent(id)}`);
     if (state.navigation !== navigation) return;
     renderSessionHeader();
-    const attachInfo = loadAttachInfo(id);
     if (!await replayEvents(id, navigation)) return;
-    await attachInfo;
     if (state.navigation !== navigation) return;
     renderTranscript();
     connectStream(id);
@@ -1088,54 +795,106 @@ function compactDetails(id, label, preview, fullText) {
   return details;
 }
 
+function isAgentWork(item) {
+  if (item.kind !== "message") return true;
+  if (item.role === "toolResult") return true;
+  if (item.role !== "assistant" || !item.done) return false;
+  return String(item.stopReason || "").replaceAll("_", "").toLowerCase() === "tooluse";
+}
+
+function renderTimelineItem(item) {
+  const wrapper = node("article", "timeline-item");
+  if (item.kind === "message") {
+    const text = messageText(item);
+    if (!text && item.done) return null;
+    const bubble = node("div", `message ${item.role || "assistant"}`);
+    if (item.role === "toolResult") {
+      bubble.append(compactDetails(
+        item.id,
+        `${item.toolName || "tool"} response`,
+        previewText(text),
+        text || "No output",
+      ));
+    } else {
+      bubble.append(node("div", "message-role", item.role || "assistant"));
+      const body = node("div", "message-text markdown-body");
+      renderMarkdown(body, text || "…");
+      bubble.append(body);
+    }
+    const metaBits = [item.model, item.done ? item.stopReason : "streaming"].filter(Boolean);
+    if (item.errorMessage) metaBits.push(item.errorMessage);
+    if (metaBits.length) bubble.append(node("div", "message-meta", metaBits.join(" · ")));
+    wrapper.append(bubble);
+  } else if (item.kind === "tool") {
+    const card = node("div", `tool-card ${item.error ? "error" : ""}`);
+    card.append(node("span", "", item.done ? (item.error ? "×" : "✓") : "◌"));
+    const args = item.args === undefined ? "No arguments" : safeJson(item.args);
+    card.append(compactDetails(
+      item.id,
+      item.name,
+      item.args === undefined ? (item.done ? "completed" : "running") : previewText(args),
+      args,
+    ));
+    wrapper.append(card);
+  } else {
+    const label = item.detail ? `${item.type} · ${item.detail}` : item.type;
+    wrapper.append(node("div", "lifecycle-card", label.replaceAll("-", " ")));
+  }
+  return wrapper;
+}
+
+function renderWorkGroup(items) {
+  const id = `work:${items[0].id}`;
+  const details = node("details", "agent-work-group");
+  details.open = state.expanded.has(id);
+  details.addEventListener("toggle", () => {
+    if (details.open) state.expanded.add(id);
+    else state.expanded.delete(id);
+  });
+  const tools = items.filter((item) => item.kind === "tool").map((item) => item.name);
+  const errors = items.filter((item) => item.error || item.errorMessage).length;
+  const summary = node("summary", "agent-work-summary");
+  summary.append(
+    node("span", "agent-work-title", `Agent work · ${items.length}`),
+    node("span", "agent-work-preview", [tools.slice(0, 3).join(", "), errors ? `${errors} error${errors === 1 ? "" : "s"}` : ""].filter(Boolean).join(" · ") || "Show intermediate activity"),
+  );
+  const content = node("div", "agent-work-content");
+  for (const item of items) {
+    const rendered = renderTimelineItem(item);
+    if (rendered) content.append(rendered);
+  }
+  details.append(summary, content);
+  const wrapper = node("section", "timeline-item agent-work-item");
+  wrapper.append(details);
+  return wrapper;
+}
+
 function renderTranscript() {
   const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 120;
   const shouldFollow = state.followLatest || nearBottom;
   const fragment = document.createDocumentFragment();
   let visible = 0;
+  let work = [];
+  const flushWork = () => {
+    if (!work.length) return;
+    fragment.append(renderWorkGroup(work));
+    visible += 1;
+    work = [];
+  };
   for (const id of state.timeline) {
     const item = state.items.get(id);
     if (!item) continue;
-    const wrapper = node("article", "timeline-item");
-    if (item.kind === "message") {
-      const text = messageText(item);
-      if (!text && item.done) continue;
-      const bubble = node("div", `message ${item.role || "assistant"}`);
-      if (item.role === "toolResult") {
-        bubble.append(compactDetails(
-          item.id,
-          `${item.toolName || "tool"} response`,
-          previewText(text),
-          text || "No output",
-        ));
-      } else {
-        bubble.append(node("div", "message-role", item.role || "assistant"));
-        const body = node("div", "message-text markdown-body");
-        renderMarkdown(body, text || "…");
-        bubble.append(body);
-      }
-      const metaBits = [item.model, item.done ? item.stopReason : "streaming"].filter(Boolean);
-      if (item.errorMessage) metaBits.push(item.errorMessage);
-      if (metaBits.length) bubble.append(node("div", "message-meta", metaBits.join(" · ")));
-      wrapper.append(bubble);
-    } else if (item.kind === "tool") {
-      const card = node("div", `tool-card ${item.error ? "error" : ""}`);
-      card.append(node("span", "", item.done ? (item.error ? "×" : "✓") : "◌"));
-      const args = item.args === undefined ? "No arguments" : safeJson(item.args);
-      card.append(compactDetails(
-        item.id,
-        item.name,
-        item.args === undefined ? (item.done ? "completed" : "running") : previewText(args),
-        args,
-      ));
-      wrapper.append(card);
-    } else {
-      const label = item.detail ? `${item.type} · ${item.detail}` : item.type;
-      wrapper.append(node("div", "lifecycle-card", label.replaceAll("-", " ")));
+    if (isAgentWork(item)) {
+      work.push(item);
+      continue;
     }
-    fragment.append(wrapper);
+    flushWork();
+    const rendered = renderTimelineItem(item);
+    if (!rendered) continue;
+    fragment.append(rendered);
     visible += 1;
   }
+  flushWork();
   transcript.replaceChildren();
   if (visible === 0) transcript.append(node("div", "empty-transcript", "No transcript events yet. Send a prompt or continue in Pi."));
   else transcript.append(fragment);
@@ -1147,17 +906,10 @@ function closeDetail() {
   state.navigation += 1;
   closeGlobal();
   closeStream();
-  disconnectTerminal();
   state.selected = null;
-  state.attachInfo = null;
-  sessionModes.classList.add("hidden");
-  setSessionMode("transcript");
   detailView.classList.add("hidden");
   listView.classList.remove("hidden");
-  backButton.classList.add("hidden");
-  sessionSwitcher.classList.add("hidden");
   document.body.classList.remove("session-open");
-  refreshButton.classList.remove("hidden");
   title.textContent = "Pi sessions";
   subtitle.textContent = "Worker Harness";
   setConnection("online");
@@ -1173,6 +925,86 @@ function route() {
   if (match) void openSession(decodeURIComponent(match[1]));
   else closeDetail();
 }
+
+async function configureRouter() {
+  const separator = routerModel.value.indexOf("::");
+  if (separator < 1 || !state.globalSnapshot?.config) return;
+  routerModel.disabled = true;
+  routerThinking.disabled = true;
+  globalStatus.textContent = "Saving router configuration…";
+  try {
+    const config = await api("/api/v1/pi/router/config", {
+      method: "PUT",
+      body: JSON.stringify({
+        provider: routerModel.value.slice(0, separator),
+        model: routerModel.value.slice(separator + 2),
+        thinking_level: routerThinking.value,
+      }),
+    });
+    state.globalSnapshot.config = config;
+    globalStatus.textContent = "Router configuration saved";
+  } catch (error) {
+    globalStatus.textContent = `Router configuration failed: ${error.message}`;
+  } finally {
+    routerModel.disabled = false;
+    routerThinking.disabled = false;
+  }
+}
+
+routerModel.addEventListener("change", () => void configureRouter());
+routerThinking.addEventListener("change", () => void configureRouter());
+globalComposer.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const message = globalMessage.value.trim();
+  if (!message) return;
+  const generation = state.globalGeneration;
+  globalSend.disabled = true;
+  globalStatus.textContent = globalTarget.value ? "Dispatching…" : "Routing…";
+  try {
+    const result = await api("/api/v1/pi/router:dispatch", {
+      method: "POST",
+      body: JSON.stringify({ message, target_session_id: globalTarget.value || null }),
+    });
+    if (!state.globalOpen || generation !== state.globalGeneration) return;
+    if (result.status === "dispatched" && result.selected_session_id) {
+      if (globalMessage.value.trim() === message) {
+        globalMessage.value = "";
+        resizeGlobalComposer();
+      }
+      const selected = globalInteractiveSessions().find((item) => item.id === result.selected_session_id);
+      globalStatus.textContent = `Sent to ${sessionLabel(selected || { id: result.selected_session_id })}`;
+    } else {
+      globalStatus.textContent = result.error || "Auto could not choose one recipient. Select a session and retry.";
+      globalTarget.focus();
+    }
+    await loadGlobalSnapshot({ quiet: true });
+  } catch (error) {
+    if (state.globalOpen && generation === state.globalGeneration) globalStatus.textContent = `Route failed: ${error.message}`;
+  } finally {
+    if (state.globalOpen && generation === state.globalGeneration) {
+      globalSend.disabled = false;
+      globalMessage.focus();
+    }
+  }
+});
+
+function resizeGlobalComposer() {
+  globalMessage.style.height = "auto";
+  globalMessage.style.height = `${Math.min(globalMessage.scrollHeight, 150)}px`;
+}
+
+globalMessage.addEventListener("input", resizeGlobalComposer);
+globalMessage.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    globalComposer.requestSubmit();
+  }
+});
+globalButton.addEventListener("click", () => {
+  setSidebarOpen(false);
+  location.hash = "global";
+});
+globalRefresh.addEventListener("click", () => void loadGlobalSnapshot());
 
 async function queueConfiguration(payload) {
   if (!state.selected) return;
@@ -1191,70 +1023,6 @@ async function queueConfiguration(payload) {
     thinkingControl.disabled = false;
   }
 }
-
-async function configureRouter() {
-  const separator = routerModel.value.indexOf("::");
-  if (separator < 1) return;
-  routerModel.disabled = true;
-  routerThinking.disabled = true;
-  try {
-    const config = await api("/api/v1/pi/router/config", {
-      method: "PUT",
-      body: JSON.stringify({
-        provider: routerModel.value.slice(0, separator),
-        model: routerModel.value.slice(separator + 2),
-        thinking_level: routerThinking.value,
-      }),
-    });
-    if (state.globalSnapshot) state.globalSnapshot.config = config;
-    globalStatus.textContent = "Router configuration saved";
-  } catch (error) {
-    globalStatus.textContent = `Router configuration failed: ${error.message}`;
-  } finally {
-    routerModel.disabled = false;
-    routerThinking.disabled = false;
-  }
-}
-
-routerModel.addEventListener("change", () => void configureRouter());
-routerThinking.addEventListener("change", () => void configureRouter());
-globalComposer.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const message = globalMessage.value.trim();
-  if (!message) return;
-  globalSend.disabled = true;
-  globalStatus.textContent = globalTarget.value ? "Dispatching…" : "Routing…";
-  try {
-    const result = await api("/api/v1/pi/router:dispatch", {
-      method: "POST",
-      body: JSON.stringify({
-        message,
-        target_session_id: globalTarget.value || null,
-      }),
-    });
-    if (result.status === "dispatched") {
-      globalMessage.value = "";
-      globalStatus.textContent = `Sent to ${sessionLabel(globalInteractiveSessions().find((item) => item.id === result.selected_session_id) || { id: result.selected_session_id })}`;
-    } else {
-      globalStatus.textContent = result.error || "Choose a recipient";
-      globalTarget.focus();
-    }
-    await loadGlobalSnapshot({ quiet: true });
-  } catch (error) {
-    globalStatus.textContent = `Route failed: ${error.message}`;
-  } finally {
-    globalSend.disabled = false;
-    globalMessage.focus();
-  }
-});
-globalMessage.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
-    event.preventDefault();
-    globalComposer.requestSubmit();
-  }
-});
-globalButton.addEventListener("click", () => { location.hash = "global"; });
-globalRefresh.addEventListener("click", () => void loadGlobalSnapshot());
 
 modelControl.addEventListener("change", () => {
   const separator = modelControl.value.indexOf("::");
@@ -1312,49 +1080,17 @@ jumpLatest.addEventListener("click", () => {
   transcript.scrollTo({ top: transcript.scrollHeight, behavior: "smooth" });
   jumpLatest.classList.add("hidden");
 });
-backButton.addEventListener("click", () => { location.hash = ""; });
-sessionPicker.addEventListener("change", () => {
-  if (sessionPicker.value && sessionPicker.value !== state.selected?.id) {
-    location.hash = `session/${encodeURIComponent(sessionPicker.value)}`;
-  }
+sidebarToggle.addEventListener("click", () => setSidebarOpen(!state.sidebarOpen));
+sidebarClose.addEventListener("click", () => setSidebarOpen(false));
+sidebarBackdrop.addEventListener("click", () => setSidebarOpen(false));
+mobileSidebar.addEventListener("change", () => setSidebarOpen(false));
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.sidebarOpen) setSidebarOpen(false);
 });
-previousSession.addEventListener("click", () => cycleSession(-1));
-nextSession.addEventListener("click", () => cycleSession(1));
-transcriptMode.addEventListener("click", () => setSessionMode("transcript"));
-terminalMode.addEventListener("click", () => setSessionMode("terminal"));
-terminalReconnect.addEventListener("click", connectTerminal);
-terminalDisconnect.addEventListener("click", () => disconnectTerminal());
-terminalComposer.addEventListener("submit", (event) => {
-  event.preventDefault();
-  const value = terminalInput.value;
-  if (!value || !sendTerminalInput(`${value}\r`)) return;
-  terminalInput.value = "";
+refreshButton.addEventListener("click", () => {
+  if (state.globalOpen) void loadGlobalSnapshot();
+  else void loadSessions();
 });
-for (const button of document.querySelectorAll("[data-terminal-key]")) {
-  button.addEventListener("click", () => {
-    try { sendTerminalInput(JSON.parse(`"${button.dataset.terminalKey}"`)); } catch { /* invalid key mapping */ }
-    terminalOutput.focus();
-  });
-}
-if ("ResizeObserver" in window) new ResizeObserver(resizeTerminal).observe(terminalOutput);
-terminalOutput.addEventListener("keydown", (event) => {
-  let data = "";
-  if (event.ctrlKey && !event.altKey && !event.metaKey && event.key.length === 1) {
-    const code = event.key.toUpperCase().charCodeAt(0);
-    if (code >= 64 && code <= 95) data = String.fromCharCode(code - 64);
-  } else if (!event.ctrlKey && !event.altKey && !event.metaKey) {
-    const keys = {
-      Enter: "\r", Backspace: "\x7f", Tab: "\t", Escape: "\x1b",
-      ArrowUp: "\x1b[A", ArrowDown: "\x1b[B", ArrowRight: "\x1b[C", ArrowLeft: "\x1b[D",
-      Home: "\x1b[H", End: "\x1b[F", Delete: "\x1b[3~",
-    };
-    data = keys[event.key] || (event.key.length === 1 ? event.key : "");
-  }
-  if (!data) return;
-  event.preventDefault();
-  sendTerminalInput(data);
-});
-refreshButton.addEventListener("click", () => loadSessions());
 window.addEventListener("hashchange", route);
 window.addEventListener("beforeinstallprompt", (event) => {
   event.preventDefault();
@@ -1369,6 +1105,7 @@ installButton.addEventListener("click", async () => {
 });
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(console.warn);
+setSidebarOpen(false);
 await loadSessions();
 route();
 setInterval(() => loadSessions({ quiet: true }), 15_000);

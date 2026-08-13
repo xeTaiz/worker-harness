@@ -115,19 +115,26 @@ class PiSessionsApiTests(unittest.TestCase):
             katex_css = client.get("/vendor/katex/katex.min.css")
         self.assertEqual(page.status_code, 200)
         self.assertIn("Pi sessions", page.text)
+        self.assertIn('id="global-button"', page.text)
+        self.assertIn('id="global-router-view"', page.text)
         self.assertEqual(manifest.status_code, 200)
         self.assertEqual(manifest.json()["display"], "standalone")
         self.assertIn("EventSource", script.text)
-        self.assertIn("new WebSocket", script.text)
-        self.assertIn("attach-info", script.text)
-        self.assertIn("gateway_websocket_url", script.text)
+        self.assertNotIn("new WebSocket", script.text)
+        self.assertNotIn("attach-info", script.text)
+        self.assertIn("agentSidebar", script.text)
+        self.assertIn("setSidebarOpen", script.text)
+        self.assertIn("renderWorkGroup", script.text)
+        self.assertIn("isAgentWork", script.text)
+        self.assertIn('/api/v1/pi/router/snapshot', script.text)
+        self.assertIn('/api/v1/pi/router/models', script.text)
+        self.assertIn('/api/v1/pi/router/config', script.text)
+        self.assertIn('/api/v1/pi/router:dispatch', script.text)
+        self.assertIn(':interrupt', script.text)
+        self.assertIn('`${model.provider}::${model.id}`', script.text)
+        self.assertIn('target_session_id: globalTarget.value || null', script.text)
+        self.assertIn('closeGlobalSources()', script.text)
         self.assertNotIn("idle-timeout", script.text)
-        self.assertIn("replaced", script.text)
-        self.assertIn("4410", script.text)
-        self.assertIn("orchestrator gateway", script.text)
-        self.assertIn("/api/v1/pi/router:dispatch", script.text)
-        self.assertIn("/api/v1/pi/router/snapshot", script.text)
-        self.assertIn(":interrupt", script.text)
         self.assertIn("DOMPurify", script.text)
         self.assertIn("renderMathInElement", script.text)
         self.assertEqual(marked.status_code, 200)
@@ -983,6 +990,28 @@ class PiDelegationTimeoutTests(unittest.TestCase):
     def test_timeout_seconds_round_trips_through_delegation(self):
         delegation = asyncio.run(self.db.get_pi_delegation("del-1"))
         self.assertEqual(delegation.timeout_seconds, 60)
+
+
+class StandaloneWebGlobalContractTests(unittest.TestCase):
+    def test_router_proxy_is_allowlisted_before_generic_api_denial(self):
+        nginx = (Path(__file__).resolve().parents[1] / "web_container" / "nginx.conf").read_text()
+        router = nginx.index("/api/v1/pi/router")
+        denial = nginx.index("location /api/ {")
+        self.assertLess(router, denial)
+        self.assertIn(":dispatch", nginx)
+        self.assertIn("requests/[^/]+", nginx)
+        self.assertIn("/api/v1/pi/sessions", nginx)
+
+    def test_global_shell_versions_are_consistent(self):
+        root = Path(__file__).resolve().parents[1]
+        page = (root / "web" / "index.html").read_text()
+        worker = (root / "web" / "sw.js").read_text()
+        self.assertIn("/app.css?v=15", page)
+        self.assertIn("/app.js?v=15", page)
+        self.assertIn('wh-pi-shell-v15', worker)
+        self.assertIn('"/app.css?v=15"', worker)
+        self.assertIn('"/app.js?v=15"', worker)
+        self.assertIn('url.pathname.startsWith("/api/")', worker)
 
 
 if __name__ == "__main__":

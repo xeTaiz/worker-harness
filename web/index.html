@@ -10,157 +10,149 @@
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/icon-maskable.svg">
   <link rel="stylesheet" href="/vendor/katex/katex.min.css">
-  <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/app.css?v=15">
   <title>Pi Sessions</title>
 </head>
 <body>
   <div id="app" class="app-shell">
     <header class="topbar">
-      <button id="back" class="icon-button hidden" aria-label="Back to sessions">←</button>
+      <button id="sidebar-toggle" class="icon-button sidebar-toggle" type="button" aria-label="Show agents" aria-controls="agent-sidebar" aria-expanded="false">☰</button>
       <div class="brand-mark" aria-hidden="true">π</div>
       <div class="title-wrap">
         <h1 id="page-title">Pi sessions</h1>
         <p id="page-subtitle">Worker Harness</p>
       </div>
-      <nav id="session-switcher" class="session-switcher hidden" aria-label="Switch Pi session">
-        <button id="previous-session" class="switch-button" type="button" aria-label="Previous session">‹</button>
-        <label class="session-picker-wrap">
-          <span class="sr-only">Current session</span>
-          <select id="session-picker" aria-label="Current Pi session"></select>
-        </label>
-        <button id="next-session" class="switch-button" type="button" aria-label="Next session">›</button>
-      </nav>
       <span id="connection-dot" class="connection-dot" title="Disconnected"></span>
-      <button id="global-button" class="install-button" type="button">Global</button>
       <button id="install" class="install-button hidden">Install</button>
-      <button id="refresh" class="icon-button" aria-label="Refresh sessions">↻</button>
+      <button id="refresh" class="icon-button" aria-label="Refresh agents">↻</button>
     </header>
 
-    <main id="session-list-view" class="view list-view">
-      <section class="hero">
-        <p class="eyebrow">TAILNET SESSION FABRIC</p>
-        <h2>Continue anywhere.</h2>
-        <p>Open a live Pi session, follow its output, and steer it from this device.</p>
-      </section>
-      <div id="summary" class="summary-row"></div>
-      <section id="session-list" class="session-list" aria-live="polite"></section>
-      <div id="empty-state" class="empty-state hidden">
-        <div class="empty-glyph">π</div>
-        <h2>No sessions found</h2>
-        <p>Start Pi with the Worker Harness bridge, then refresh.</p>
-      </div>
-    </main>
+    <div class="workspace">
+      <aside id="agent-sidebar" class="agent-sidebar" aria-label="Agents">
+        <div class="sidebar-header">
+          <div>
+            <p class="eyebrow">TAILNET</p>
+            <h2>Agents</h2>
+          </div>
+          <button id="sidebar-close" class="icon-button sidebar-close" type="button" aria-label="Hide agents">×</button>
+        </div>
+        <button id="global-button" class="global-nav" type="button">
+          <span class="global-nav-mark" aria-hidden="true">⌁</span>
+          <span><strong>Global</strong><small>Semantic dispatcher</small></span>
+          <span class="global-nav-arrow" aria-hidden="true">›</span>
+        </button>
+        <div id="summary" class="summary-row"></div>
+        <section id="session-list" class="session-list" aria-live="polite"></section>
+        <div id="empty-state" class="empty-state hidden">
+          <div class="empty-glyph">π</div>
+          <h2>No agents found</h2>
+          <p>Start Pi with the Worker Harness bridge, then refresh.</p>
+        </div>
+      </aside>
+      <button id="sidebar-backdrop" class="sidebar-backdrop hidden" type="button" aria-label="Hide agents"></button>
 
-    <main id="global-router-view" class="view global-view hidden">
-      <section class="global-controls" aria-label="Global router controls">
-        <label>
-          <span>Routing model</span>
-          <select id="router-model" aria-label="Routing model"></select>
-        </label>
-        <label>
-          <span>Thinking</span>
-          <select id="router-thinking" aria-label="Router thinking level">
-            <option value="off">Off</option>
-            <option value="minimal">Minimal</option>
-            <option value="low">Low</option>
-            <option value="medium">Medium</option>
-            <option value="high">High</option>
-            <option value="xhigh">Extra high</option>
-            <option value="max">Max</option>
-          </select>
-        </label>
-        <span id="router-latency" class="control-status">No routes yet</span>
-      </section>
-      <section class="global-section" aria-labelledby="global-agents-title">
-        <div class="global-section-head">
-          <div><p class="eyebrow">INTERACTIVE AGENTS</p><h2 id="global-agents-title">Working now</h2></div>
-          <button id="global-refresh" class="icon-button" type="button" aria-label="Refresh global view">↻</button>
-        </div>
-        <div id="global-roster" class="global-roster" aria-live="polite"></div>
-      </section>
-      <section class="global-section" aria-labelledby="global-turns-title">
-        <div class="global-section-head"><div><p class="eyebrow">LATEST TURNS</p><h2 id="global-turns-title">Across sessions</h2></div></div>
-        <div id="global-turns" class="global-turns" aria-live="polite"></div>
-      </section>
-      <form id="global-composer" class="composer global-composer">
-        <div class="composer-controls">
-          <label for="global-target">Recipient</label>
-          <select id="global-target" name="target"><option value="">Auto</option></select>
-        </div>
-        <div class="composer-row">
-          <textarea id="global-message" rows="1" maxlength="20000" placeholder="Message the right Pi session…" aria-label="Global message"></textarea>
-          <button id="global-send" type="submit" aria-label="Route message">↑</button>
-        </div>
-        <p id="global-status" class="composer-status" role="status"></p>
-      </form>
-    </main>
+      <main id="session-list-view" class="view welcome-view">
+        <section class="hero">
+          <p class="eyebrow">TAILNET SESSION FABRIC</p>
+          <h2>Continue anywhere.</h2>
+          <p>Choose an agent to follow its work and steer the conversation from this device.</p>
+        </section>
+      </main>
 
-    <main id="session-detail-view" class="view detail-view hidden">
-      <section id="session-meta" class="session-meta"></section>
-      <nav id="session-modes" class="session-modes hidden" aria-label="Session view">
-        <button id="transcript-mode" type="button" class="active" aria-pressed="true">Transcript</button>
-        <button id="terminal-mode" type="button" aria-pressed="false">Terminal preview</button>
-      </nav>
-      <section id="session-controls" class="session-controls hidden" aria-label="Session controls">
-        <label>
-          <span>Model</span>
-          <select id="model-control" aria-label="Model"></select>
-        </label>
-        <label>
-          <span>Thinking</span>
-          <select id="thinking-control" aria-label="Thinking level">
-            <option value="off">Off</option>
-            <option value="minimal">Minimal</option>
-            <option value="low">Low</option>
-            <option value="medium">Medium</option>
-            <option value="high">High</option>
-            <option value="xhigh">Extra high</option>
-            <option value="max">Max</option>
-          </select>
-        </label>
-        <span id="control-status" class="control-status" role="status"></span>
-      </section>
-      <section id="transcript" class="transcript" aria-live="polite" aria-label="Session transcript"></section>
-      <section id="terminal-panel" class="terminal-panel hidden" aria-label="Raw terminal attachment">
-        <div class="terminal-toolbar">
-          <span id="terminal-status" role="status">Disconnected</span>
-          <button id="terminal-reconnect" type="button">Reconnect</button>
-          <button id="terminal-disconnect" type="button">Disconnect</button>
+      <main id="global-router-view" class="view global-view hidden">
+        <div class="global-scroll">
+          <section class="global-controls" aria-label="Global router controls">
+            <label class="compact-control">
+              <span>Router model</span>
+              <select id="router-model" aria-label="Router model"></select>
+            </label>
+            <label class="compact-control">
+              <span>Thinking</span>
+              <select id="router-thinking" aria-label="Router thinking level">
+                <option value="off">Off</option>
+                <option value="minimal">Minimal</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="xhigh">Extra high</option>
+                <option value="max">Max</option>
+              </select>
+            </label>
+            <span id="router-latency" class="router-latency">No routes yet</span>
+          </section>
+          <section class="global-section" aria-labelledby="global-agents-title">
+            <div class="global-section-head">
+              <div><p class="eyebrow">INTERACTIVE AGENTS</p><h2 id="global-agents-title">Active roster</h2></div>
+              <button id="global-refresh" class="icon-button" type="button" aria-label="Refresh Global">↻</button>
+            </div>
+            <div id="global-roster" class="global-roster" aria-live="polite"></div>
+          </section>
+          <section class="global-section" aria-labelledby="global-turns-title">
+            <div class="global-section-head"><div><p class="eyebrow">LATEST TURNS</p><h2 id="global-turns-title">Across sessions</h2></div></div>
+            <div id="global-turns" class="global-turns" aria-live="polite"></div>
+          </section>
         </div>
-        <pre id="terminal-output" tabindex="0" aria-label="Terminal output"></pre>
-        <div class="terminal-keys" aria-label="Terminal keys">
-          <button type="button" data-terminal-key="\u0003">Ctrl-C</button>
-          <button type="button" data-terminal-key="\u001b">Esc</button>
-          <button type="button" data-terminal-key="\t">Tab</button>
-          <button type="button" data-terminal-key="\u001b[A">↑</button>
-          <button type="button" data-terminal-key="\u001b[B">↓</button>
-        </div>
-        <form id="terminal-composer" class="terminal-composer">
-          <textarea id="terminal-input" rows="1" placeholder="Type a terminal command…" aria-label="Terminal input"></textarea>
-          <button type="submit" aria-label="Send terminal input">↵</button>
+        <form id="global-composer" class="composer global-composer">
+          <div class="composer-controls">
+            <label class="compact-control global-target-control">
+              <span>Recipient</span>
+              <select id="global-target" name="target"><option value="">Auto</option></select>
+            </label>
+          </div>
+          <div class="composer-row">
+            <textarea id="global-message" rows="1" maxlength="20000" placeholder="Message the right Pi session…" aria-label="Global message"></textarea>
+            <button id="global-send" type="submit" aria-label="Route message">↑</button>
+          </div>
+          <p id="global-status" class="composer-status" role="status"></p>
         </form>
-      </section>
-      <button id="jump-latest" class="jump-latest hidden">↓ Latest</button>
-      <form id="composer" class="composer">
-        <div class="composer-controls">
-          <label for="delivery">Delivery</label>
-          <select id="delivery" name="delivery">
-            <option value="steer">Steer current turn</option>
-            <option value="followUp">Follow up</option>
-          </select>
-        </div>
-        <div class="composer-row">
-          <textarea id="message" rows="1" maxlength="20000" placeholder="Message this Pi session…" aria-label="Message"></textarea>
-          <button id="send" type="submit" aria-label="Send message">↑</button>
-        </div>
-        <p id="composer-status" class="composer-status" role="status"></p>
-      </form>
-    </main>
+      </main>
+
+      <main id="session-detail-view" class="view detail-view hidden">
+        <section id="session-meta" class="hidden" aria-hidden="true"></section>
+        <section id="transcript" class="transcript" aria-live="polite" aria-label="Session transcript"></section>
+        <button id="jump-latest" class="jump-latest hidden">↓ Latest</button>
+        <form id="composer" class="composer">
+          <div class="composer-controls" aria-label="Message and session controls">
+            <label class="compact-control">
+              <span>Delivery</span>
+              <select id="delivery" name="delivery">
+                <option value="steer">Steer</option>
+                <option value="followUp">Follow up</option>
+              </select>
+            </label>
+            <div id="session-controls" class="session-controls hidden">
+              <label class="compact-control">
+                <span>Model</span>
+                <select id="model-control" aria-label="Model"></select>
+              </label>
+              <label class="compact-control">
+                <span>Thinking</span>
+                <select id="thinking-control" aria-label="Thinking level">
+                  <option value="off">Off</option>
+                  <option value="minimal">Minimal</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                  <option value="xhigh">Extra high</option>
+                  <option value="max">Max</option>
+                </select>
+              </label>
+              <span id="control-status" class="control-status" role="status"></span>
+            </div>
+          </div>
+          <div class="composer-row">
+            <textarea id="message" rows="1" maxlength="20000" placeholder="Message this Pi session…" aria-label="Message"></textarea>
+            <button id="send" type="submit" aria-label="Send message">↑</button>
+          </div>
+          <p id="composer-status" class="composer-status" role="status"></p>
+        </form>
+      </main>
+    </div>
   </div>
   <script src="/vendor/marked/marked.umd.js"></script>
   <script src="/vendor/dompurify/purify.min.js"></script>
   <script src="/vendor/katex/katex.min.js"></script>
   <script src="/vendor/katex/auto-render.min.js"></script>
-  <script type="module" src="/app.js"></script>
+  <script type="module" src="/app.js?v=15"></script>
 </body>
 </html>
