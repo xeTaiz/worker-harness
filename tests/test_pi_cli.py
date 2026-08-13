@@ -460,9 +460,17 @@ class PiCliTests(unittest.TestCase):
         selected = asyncio.run(pi._attachable_candidates(rows))
         self.assertEqual([row["id"] for row in selected], ["interactive-session-id"])
 
-    def test_attach_picker_fails_closed_when_snapshot_lacks_attach_info(self):
-        with self.assertRaisesRegex(RuntimeError, "did not include attachment information"):
+    def test_attach_picker_reports_outdated_orchestrator(self):
+        with self.assertRaisesRegex(RuntimeError, "orchestrator does not support"):
             asyncio.run(pi._attachable_candidates([self._session()]))
+
+    def test_attach_picker_reports_partially_missing_attach_info(self):
+        rows = [
+            {**self._session(), "attach_info": {"attachable": True}},
+            {**self._session(), "id": "missing"},
+        ]
+        with self.assertRaisesRegex(RuntimeError, "omitted attachment information for missing"):
+            asyncio.run(pi._attachable_candidates(rows))
 
     def test_attach_picker_maps_full_fzf_row_back_to_session(self):
         rows = [self._session(), {**self._session(), "id": "second", "name": "other"}]

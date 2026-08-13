@@ -301,8 +301,13 @@ async def _attachable_candidates(rows: list[dict]) -> list[dict]:
 
     missing = [str(row.get("id") or "") for row in rows if not isinstance(row.get("attach_info"), dict)]
     if missing:
+        if len(missing) == len(rows):
+            raise RuntimeError(
+                "orchestrator does not support batched attachment inventory; "
+                "update the orchestrator to Worker Harness main@1751e74 or newer"
+            )
         raise RuntimeError(
-            "session inventory did not include attachment information for "
+            "session inventory omitted attachment information for "
             + ", ".join(session_id[:12] or "<unknown>" for session_id in missing)
         )
     return [row for row in rows if row["attach_info"].get("attachable")]
