@@ -29,7 +29,7 @@ A later shell alias may make this feel like ordinary `pi`, but plain `pi` in an 
 2. **The hidden server uses a distinct socket.** It is not the operator's outer tmux server. An outer tmux client therefore keeps its own status bar, windows, prefix, and session state while the managed Pi backend remains invisible.
 3. **One Pi per window, one pane per window.** The managed server has no split-pane topology. This avoids relay zoom conflicts and lets each Pi window participate independently in tmux sizing.
 4. **One owner session groups the Pi windows.** The launcher recreates the owner session when absent. It may disappear when the last Pi exits; the next launch recreates it.
-5. **No visible backend chrome, but native scrollback and complete modified-key input.** Force `status off`, `mouse on`, `extended-keys on`, `history-limit 50000`, and `window-size latest` on the managed server/owner session. On tmux 3.5+, also select `extended-keys-format csi-u`; tmux 3.2–3.4 keeps its supported `xterm` format. Relay-created grouped sessions defensively reinforce `status off`, `mouse on`, and `window-size latest`. The history limit must be set before the first pane is created because tmux fixes each pane's allocation at creation time.
+5. **No visible backend chrome, but native scrollback, clipboard export, and complete modified-key input.** Force `status off`, `mouse on`, `set-clipboard external`, `extended-keys on`, `history-limit 50000`, and `window-size latest` on the managed server/owner session. On tmux 3.5+, also select `extended-keys-format csi-u`; tmux 3.2–3.4 keeps its supported `xterm` format. Relay-created grouped sessions defensively reinforce `status off`, `mouse on`, and `window-size latest`. The history limit must be set before the first pane is created because tmux fixes each pane's allocation at creation time.
 6. **The backend is intentionally hard to operate directly.** Worker Harness owns creation, naming, attachment, cycling, detach, and cleanup. Lack of convenient nested tmux bindings is a benefit, not a UX defect, provided the Worker Harness escape/detach path is reliable.
 7. **Protocol v2 remains unchanged.** This adds launcher and local-path policy only; no orchestrator schema, terminal protocol, worker SIF, attachment ownership, or gateway change is required.
 
@@ -87,6 +87,7 @@ Resume modes need explicit handling. If the operator supplies `--session`, `--se
    ```tmux
    set-option -g status off
    set-option -g mouse on
+   set-option -s set-clipboard external
    set-option -g extended-keys on
    # tmux 3.5+ only; tmux 3.2–3.4 retains its xterm format
    set-option -g extended-keys-format csi-u
@@ -97,7 +98,7 @@ Resume modes need explicit handling. If the operator supplies `--session`, `--se
    set-option -t wh-pi window-size latest
    ```
 
-   `mouse on` lets a wheel gesture pass through Ghostty/Zellij into tmux's built-in `WheelUpPane` copy-mode binding. `extended-keys on` lets Pi distinguish modified Enter and other modified keys; `csi-u` is Pi's preferred format where tmux supports it. Existing panes cannot be enlarged retroactively; the configured history limit applies when each pane is allocated.
+   `mouse on` lets wheel and drag gestures pass through the outer terminal multiplexer into the managed tmux's copy mode and authoritative scrollback. `set-clipboard external` makes a completed inner selection emit OSC 52 without accepting arbitrary pane applications as tmux buffers; an outer tmux may use `set-clipboard on` to accept and relay that selection to the local terminal clipboard. `extended-keys on` lets Pi distinguish modified Enter and other modified keys; `csi-u` is Pi's preferred format where tmux supports it. Existing panes cannot be enlarged retroactively; the configured history limit applies when each pane is allocated.
 
 5. Generate the private session UUID and human display name.
 6. Create a detached one-pane window and capture its stable pane ID. Treat the name and all Pi arguments as untrusted argv data: use an argv-safe launcher helper or strict shell quoting for tmux's command string; never concatenate operator/model-generated text into an executable shell fragment.

@@ -253,6 +253,7 @@ def _configure_managed_server(socket: Path) -> None:
     supports_csi_u = _tmux_supports_csi_u()
     _run_tmux(socket, "set-option", "-g", "status", "off")
     _run_tmux(socket, "set-option", "-g", "mouse", "on")
+    _run_tmux(socket, "set-option", "-s", "set-clipboard", "external")
     _run_tmux(socket, "set-option", "-g", "extended-keys", "on")
     if supports_csi_u:
         _run_tmux(
@@ -386,6 +387,11 @@ def start_managed_pi(
             "-g",
             "mouse",
             "on",
+            ";",
+            "set-option",
+            "-s",
+            "set-clipboard",
+            "external",
             ";",
             "set-option",
             "-g",

@@ -142,6 +142,8 @@ class PiRuntimeTests(unittest.TestCase):
         new_session_index = args.index("new-session")
         self.assertEqual(args[1], "start-server")
         self.assertLess(args.index("mouse"), new_session_index)
+        self.assertLess(args.index("set-clipboard"), new_session_index)
+        self.assertLess(args.index("external"), new_session_index)
         self.assertLess(args.index("extended-keys"), new_session_index)
         self.assertLess(args.index("extended-keys-format"), new_session_index)
         self.assertLess(args.index(pi_runtime.MANAGED_TMUX_EXTENDED_KEYS_FORMAT), new_session_index)
@@ -233,6 +235,7 @@ class PiRuntimeTests(unittest.TestCase):
         history_limit = str(pi_runtime.MANAGED_TMUX_HISTORY_LIMIT)
         self.assertIn(("set-option", "-g", "status", "off"), commands)
         self.assertIn(("set-option", "-g", "mouse", "on"), commands)
+        self.assertIn(("set-option", "-s", "set-clipboard", "external"), commands)
         self.assertIn(("set-option", "-g", "extended-keys", "on"), commands)
         self.assertIn(
             (
@@ -325,6 +328,15 @@ class PiRuntimeTests(unittest.TestCase):
                 )
                 self.assertEqual(extended.returncode, 0, extended.stderr)
                 self.assertEqual(extended.stdout.strip(), "on")
+                clipboard = subprocess.run(
+                    [executable, "-S", str(socket), "show", "-sv", "set-clipboard"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(clipboard.returncode, 0, clipboard.stderr)
+                self.assertEqual(clipboard.stdout.strip(), "external")
                 if pi_runtime._tmux_supports_csi_u():
                     key_format = subprocess.run(
                         [
