@@ -64,55 +64,93 @@ class SSHResult:
     returncode: int
 
 
-async def _terminate_async_process(proc: asyncio.subprocess.Process, grace_seconds: float = 2.0) -> None:
-    """Terminate the complete process group of an async SSH call.
+def _signal_process_group(pgid: int, sig: signal.Signals) -> bool:
+    """Signal an owned process group. Return whether the group still existed."""
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        log.warning("Permission denied signalling process group %s with %s", pgid, sig.name)
+        return True
+    return True
 
-    All subprocesses use ``start_new_session=True``. Killing their process
-    group avoids the shell-wrapper leak where killing `tailscale` leaves an
-    underlying ssh child alive and holding a connection.
+
+def _process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+async def _wait_for_async_process_group(proc: asyncio.subprocess.Process, timeout: float) -> bool:
+    """Wait for the complete group to disappear while reaping its leader."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while _process_group_exists(proc.pid):
+        if proc.returncode is None:
+            # asyncio's child watcher normally reaps the leader. Yielding here
+            # lets that callback run before checking whether descendants remain.
+            await asyncio.sleep(0)
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(0.05, remaining))
+    await proc.wait()
+    return True
+
+
+async def _terminate_async_process(proc: asyncio.subprocess.Process, grace_seconds: float = 2.0) -> None:
+    """Terminate and reap the complete process group of an async SSH call.
+
+    The direct process can exit before a ProxyCommand descendant. Its return
+    code therefore never proves that the process group is gone.
     """
-    if proc.returncode is not None:
-        return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        return
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=grace_seconds)
-        return
-    except asyncio.TimeoutError:
-        pass
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=1.0)
-    except asyncio.TimeoutError:
-        pass
+    _signal_process_group(proc.pid, signal.SIGTERM)
+    group_gone = await _wait_for_async_process_group(proc, grace_seconds)
+    if not group_gone:
+        _signal_process_group(proc.pid, signal.SIGKILL)
+        group_gone = await _wait_for_async_process_group(proc, 1.0)
+
+    if proc.returncode is None:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=0.5)
+        except asyncio.TimeoutError:
+            log.error("SSH process %s could not be reaped after SIGKILL", proc.pid)
+    if not group_gone:
+        log.error("SSH process group %s survived SIGKILL", proc.pid)
+
+
+def _wait_for_popen_process_group(proc: subprocess.Popen, timeout: float) -> bool:
+    """Wait for a Popen group to disappear while polling/reaping its leader."""
+    deadline = time.monotonic() + timeout
+    while True:
+        proc.poll()
+        if not _process_group_exists(proc.pid):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
 
 
 def _terminate_popen_process_group(proc: subprocess.Popen, grace_seconds: float = 2.0) -> None:
     """Synchronous sibling for persistent tunnel Popen cleanup."""
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        return
-    try:
-        proc.wait(timeout=grace_seconds)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-    try:
-        proc.wait(timeout=1.0)
-    except subprocess.TimeoutExpired:
-        pass
+    _signal_process_group(proc.pid, signal.SIGTERM)
+    group_gone = _wait_for_popen_process_group(proc, grace_seconds)
+    if not group_gone:
+        _signal_process_group(proc.pid, signal.SIGKILL)
+        group_gone = _wait_for_popen_process_group(proc, 1.0)
+
+    if proc.returncode is None:
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            log.error("Tunnel process %s could not be reaped after SIGKILL", proc.pid)
+    if not group_gone:
+        log.error("Tunnel process group %s survived SIGKILL", proc.pid)
 
 
 # ── Argument helpers ───────────────────────────────────────────────────
@@ -462,7 +500,6 @@ async def ssh_port_forward(
             return proc
         except BaseException:
             # A cancellation while the handshake is in progress must not leak
-            # a long-lived port-forward subprocess.
-            if proc.poll() is None:
-                _terminate_popen_process_group(proc)
+            # a long-lived port-forward subprocess or ProxyCommand descendant.
+            _terminate_popen_process_group(proc)
             raise

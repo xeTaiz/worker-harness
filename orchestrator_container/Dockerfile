@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     openssh-client \
     iproute2 \
     procps \
+    tini \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -29,4 +30,4 @@ RUN chmod +x /entrypoint.sh
 HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=12 \
     CMD curl -fsS "http://127.0.0.1:${WH_CONTROL_PORT:-12889}/health" || exit 1
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "-s", "-g", "--", "/entrypoint.sh"]

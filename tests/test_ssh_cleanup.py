@@ -91,6 +91,32 @@ class SshCleanupTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_timeout_kills_descendant_after_group_leader_exits(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                child_file = root / "child.pid"
+                fake_tailscale = root / "tailscale"
+                fake_tailscale.write_text(
+                    "#!/bin/sh\n"
+                    "sleep 30 &\n"
+                    "echo $! > \"$FAKE_CHILD_PID\"\n"
+                    "exit 0\n"
+                )
+                fake_tailscale.chmod(fake_tailscale.stat().st_mode | stat.S_IXUSR)
+                set_lanes(WorkerLanes(max_concurrent=1, max_queue=1))
+                with patch.dict(os.environ, {
+                    "PATH": f"{root}:{os.environ['PATH']}",
+                    "FAKE_CHILD_PID": str(child_file),
+                }, clear=False):
+                    result = await async_ssh_run(self._worker(), "ignored", timeout=0.1)
+
+                self.assertEqual(result.returncode, -1)
+                self.assertTrue(child_file.exists())
+                self._assert_pid_gone(int(child_file.read_text().strip()))
+
+        asyncio.run(run())
+
     def test_cancellation_kills_complete_ssh_process_group(self):
         async def run():
             with tempfile.TemporaryDirectory() as tmp:

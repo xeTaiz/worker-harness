@@ -74,10 +74,66 @@ bootstrap_tailnet() {
   return 1
 }
 
+# Keep this shell as the direct parent of tailscaled, bootstrap, and Python so
+# it can supervise and reap each child. Tini remains PID 1 and subreaps any
+# orphaned SSH ProxyCommand descendants.
+shutdown_children() {
+  status=$?
+  trap - EXIT INT TERM
+
+  pids=("${ORCH_PID:-}" "${BOOTSTRAP_PID:-}" "$TAILSCALED_PID")
+  for pid in "${pids[@]}"; do
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+
+  for _ in $(seq 1 50); do
+    live=false
+    for pid in "${pids[@]}"; do
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        live=true
+      fi
+    done
+    if [ "$live" = false ]; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  for pid in "${pids[@]}"; do
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    if [ -n "$pid" ]; then
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  exit "$status"
+}
+
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap shutdown_children EXIT
+
 # Tailnet control-plane latency must not gate the local registration/control
 # servers. Once tailscaled restores the persisted identity, the already-running
 # HTTP services become reachable immediately on the same Tailnet IP.
 bootstrap_tailnet &
+BOOTSTRAP_PID=$!
 
 echo "[entrypoint] Starting orchestrator immediately: python -m worker_harness.orchestrator $WH_COMMAND"
-exec python -m worker_harness.orchestrator "$WH_COMMAND"
+python -m worker_harness.orchestrator "$WH_COMMAND" &
+ORCH_PID=$!
+
+set +e
+wait -n -p EXITED_PID "$ORCH_PID" "$TAILSCALED_PID"
+status=$?
+set -e
+
+if [ "$EXITED_PID" = "$TAILSCALED_PID" ]; then
+  echo "[entrypoint] ERROR: tailscaled exited; stopping orchestrator"
+else
+  echo "[entrypoint] Orchestrator exited with status $status"
+fi
+exit "$status"

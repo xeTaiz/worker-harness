@@ -1864,23 +1864,50 @@ def create_app(db: Database, router_client=None) -> FastAPI:
             created_at=int(datetime.now(timezone.utc).timestamp()),
         )
 
-        proc = await ssh_port_forward(worker, payload.local_port, payload.remote_port)
-        if proc.poll() is not None:
-            raise HTTPException(
-                status_code=502,
-                detail=f"SSH tunnel setup exited immediately (code={proc.returncode})",
-            )
-        pf.pid = proc.pid
-        await db.insert_port_forward(pf)
-        app.state.tunnels.add(TunnelProcess(
-            id=pf.id,
-            worker_id=worker.id,
-            local_port=payload.local_port,
-            remote_port=payload.remote_port,
-            proc=proc,
-            created_at=pf.created_at,
-        ))
-        await app.state.cache.invalidate("tunnels:list")
+        proc = None
+        registered = False
+        try:
+            proc = await ssh_port_forward(worker, payload.local_port, payload.remote_port)
+            if proc.poll() is not None:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"SSH tunnel setup exited immediately (code={proc.returncode})",
+                )
+            pf.pid = proc.pid
+            await db.insert_port_forward(pf)
+            app.state.tunnels.add(TunnelProcess(
+                id=pf.id,
+                worker_id=worker.id,
+                local_port=payload.local_port,
+                remote_port=payload.remote_port,
+                proc=proc,
+                created_at=pf.created_at,
+            ))
+            registered = True
+            await app.state.cache.invalidate("tunnels:list")
+        except BaseException:
+            async def cleanup_failed_tunnel() -> None:
+                entry = app.state.tunnels.remove(pf.id) if registered else None
+                if entry:
+                    await asyncio.to_thread(TunnelRegistry.stop, entry)
+                elif proc is not None:
+                    transient = TunnelProcess(
+                        id=pf.id, worker_id=worker.id,
+                        local_port=payload.local_port, remote_port=payload.remote_port,
+                        proc=proc, created_at=pf.created_at,
+                    )
+                    await asyncio.to_thread(TunnelRegistry.stop, transient)
+                try:
+                    await db.delete_port_forward(pf.id)
+                except Exception:
+                    log.exception("Failed to delete tunnel row %s during rollback", pf.id)
+
+            cleanup_task = asyncio.create_task(cleanup_failed_tunnel())
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await cleanup_task
+            raise
 
         return {
             **pf.model_dump(mode="json"),

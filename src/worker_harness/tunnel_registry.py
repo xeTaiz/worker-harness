@@ -7,10 +7,10 @@ reaper can clean them up deterministically.
 
 from __future__ import annotations
 
-import os
-import signal
 import subprocess
 from dataclasses import dataclass
+
+from .ssh import _process_group_exists, _terminate_popen_process_group
 
 
 @dataclass
@@ -37,10 +37,11 @@ class TunnelRegistry:
         return self._entries.pop(tunnel_id, None)
 
     def reap_dead(self) -> int:
-        """Drop registry entries for tunnel processes that have already died."""
-        dead = [tunnel_id for tunnel_id, entry in self._entries.items() if entry.proc.poll() is not None]
-        for tunnel_id in dead:
-            self._entries.pop(tunnel_id, None)
+        """Reap dead tunnel leaders and terminate any surviving descendants."""
+        dead = [entry for entry in self._entries.values() if entry.proc.poll() is not None]
+        for entry in dead:
+            self.stop(entry, grace_seconds=0.1)
+            self._entries.pop(entry.id, None)
         return len(dead)
 
     def stats(self) -> dict:
@@ -57,25 +58,11 @@ class TunnelRegistry:
 
     @staticmethod
     def stop(entry: TunnelProcess, grace_seconds: float = 5.0) -> bool:
-        """Terminate one tunnel's complete process group. Returns whether it
-        was live when stop began."""
+        """Terminate and reap one tunnel's complete process group."""
         proc = entry.proc
-        if proc.poll() is not None:
-            return False
-        try:
-            # ssh_port_forward creates a new session, so terminate the whole
-            # group rather than leaving an SSH child behind.
-            os.killpg(proc.pid, signal.SIGTERM)
-            proc.wait(timeout=grace_seconds)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=1)
-            except (subprocess.TimeoutExpired, ProcessLookupError, PermissionError):
-                pass
-        except (ProcessLookupError, PermissionError):
-            pass
-        return True
+        was_live = proc.returncode is None or _process_group_exists(proc.pid)
+        _terminate_popen_process_group(proc, grace_seconds)
+        return was_live
 
     def shutdown(self, grace_seconds: float = 5.0) -> int:
         """Terminate every managed tunnel, escalating to SIGKILL if needed."""
