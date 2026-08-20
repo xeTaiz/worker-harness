@@ -16,10 +16,18 @@ fi
 load_env_file() {
   local env_file="$1"
   if [ -n "$env_file" ] && [ -f "$env_file" ]; then
-    # shellcheck disable=SC1090
+    # Variables the caller already exported (e.g. a Slurm script's WH_DIR)
+    # must win over this file — it only supplies defaults. Snapshot every
+    # currently-exported name, source the file, then force-restore those
+    # names to their pre-source values/export state.
+    local prior
+    prior="$(declare -p $(compgen -e) 2>/dev/null)"
+    prior="${prior//declare -/declare -g}"
     set -a
+    # shellcheck disable=SC1090
     . "$env_file"
     set +a
+    eval "$prior"
     return 0
   fi
   return 1
@@ -239,6 +247,15 @@ exec_env_args=(
   --env WH_PI_JOB_SOCKET="${WH_PI_JOB_SOCKET:-}"
   --env WH_PI_COMMAND="${WH_PI_COMMAND:-}"
 )
+
+# Opt-in override for worker identity. Left unset, the container falls back
+# to its inherited hostname (unchanged default behavior for existing fleet
+# workers). Set WORKER_NAME (and TS_HOSTNAME above) when co-locating
+# multiple instances on one physical host (e.g. several SLURM jobs sharing
+# a multi-GPU node), so each gets a distinct orchestrator/Tailscale identity.
+if [ -n "${WORKER_NAME:-}" ]; then
+  exec_env_args+=(--env WORKER_NAME="$WORKER_NAME")
+fi
 
 if [ "$launch_mode" = "instance" ]; then
   # Stop any leftover instance from a previous run (crash, restart, etc.)
