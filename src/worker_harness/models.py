@@ -194,6 +194,7 @@ class PiSession(BaseModel):
     # Interactive bridge metadata. Delegated sessions leave these empty.
     name: str = ""
     host: str = ""
+    agent: str = "pi"
     bridge_incarnation: str | None = None
     terminal_attachable: bool = False
     terminal_host: str = ""
@@ -241,6 +242,7 @@ class PiBridgeRegister(BaseModel):
     cwd: str = Field(default="", max_length=4096)
     name: str = Field(default="", max_length=256)
     host: str = Field(default="", max_length=256)
+    agent: str = Field(default="pi", max_length=16, pattern=r"^[a-z][a-z0-9_-]*$")
     terminal_attachable: bool = False
     terminal_host: str = Field(default="", max_length=256, pattern=r"^[A-Za-z0-9.-]*$")
     terminal_port: int = Field(default=0, ge=0, le=65535)

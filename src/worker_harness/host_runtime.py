@@ -31,7 +31,7 @@ REQUIRED_EXECUTABLES: tuple[str, ...] = (
     "tmux",
     "tailscale",
 )
-OPTIONAL_EXECUTABLES: tuple[str, ...] = ("zellij",)
+OPTIONAL_EXECUTABLES: tuple[str, ...] = ("zellij", "omp")
 STANDARD_PATH_FALLBACK: tuple[str, ...] = ("/usr/local/bin", "/usr/bin", "/bin")
 VERSION_ARGUMENTS: Mapping[str, tuple[str, ...]] = {
     "wh": ("--help",),
@@ -41,6 +41,7 @@ VERSION_ARGUMENTS: Mapping[str, tuple[str, ...]] = {
     "tmux": ("-V",),
     "tailscale": ("version",),
     "zellij": ("--version",),
+    "omp": ("--version",),
 }
 VALIDATION_TIMEOUT_SECONDS = 5.0
 CLEAN_ENV_KEYS: tuple[str, ...] = (

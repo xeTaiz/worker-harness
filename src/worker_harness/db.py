@@ -210,6 +210,7 @@ class Database:
                 detail TEXT DEFAULT '',
                 name TEXT DEFAULT '',
                 host TEXT DEFAULT '',
+                agent TEXT DEFAULT 'pi',
                 bridge_incarnation TEXT,
                 terminal_attachable INTEGER DEFAULT 0,
                 terminal_host TEXT DEFAULT '',
@@ -226,6 +227,7 @@ class Database:
         for column, declaration in {
             "name": "TEXT DEFAULT ''",
             "host": "TEXT DEFAULT ''",
+            "agent": "TEXT DEFAULT 'pi'",
             "bridge_incarnation": "TEXT",
             "terminal_attachable": "INTEGER DEFAULT 0",
             "terminal_host": "TEXT DEFAULT ''",
@@ -461,6 +463,7 @@ class Database:
             task=row["task"], cwd=row["cwd"], tmux_session=row["tmux_session"], detail=row["detail"],
             name=row["name"] if "name" in row.keys() else "",
             host=row["host"] if "host" in row.keys() else "",
+            agent=row["agent"] if "agent" in row.keys() else "pi",
             bridge_incarnation=row["bridge_incarnation"] if "bridge_incarnation" in row.keys() else None,
             terminal_attachable=bool(row["terminal_attachable"]) if "terminal_attachable" in row.keys() else False,
             terminal_host=row["terminal_host"] if "terminal_host" in row.keys() else "",
@@ -479,13 +482,14 @@ class Database:
         await self._db.execute(
             """INSERT INTO pi_sessions
                (id, worker_id, parent_session_id, session_type, state, task, cwd, tmux_session, detail,
-                name, host, bridge_incarnation, terminal_attachable, terminal_host, terminal_port,
+                name, host, agent, bridge_incarnation, terminal_attachable, terminal_host, terminal_port,
                 terminal_protocol_version, has_pending_messages, last_seen, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (session.id, session.worker_id, session.parent_session_id, session.session_type.value,
              session.state.value, session.task, session.cwd, session.tmux_session, session.detail,
-             session.name, session.host, session.bridge_incarnation, int(session.terminal_attachable),
-             session.terminal_host, session.terminal_port, session.terminal_protocol_version,
+             session.name, session.host, session.agent, session.bridge_incarnation,
+             int(session.terminal_attachable), session.terminal_host, session.terminal_port,
+             session.terminal_protocol_version,
              int(session.has_pending_messages), session.last_seen, session.created_at, session.updated_at),
         )
         await self._db.commit()
@@ -493,12 +497,12 @@ class Database:
     async def update_pi_session(self, session: PiSession) -> None:
         await self._db.execute(
             """UPDATE pi_sessions SET worker_id=?, parent_session_id=?, session_type=?, state=?, task=?, cwd=?,
-               tmux_session=?, detail=?, name=?, host=?, bridge_incarnation=?, terminal_attachable=?,
+               tmux_session=?, detail=?, name=?, host=?, agent=?, bridge_incarnation=?, terminal_attachable=?,
                terminal_host=?, terminal_port=?, terminal_protocol_version=?, has_pending_messages=?,
                last_seen=?, updated_at=? WHERE id=?""",
             (session.worker_id, session.parent_session_id, session.session_type.value, session.state.value,
              session.task, session.cwd, session.tmux_session, session.detail, session.name, session.host,
-             session.bridge_incarnation, int(session.terminal_attachable), session.terminal_host,
+             session.agent, session.bridge_incarnation, int(session.terminal_attachable), session.terminal_host,
              session.terminal_port, session.terminal_protocol_version, int(session.has_pending_messages),
              session.last_seen, session.updated_at, session.id),
         )
@@ -529,13 +533,14 @@ class Database:
             await self._db.execute(
                 """INSERT INTO pi_sessions
                    (id, worker_id, parent_session_id, session_type, state, task, cwd, tmux_session,
-                    detail, name, host, bridge_incarnation, terminal_attachable, terminal_host,
+                    detail, name, host, agent, bridge_incarnation, terminal_attachable, terminal_host,
                     terminal_port, terminal_protocol_version, has_pending_messages, last_seen, created_at, updated_at)
-                   VALUES (?, NULL, NULL, ?, ?, '', ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, NULL, NULL, ?, ?, '', ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                      worker_id=NULL, parent_session_id=NULL, session_type=excluded.session_type,
                      state=excluded.state, cwd=excluded.cwd, detail='', name=excluded.name,
-                     host=excluded.host, bridge_incarnation=excluded.bridge_incarnation,
+                     host=excluded.host, agent=excluded.agent,
+                     bridge_incarnation=excluded.bridge_incarnation,
                      terminal_attachable=excluded.terminal_attachable,
                      terminal_host=excluded.terminal_host, terminal_port=excluded.terminal_port,
                      terminal_protocol_version=excluded.terminal_protocol_version,
@@ -543,7 +548,7 @@ class Database:
                      last_seen=excluded.last_seen, updated_at=excluded.updated_at""",
                 (
                     payload.session_id, PiSessionType.INTERACTIVE.value, PiSessionState.IDLE.value,
-                    payload.cwd, payload.name, payload.host, payload.incarnation,
+                    payload.cwd, payload.name, payload.host, payload.agent, payload.incarnation,
                     int(payload.terminal_attachable), payload.terminal_host, payload.terminal_port,
                     payload.terminal_protocol_version, int(payload.has_pending_messages), now, created_at, now,
                 ),

@@ -54,13 +54,13 @@ capture the prepared interactive shell's host runtime before launching Pi:
 
 ```bash
 uv tool install --editable ~/Dev/worker-harness
-wh host setup                        # capture wh/pi/Bun/Node/tmux/Tailscale paths
+wh host setup                        # capture wh/agents/Bun/Node/tmux/Tailscale paths
 wh host doctor                       # validate from a clean SSH-like environment
-wh pi start --name research          # new Pi in the hidden managed tmux backend
-wh pi attach                         # interactive fzf picker
-wh pi attach <id-prefix-or-name>     # select directly
-wh launch                             # machine/cwd → running/history/new picker
-wh pi resume <exact-id> --cwd /repo  # identity-safe target-local resume
+wh start --agent omp --name research # new omp in the hidden managed tmux backend
+wh attach                            # interactive fzf picker across agents
+wh attach <id-prefix-or-name>        # select directly
+wh launch                            # machine/cwd → running/history/new picker
+wh resume <exact-id> --cwd /repo     # identity-safe target-local Pi resume
 ```
 
 `uv tool install` intentionally cannot run project post-install hooks. On an
@@ -75,15 +75,17 @@ uv tool install --force --reinstall \
 `wh host setup` writes a private, atomic
 `~/.config/worker-harness/host-runtime.json` manifest. It records the absolute
 executables and stable PATH needed by non-interactive SSH launches and managed
-tmux panes, including Pi's `#!/usr/bin/env node` dependency and the Bun path
-used to start the host relay. It does not edit shell profiles. Rerun setup after
-moving or upgrading Node, Bun, Pi, tmux, Tailscale, or the `wh` installation;
+tmux panes, including Pi's `#!/usr/bin/env node` dependency, omp when present,
+and the Bun path used to start the host relay. It does not edit shell profiles.
+Rerun setup after moving or upgrading Node, Bun, Pi, omp, tmux, Tailscale, or
+the `wh` installation;
 `wh host doctor` reports stale paths and exits nonzero. Set
 `WH_HOST_RUNTIME_CONFIG` only when an alternate manifest path is required.
 
-`wh pi start` generates the internal Pi session ID, creates one single-pane
-window in a dedicated status-free tmux server, waits for its exact local route,
-and attaches over loopback; `--name` is only the human-facing label. The
+`wh start` creates one single-pane window in a dedicated status-free tmux
+server, waits for its exact local route, and attaches over loopback. Pi accepts
+the generated session ID; omp chooses its own ID, which `wh` resolves from the
+registered tmux pane. `--name` is the human-facing label. The
 managed backend retains 50,000 lines per new pane and enables tmux mouse mode,
 so scrolling up enters tmux copy mode even through Zellij. Press `Ctrl-]` to
 detach without stopping Pi. Tmux sources always stream through a

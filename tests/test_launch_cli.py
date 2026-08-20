@@ -210,7 +210,8 @@ class LaunchCommandTests(unittest.TestCase):
         )
         self.assertTrue(command.startswith("sh -lc "))
         self.assertIn("cd --", command)
-        self.assertIn('exec "$wh_bin" --output json pi start --no-attach --name', command)
+        self.assertIn('exec "$wh_bin" --output json start --no-attach --name', command)
+        self.assertIn("--agent pi", command)
         self.assertIn('wh_bin="$HOME/.local/bin/wh"', command)
         self.assertIn("run `wh host setup`", command)
         # The dangerous fragments exist only as quoted data, never as a bare
@@ -219,6 +220,16 @@ class LaunchCommandTests(unittest.TestCase):
         self.assertEqual(parsed[0:2], ["sh", "-lc"])
         self.assertIn("'/home/u/Dev/a b;echo BAD'", parsed[2])
         self.assertIn("'value;echo BAD'", parsed[2])
+
+    def test_remote_launch_command_forwards_the_selected_agent(self):
+        command = launch.build_remote_launch_command(
+            "/home/u/Dev/a",
+            "omp-probe",
+            [],
+            agent="omp",
+        )
+        self.assertIn('exec "$wh_bin" --output json start --no-attach --name', command)
+        self.assertIn("--agent omp", command)
 
     def test_remote_launch_falls_back_to_uv_tool_link_under_restricted_path(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -307,7 +318,7 @@ class LaunchCommandTests(unittest.TestCase):
             )
         self.assertEqual(rows[0]["id"], "history-1")
         remote = ssh.call_args.args[1]
-        self.assertIn("pi history-list --cwd /home/u/Repo", shlex_split_once(remote)[2])
+        self.assertIn("history-list --cwd /home/u/Repo", shlex_split_once(remote)[2])
 
     def test_target_resume_uses_exact_id_and_no_attach(self):
         completed = subprocess.CompletedProcess([], 0, json.dumps({
@@ -326,7 +337,7 @@ class LaunchCommandTests(unittest.TestCase):
             )
         self.assertEqual(result["session_id"], "history-1")
         script = shlex_split_once(ssh.call_args.args[1])[2]
-        self.assertIn("pi resume history-1 --cwd /home/u/Repo --no-attach", script)
+        self.assertIn("resume history-1 --cwd /home/u/Repo --no-attach", script)
 
     def test_active_sessions_match_exact_target_and_cwd(self):
         machine = self.remote_machine()
@@ -437,6 +448,7 @@ class LaunchCliTests(unittest.TestCase):
                 "--machine", "camel",
                 "--cwd", "/home/u/Dev/Repo",
                 "--name", "Repo",
+                "--agent", "omp",
                 "--no-attach",
                 "--",
                 "--offline",
@@ -446,6 +458,7 @@ class LaunchCliTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["pi_args"], [
             "--offline", "--model", "test/model",
         ])
+        self.assertEqual(run.call_args.kwargs["agent"], "omp")
 
     def test_cli_tmux_picker_passes_exact_popup_locator(self):
         launched = {

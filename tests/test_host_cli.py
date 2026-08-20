@@ -79,6 +79,11 @@ class _FakeRuntimeHarness:
             "#!/bin/sh\necho bun\\n",
         )
         self.executables["node"] = _write_executable(self.bin_extra, "node", node_body)
+        self.executables["omp"] = _write_executable(
+            self.bin_extra,
+            "omp",
+            "#!/bin/sh\necho omp\\n",
+        )
         self.executables["tmux"] = _write_executable(self.bin_root, "tmux", "#!/bin/sh\necho tmux\\n")
         self.executables["tailscale"] = _write_executable(
             self.bin_root,
@@ -120,6 +125,7 @@ class HostRuntimeCaptureTests(unittest.TestCase):
         self.assertEqual(runtime.path[:2], (str(self.harness.bin_root), str(self.harness.bin_extra)))
         # Optional zellij is captured because the fake binary exists.
         self.assertIsNotNone(runtime.executable("zellij"))
+        self.assertIsNotNone(runtime.executable("omp"))
         # Every PATH entry is absolute, non-empty, and existing.
         for entry in runtime.path:
             self.assertTrue(os.path.isabs(entry))

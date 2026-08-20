@@ -22,6 +22,8 @@ from rich.cells import set_cell_size
 from rich.console import Console
 from rich.table import Table
 
+from worker_harness.agents import pick_agent, row_agent, validate_agent
+
 app = typer.Typer(help="Inspect and message registered Pi sessions")
 console = Console()
 logger = logging.getLogger(__name__)
@@ -144,6 +146,7 @@ def _output_mode() -> str:
 def sessions(
     session_type: str | None = typer.Option(None, "--type", help="Filter by interactive, delegated, or global-router"),
     state: str | None = typer.Option(None, "--state", help="Filter by session state"),
+    agent: str | None = typer.Option(None, "--agent", help="Only pi or omp sessions; both when omitted"),
 ):
     """List sessions registered with the orchestrator."""
 
@@ -153,12 +156,14 @@ def sessions(
             rows = [row for row in rows if row.get("session_type") == session_type]
         if state:
             rows = [row for row in rows if row.get("state") == state]
+        rows = _filter_agent(rows, agent)
         if _output_mode() == "json":
             console.print(json.dumps(rows, indent=2))
             return
         table = Table(title="Pi Sessions")
         table.add_column("ID")
         table.add_column("Type")
+        table.add_column("Agent")
         table.add_column("State")
         table.add_column("Name / Task")
         table.add_column("Host / Worker")
@@ -169,6 +174,7 @@ def sessions(
             table.add_row(
                 str(row.get("id", ""))[:12],
                 str(row.get("session_type", "")),
+                row_agent(row),
                 str(row.get("state", "")),
                 str(label)[:40],
                 str(location)[:24],
@@ -252,8 +258,8 @@ def _attach_candidates(
     return candidates
 
 
-async def _candidate_inventory() -> list[dict]:
-    rows = await _request("GET", "/api/v1/pi/sessions?include_attach_info=true")
+async def _candidate_inventory(agent: str | None = None) -> list[dict]:
+    rows = _filter_agent(await _request("GET", "/api/v1/pi/sessions?include_attach_info=true"), agent)
     workers: list[dict] = []
     if any(str(row.get("session_type") or "") == "delegated" for row in rows):
         try:
@@ -265,6 +271,13 @@ async def _candidate_inventory() -> list[dict]:
         workers,
         tailnet_dns_by_ip=_tailnet_dns_labels(),
     )
+
+
+def _filter_agent(rows: list[dict], agent: str | None) -> list[dict]:
+    if not agent:
+        return rows
+    validate_agent(agent)
+    return [row for row in rows if row_agent(row) == agent]
 
 
 def _resolve_session(rows: list[dict], target: str) -> dict:
@@ -491,6 +504,7 @@ def _pick_session(rows: list[dict]) -> dict:
         child = "  " + branch + " " + "   ".join((
             state_glyph(state),
             _PICKER_TYPE.get(session_type, "?"),
+            set_cell_size(row_agent(row), 4),
             dim_context,
             set_cell_size(label, _PICKER_NAME_WIDTH),
             cwd,
@@ -500,6 +514,7 @@ def _pick_session(rows: list[dict]) -> dict:
     header = "      " + "   ".join((
         "S",
         "T",
+        set_cell_size("AGT", 4),
         set_cell_size("MACHINE @TAILNET", _PICKER_CONTEXT_WIDTH),
         set_cell_size("NAME", _PICKER_NAME_WIDTH),
         "PATH",
@@ -708,53 +723,52 @@ def start(
         min=0.1,
         help="Seconds to wait for the local Pi terminal route",
     ),
+    agent: str | None = typer.Option(None, "--agent", help="Agent to launch: pi or omp; asks when omitted"),
 ):
-    """Start a new Pi in the hidden managed tmux backend."""
+    """Start a new agent session in the hidden managed tmux backend."""
 
     from worker_harness.pi_runtime import (
+        ensure_managed_route,
         local_relay_websocket_url,
         start_managed_pi,
-        wait_for_managed_route,
     )
 
     try:
+        agent = pick_agent(agent)
         size = shutil.get_terminal_size(fallback=(80, 24))
         managed = start_managed_pi(
             name=name,
             pi_args=list(ctx.args),
             rows=size.lines,
             cols=size.columns,
+            agent=agent,
         )
 
         async def run() -> None:
-            await wait_for_managed_route(managed, timeout=timeout)
+            session, _route = await ensure_managed_route(managed, timeout=timeout)
             if not attach_after_start:
                 result = {
-                    "session_id": managed.session_id,
-                    "name": managed.name,
-                    "tmux_socket": str(managed.tmux_socket),
-                    "tmux_pane_id": managed.tmux_pane_id,
+                    "session_id": session.session_id,
+                    "name": session.name,
+                    "tmux_socket": str(session.tmux_socket),
+                    "tmux_pane_id": session.tmux_pane_id,
                 }
                 if _output_mode() == "json":
                     console.print(json.dumps(result, indent=2))
                 else:
                     console.print(
-                        f"[green]Started Pi[/] {managed.name} "
-                        f"([dim]{managed.session_id}[/])"
+                        f"[green]Started {agent}[/] {session.name} "
+                        f"([dim]{session.session_id}[/])"
                     )
                 return
-            selected = {
-                "id": managed.session_id,
-                "name": managed.name,
-                "state": "idle",
-            }
+            selected = {"id": session.session_id, "name": session.name, "state": "idle"}
             from worker_harness.pi_zellij import is_immediate_zellij
             if is_immediate_zellij():
                 await _open_in_zellij(selected, loopback=True)
                 return
             await _run_attach_loop(
                 selected,
-                initial_websocket_url=local_relay_websocket_url(managed.session_id),
+                initial_websocket_url=local_relay_websocket_url(session.session_id),
             )
 
         asyncio.run(run())
@@ -884,6 +898,11 @@ def attach(
         help="Select the next or previous attachable session relative to TARGET",
         hidden=True,
     ),
+    agent: str | None = typer.Option(
+        None,
+        "--agent",
+        help="Restrict discovery to pi or omp sessions; both when omitted",
+    ),
     here: bool = typer.Option(False, "--here", hidden=True),
     loopback: bool = typer.Option(False, "--loopback", hidden=True),
     session_name: str | None = typer.Option(None, "--session-name", hidden=True),
@@ -927,11 +946,12 @@ def attach(
                     picker_target_client,
                 )
             )
-            candidates = await _candidate_inventory()
             selected = (
-                _resolve_session(candidates, target)
+                _resolve_session(await _candidate_inventory(), target)
                 if target
-                else _pick_session(await _attachable_candidates(candidates))
+                else _pick_session(
+                    await _attachable_candidates(await _candidate_inventory(agent))
+                )
             )
             from worker_harness.pi_tmux import open_or_focus_attachment_window
 
@@ -965,11 +985,12 @@ def attach(
                 "state": session_state or "disconnected",
             }
         else:
-            candidates = await _candidate_inventory()
             selected = (
-                _resolve_session(candidates, target)
+                _resolve_session(await _candidate_inventory(), target)
                 if target
-                else _pick_session(await _attachable_candidates(candidates))
+                else _pick_session(
+                    await _attachable_candidates(await _candidate_inventory(agent))
+                )
             )
         if is_immediate_zellij() and not here:
             await _open_in_zellij(selected)
@@ -1016,7 +1037,7 @@ def cycle(direction: str = typer.Argument(..., help="next or previous")):
             return
         selected = await _cycle_session(current_session_id, direction)
         executable = shutil.which("wh") or sys.argv[0]
-        os.execvp(executable, [executable, "pi", "attach", str(selected.get("id") or "")])
+        os.execvp(executable, [executable, "attach", str(selected.get("id") or "")])
 
     try:
         asyncio.run(run())

@@ -290,7 +290,6 @@ def open_or_focus_attachment_window(
 
         child = [
             _wh_executable(),
-            "pi",
             "attach",
             "--tmux-child",
             f"--session-name={name}",

@@ -96,15 +96,23 @@ class PiCliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("repo-agent", result.output)
         self.assertIn("interactive", result.output)
+        self.assertIn("pi", result.output)
 
     def test_sessions_json_and_filter(self):
         _state["output"] = "json"
-        rows = [self._session(), {**self._session(), "id": "delegated", "session_type": "delegated"}]
+        rows = [
+            self._session(),
+            {**self._session(), "id": "delegated", "session_type": "delegated"},
+            {**self._session(), "id": "omp", "agent": "omp"},
+        ]
         with patch.object(pi, "_request", new=AsyncMock(return_value=rows)):
-            result = self.runner.invoke(pi.app, ["sessions", "--type", "interactive"])
+            result = self.runner.invoke(
+                pi.app,
+                ["sessions", "--type", "interactive", "--agent", "omp"],
+            )
         self.assertEqual(result.exit_code, 0, result.output)
         parsed = json.loads(result.output)
-        self.assertEqual([row["id"] for row in parsed], ["interactive-session-id"])
+        self.assertEqual([row["id"] for row in parsed], ["omp"])
 
     def test_cycle_order_wraps_in_both_directions(self):
         rows = [
@@ -373,7 +381,7 @@ class PiCliTests(unittest.TestCase):
             result = self.runner.invoke(pi.app, ["cycle", "previous"])
         self.assertEqual(result.exit_code, 0, result.output)
         execute.assert_called_once_with(
-            "/usr/bin/wh", ["/usr/bin/wh", "pi", "attach", "second"]
+            "/usr/bin/wh", ["/usr/bin/wh", "attach", "second"]
         )
 
     def test_start_creates_named_hidden_pi_and_can_return_without_attach(self):
@@ -383,13 +391,13 @@ class PiCliTests(unittest.TestCase):
         start_managed = patch(
             "worker_harness.pi_runtime.start_managed_pi", return_value=managed
         )
-        wait_route = AsyncMock(return_value={"multiplexer": "tmux"})
+        ensure_route = AsyncMock(return_value=(managed, {"multiplexer": "tmux"}))
         with (
             start_managed as start_runtime,
-            patch("worker_harness.pi_runtime.wait_for_managed_route", new=wait_route),
+            patch("worker_harness.pi_runtime.ensure_managed_route", new=ensure_route),
         ):
             result = self.runner.invoke(pi.app, [
-                "start", "--name", "research", "--no-attach", "--",
+                "start", "--name", "research", "--agent", "pi", "--no-attach", "--",
                 "--model", "openai/test", "hello world",
             ])
         self.assertEqual(result.exit_code, 0, result.output)
@@ -398,7 +406,8 @@ class PiCliTests(unittest.TestCase):
             start_runtime.call_args.kwargs["pi_args"],
             ["--model", "openai/test", "hello world"],
         )
-        wait_route.assert_awaited_once_with(managed, timeout=10.0)
+        self.assertEqual(start_runtime.call_args.kwargs["agent"], "pi")
+        ensure_route.assert_awaited_once_with(managed, timeout=10.0)
 
     def test_start_attaches_exact_generated_session_over_loopback(self):
         managed = pi_runtime.ManagedPiSession(
@@ -408,8 +417,8 @@ class PiCliTests(unittest.TestCase):
         with (
             patch("worker_harness.pi_runtime.start_managed_pi", return_value=managed),
             patch(
-                "worker_harness.pi_runtime.wait_for_managed_route",
-                new=AsyncMock(return_value={"multiplexer": "tmux"}),
+                "worker_harness.pi_runtime.ensure_managed_route",
+                new=AsyncMock(return_value=(managed, {"multiplexer": "tmux"})),
             ),
             patch(
                 "worker_harness.pi_runtime.local_relay_websocket_url",
@@ -417,7 +426,7 @@ class PiCliTests(unittest.TestCase):
             ),
             patch.object(pi, "_run_attach_loop", new=attach_loop),
         ):
-            result = self.runner.invoke(pi.app, ["start", "--name", "research"])
+            result = self.runner.invoke(pi.app, ["start", "--name", "research", "--agent", "pi"])
         self.assertEqual(result.exit_code, 0, result.output)
         attach_loop.assert_awaited_once_with(
             {"id": "generated-id", "name": "research", "state": "idle"},
@@ -435,13 +444,13 @@ class PiCliTests(unittest.TestCase):
             }),
             patch("worker_harness.pi_runtime.start_managed_pi", return_value=managed),
             patch(
-                "worker_harness.pi_runtime.wait_for_managed_route",
-                new=AsyncMock(return_value={"multiplexer": "tmux"}),
+                "worker_harness.pi_runtime.ensure_managed_route",
+                new=AsyncMock(return_value=(managed, {"multiplexer": "tmux"})),
             ),
             patch.object(pi, "_open_in_zellij", new=opener),
             patch.object(pi, "_run_attach_loop", new=AsyncMock()) as attach_loop,
         ):
-            result = self.runner.invoke(pi.app, ["start", "--name", "research"])
+            result = self.runner.invoke(pi.app, ["start", "--name", "research", "--agent", "pi"])
         self.assertEqual(result.exit_code, 0, result.output)
         opener.assert_awaited_once_with({
             "id": "generated-id", "name": "research", "state": "idle",
@@ -459,6 +468,20 @@ class PiCliTests(unittest.TestCase):
         ]
         selected = asyncio.run(pi._attachable_candidates(rows))
         self.assertEqual([row["id"] for row in selected], ["interactive-session-id"])
+
+    def test_candidate_inventory_filters_agent_before_grouping(self):
+        rows = [
+            {**self._session(), "agent": "pi"},
+            {**self._session(), "id": "omp", "agent": "omp"},
+        ]
+        with (
+            patch.object(pi, "_request", new=AsyncMock(return_value=rows)),
+            patch.object(pi, "_tailnet_dns_labels", return_value={}),
+        ):
+            selected = asyncio.run(pi._candidate_inventory("omp"))
+        self.assertEqual([row["id"] for row in selected], ["omp"])
+        self.assertTrue(selected[0]["_machine_first"])
+        self.assertTrue(selected[0]["_machine_last"])
 
     def test_attach_picker_reports_outdated_orchestrator(self):
         with self.assertRaisesRegex(RuntimeError, "orchestrator does not support"):

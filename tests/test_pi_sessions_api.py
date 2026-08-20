@@ -150,10 +150,12 @@ class PiSessionsApiTests(unittest.TestCase):
                 "cwd": "/home/dome/project",
                 "name": "project-agent",
                 "host": "archdome",
+                "agent": "omp",
             })
             self.assertEqual(registered.status_code, 200, registered.text)
             self.assertEqual(registered.json()["session_type"], "interactive")
             self.assertEqual(registered.json()["state"], "idle")
+            self.assertEqual(registered.json()["agent"], "omp")
 
             event_payload = {
                 "incarnation": first_incarnation,

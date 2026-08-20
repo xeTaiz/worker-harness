@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import fcntl
 import hashlib
 import json
@@ -18,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 from urllib.parse import quote
+
+from worker_harness.agents import AGENT_EXECUTABLE_ENV, validate_agent
 
 MANAGED_TMUX_SESSION = "wh-pi"
 MANAGED_TMUX_HISTORY_LIMIT = 50_000
@@ -117,8 +120,8 @@ def validate_new_session_args(pi_args: Sequence[str]) -> None:
     for argument in pi_args:
         if argument in _CONFLICTING_PI_OPTIONS or argument.startswith(_CONFLICTING_PI_PREFIXES):
             raise RuntimeError(
-                f"Pi option {argument!r} conflicts with managed new-session identity; "
-                "resume/continue/fork modes are not supported by wh pi start yet"
+                f"agent option {argument!r} conflicts with managed new-session identity; "
+                "resume/continue/fork modes are not supported by wh start yet"
             )
 
 
@@ -133,19 +136,20 @@ def _host_runtime():
         ) from exc
 
 
-def _real_pi_executable() -> str:
-    configured = os.environ.get("WH_PI_EXECUTABLE")
+def _real_agent_executable(agent: str) -> str:
+    override = AGENT_EXECUTABLE_ENV[validate_agent(agent)]
+    configured = os.environ.get(override)
     if configured:
         candidate = Path(configured).expanduser()
         if not candidate.is_file() or not os.access(candidate, os.X_OK):
-            raise RuntimeError(f"WH_PI_EXECUTABLE is not executable: {candidate}")
+            raise RuntimeError(f"{override} is not executable: {candidate}")
         return str(candidate.resolve())
     runtime = _host_runtime()
-    executable = runtime.executable("pi") if runtime else shutil.which("pi")
+    executable = runtime.executable(agent) if runtime else shutil.which(agent)
     if not executable:
         raise RuntimeError(
-            "Pi executable not found; run `wh host setup` from a shell where pi is available "
-            "or set WH_PI_EXECUTABLE"
+            f"{agent} executable not found; run `wh host setup` from a shell where {agent} is "
+            f"available or set {override}"
         )
     return str(Path(executable).resolve())
 
@@ -155,7 +159,7 @@ def _tmux_executable() -> str:
     executable = runtime.executable("tmux") if runtime else shutil.which("tmux")
     if not executable:
         raise RuntimeError(
-            "tmux is required for wh pi start; run `wh host setup` from a prepared shell"
+            "tmux is required for wh start; run `wh host setup` from a prepared shell"
         )
     return executable
 
@@ -210,7 +214,7 @@ def _run_tmux(
             env=_tmux_environment(),
         )
     except FileNotFoundError as exc:
-        raise RuntimeError("tmux is required for wh pi start") from exc
+        raise RuntimeError("tmux is required for wh start") from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"tmux command timed out: {' '.join(args)}") from exc
     if check and result.returncode != 0:
@@ -304,6 +308,7 @@ def start_managed_pi(
     cols: int = 80,
     session_id: str | None = None,
     executable: str | None = None,
+    agent: str = "pi",
     _resume_existing: bool = False,
 ) -> ManagedPiSession:
     """Create one detached Pi window in the dedicated hidden tmux server."""
@@ -316,7 +321,7 @@ def start_managed_pi(
     display_name = (name or _default_name(cwd, session_id)).strip()
     if not display_name:
         raise RuntimeError("Pi session name cannot be empty")
-    pi_executable = executable or _real_pi_executable()
+    pi_executable = executable or _real_agent_executable(agent)
     socket = managed_tmux_socket_path()
     _prepare_managed_runtime(socket)
     if _resume_existing and _managed_session_id_is_live(socket, session_id):
@@ -326,11 +331,18 @@ def start_managed_pi(
     runtime_assignments = (
         [f"PATH={os.pathsep.join(runtime.path)}"] if runtime is not None else []
     )
-    identity_args = (
-        ["--session", session_id]
-        if _resume_existing
-        else ["--session-id", session_id, "--name", display_name]
-    )
+    if validate_agent(agent) == "omp":
+        if _resume_existing:
+            raise RuntimeError("omp sessions cannot be resumed through the managed runtime yet")
+        # omp has no --session-id/--name; its id is read back from the pane after start.
+        identity_args: list[str] = []
+        session_id = ""
+    else:
+        identity_args = (
+            ["--session", session_id]
+            if _resume_existing
+            else ["--session-id", session_id, "--name", display_name]
+        )
     command = shlex.join([
         "env",
         "WH_MANAGED_PI=1",
@@ -541,5 +553,50 @@ async def wait_for_managed_route(
         await asyncio.sleep(min(_ROUTE_POLL_SECONDS, max(0.0, deadline - loop.time())))
     raise RuntimeError(
         f"Pi is still running but its local terminal route did not become ready within {timeout:g}s: "
-        f"{last_error}. Attach later with: wh pi attach {session.session_id}"
+        f"{last_error}. Attach later with: wh attach {session.session_id}"
     )
+
+
+async def _locate_managed_session_id(session: ManagedPiSession, *, timeout: float) -> str:
+    """Read back the session id the agent chose for one exact managed pane."""
+
+    from worker_harness.pi_terminal import _relay_request
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    last_error = "managed pane has not registered a session"
+    while loop.time() < deadline:
+        try:
+            located = await _relay_request({
+                "action": "locate",
+                "multiplexer": "tmux",
+                "tmux_socket": str(session.tmux_socket),
+                "tmux_pane_id": session.tmux_pane_id,
+            })
+            session_id = str(located.get("session_id") or "")
+            if session_id:
+                return session_id
+            last_error = "relay returned an empty session id"
+        except (OSError, asyncio.TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
+            last_error = str(exc)
+        if not await asyncio.to_thread(managed_pane_is_live, session):
+            raise RuntimeError("agent exited before registering its local terminal route")
+        await asyncio.sleep(min(_ROUTE_POLL_SECONDS, max(0.0, deadline - loop.time())))
+    raise RuntimeError(
+        f"managed agent pane did not register a session within {timeout:g}s: {last_error}"
+    )
+
+
+async def ensure_managed_route(
+    session: ManagedPiSession,
+    *,
+    timeout: float = 10.0,
+) -> tuple[ManagedPiSession, dict[str, Any]]:
+    """Resolve an agent-chosen session id when absent, then validate its route."""
+
+    if not session.session_id:
+        session = dataclasses.replace(
+            session,
+            session_id=await _locate_managed_session_id(session, timeout=timeout),
+        )
+    return session, await wait_for_managed_route(session, timeout=timeout)

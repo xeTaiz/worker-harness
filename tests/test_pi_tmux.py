@@ -110,7 +110,6 @@ def test_new_window_quotes_child_and_sets_ownership_state(monkeypatch, tmp_path)
     assert gated[4].startswith("wh-pi-attach-")
     assert gated[5:] == [
         "/opt/bin/wh",
-        "pi",
         "attach",
         "--tmux-child",
         "--session-name=name with ' quote",

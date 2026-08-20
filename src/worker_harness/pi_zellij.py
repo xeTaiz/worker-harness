@@ -243,7 +243,6 @@ def open_or_focus_attachment_tab(
             "--close-on-exit",
             "--",
             _wh_executable(),
-            "pi",
             "attach",
             "--here",
             f"--session-name={name}",

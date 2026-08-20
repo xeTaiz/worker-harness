@@ -17,6 +17,8 @@ import httpx
 import typer
 from rich.console import Console
 
+from worker_harness.agents import pick_agent, row_agent
+
 console = Console()
 
 _WORKER_TAG = "tag:wh-worker"
@@ -460,7 +462,13 @@ def _build_remote_wh_command(cwd: str, argv: Sequence[str]) -> str:
     return "sh -lc " + shlex.quote(script)
 
 
-def build_remote_launch_command(cwd: str, name: str, pi_args: Sequence[str]) -> str:
+def build_remote_launch_command(
+    cwd: str,
+    name: str,
+    pi_args: Sequence[str],
+    *,
+    agent: str = "pi",
+) -> str:
     """Build the one strictly quoted target-side new-session command."""
 
     if not name.strip() or "\0" in name:
@@ -468,11 +476,12 @@ def build_remote_launch_command(cwd: str, name: str, pi_args: Sequence[str]) -> 
     argv = [
         "--output",
         "json",
-        "pi",
         "start",
         "--no-attach",
         "--name",
         name,
+        "--agent",
+        agent,
     ]
     if pi_args:
         argv.extend(("--", *pi_args))
@@ -502,6 +511,7 @@ def run_target_launch(
     name: str,
     pi_args: Sequence[str],
     timeout: float,
+    agent: str = "pi",
 ) -> dict[str, Any]:
     """Launch through local argv or one SSH remote command and parse its UUID."""
 
@@ -513,11 +523,12 @@ def run_target_launch(
             wh,
             "--output",
             "json",
-            "pi",
             "start",
             "--no-attach",
             "--name",
             name,
+            "--agent",
+            agent,
         ]
         if pi_args:
             command.extend(("--", *pi_args))
@@ -525,7 +536,7 @@ def run_target_launch(
     else:
         if destination is None:
             raise RuntimeError("remote machine requires an SSH destination")
-        remote = build_remote_launch_command(cwd, name, pi_args)
+        remote = build_remote_launch_command(cwd, name, pi_args, agent=agent)
         result = _run_ssh_phase(
             destination,
             remote,
@@ -553,7 +564,7 @@ def list_target_history(
         raise RuntimeError("remote machine requires an SSH destination")
     remote = _build_remote_wh_command(
         cwd,
-        ["--output", "json", "pi", "history-list", "--cwd", cwd],
+        ["--output", "json", "history-list", "--cwd", cwd],
     )
     result = _run_ssh_phase(
         destination,
@@ -587,7 +598,6 @@ def run_target_resume(
     argv = [
         "--output",
         "json",
-        "pi",
         "resume",
         session_id,
         "--cwd",
@@ -831,6 +841,7 @@ async def launch_managed_pi(
     attach_after_start: bool,
     timeout: float,
     pi_args: Sequence[str],
+    agent: str = "pi",
     tmux_target_session: str | None = None,
     tmux_target_client: str | None = None,
 ) -> dict[str, Any]:
@@ -876,18 +887,22 @@ async def launch_managed_pi(
         except RuntimeError as exc:
             console.print(f"[yellow]Running Pi sessions unavailable:[/] {exc}")
             registered = []
-        active = _active_sessions_for_target(registered, machine, cwd)
+        active = [
+            row for row in _active_sessions_for_target(registered, machine, cwd)
+            if row_agent(row) == agent
+        ]
         histories: list[dict[str, Any]] = []
-        try:
-            histories = await asyncio.to_thread(
-                list_target_history,
-                machine,
-                destination=destination,
-                cwd=cwd,
-                timeout=timeout,
-            )
-        except (RuntimeError, RemoteCommandError) as exc:
-            console.print(f"[yellow]Previous Pi sessions unavailable:[/] {exc}")
+        if agent == "pi":
+            try:
+                histories = await asyncio.to_thread(
+                    list_target_history,
+                    machine,
+                    destination=destination,
+                    cwd=cwd,
+                    timeout=timeout,
+                )
+            except (RuntimeError, RemoteCommandError) as exc:
+                console.print(f"[yellow]Previous Pi sessions unavailable:[/] {exc}")
         active_ids = {
             str(row.get("id") or "")
             for row in registered
@@ -961,6 +976,7 @@ async def launch_managed_pi(
         name=name,
         pi_args=pi_args,
         timeout=timeout,
+        agent=agent,
     )
     session_id = str(launched["session_id"])
     selected = await wait_for_registered_session(
@@ -998,6 +1014,7 @@ def launch(
         help="Absolute working directory on the target; picker when omitted",
     ),
     name: str | None = typer.Option(None, "--name", "-n", help="Human-facing Pi name"),
+    agent: str | None = typer.Option(None, "--agent", help="Agent to launch: pi or omp; asks when omitted"),
     ssh_user: str | None = typer.Option(None, "--ssh-user", help="OpenSSH user override"),
     attach_after_start: bool = typer.Option(
         True,
@@ -1030,6 +1047,7 @@ def launch(
                 tmux_target_session,
                 tmux_target_client,
             )
+        agent = pick_agent(agent)
         result = asyncio.run(launch_managed_pi(
             machine_selector=machine,
             cwd=cwd,
@@ -1038,6 +1056,7 @@ def launch(
             attach_after_start=attach_after_start,
             timeout=timeout,
             pi_args=list(ctx.args),
+            agent=agent,
             tmux_target_session=tmux_target_session,
             tmux_target_client=tmux_target_client,
         ))

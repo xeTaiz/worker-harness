@@ -86,6 +86,34 @@ class PiRuntimeTests(unittest.TestCase):
             ),
         )
 
+    def test_omp_window_omits_pi_identity_flags_and_defers_the_session_id(self):
+        completed = subprocess.CompletedProcess([], 0, "%43\n", "")
+        with tempfile.TemporaryDirectory() as directory:
+            socket = Path(directory) / "pi-tmux.sock"
+            with (
+                patch.object(pi_runtime, "managed_tmux_socket_path", return_value=socket),
+                patch.object(pi_runtime, "_host_runtime", return_value=None),
+                patch.object(pi_runtime, "_session_exists", return_value=True),
+                patch.object(pi_runtime, "_configure_managed_server"),
+                patch.object(pi_runtime, "_run_tmux", return_value=completed) as run,
+            ):
+                managed = pi_runtime.start_managed_pi(
+                    name="omp-probe",
+                    pi_args=["hello world"],
+                    cwd=Path(directory),
+                    executable="/usr/bin/omp",
+                    agent="omp",
+                )
+        self.assertEqual(managed.session_id, "")
+        self.assertEqual(managed.name, "omp-probe")
+        launched = shlex.split(run.call_args_list[0].args[-1])
+        self.assertEqual(launched, [
+            "env",
+            "WH_MANAGED_PI=1",
+            "/usr/bin/omp",
+            "hello world",
+        ])
+
     def test_first_window_on_older_tmux_uses_xterm_extended_keys(self):
         completed = subprocess.CompletedProcess([], 0, "%7\n", "")
         with tempfile.TemporaryDirectory() as directory:
@@ -448,6 +476,22 @@ class PiRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(route["tmux_pane_id"], "%9")
         self.assertEqual(relay.await_count, 2)
 
+    async def test_ensure_route_resolves_agent_chosen_session_id(self):
+        session = pi_runtime.ManagedPiSession(
+            "", "omp-probe", Path("/tmp/managed.sock"), "%9"
+        )
+        locate = AsyncMock(return_value="chosen-session")
+        wait = AsyncMock(return_value={"multiplexer": "tmux"})
+        with (
+            patch.object(pi_runtime, "_locate_managed_session_id", new=locate),
+            patch.object(pi_runtime, "wait_for_managed_route", new=wait),
+        ):
+            resolved, route = await pi_runtime.ensure_managed_route(session, timeout=3)
+        self.assertEqual(resolved.session_id, "chosen-session")
+        self.assertEqual(route["multiplexer"], "tmux")
+        locate.assert_awaited_once_with(session, timeout=3)
+        wait.assert_awaited_once_with(resolved, timeout=3)
+
     async def test_wait_timeout_reports_running_session_and_manual_attach(self):
         session = pi_runtime.ManagedPiSession(
             "session-1", "test", Path("/tmp/managed.sock"), "%9"
@@ -461,7 +505,7 @@ class PiRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):
             patch.object(pi_runtime, "_ROUTE_POLL_SECONDS", 0),
         ):
             with self.assertRaisesRegex(
-                RuntimeError, r"still running.*wh pi attach session-1"
+                RuntimeError, r"still running.*wh attach session-1"
             ):
                 await pi_runtime.wait_for_managed_route(session, timeout=0.01)
 
