@@ -226,6 +226,41 @@ async def sweep_expired_pi_delegations(db: Database, relay_request_fn, now: int 
         ))
 
 
+async def reconcile_active_ssh_jobs(
+    db: Database,
+    job_manager: JobManager,
+    *,
+    max_concurrent: int = 4,
+) -> None:
+    """Refresh persisted SSH job state without blocking read endpoints."""
+    jobs = [
+        job
+        for job in await db.list_jobs()
+        if job.kind == JobKind.SSH
+        and job.status in (JobStatus.RUNNING, JobStatus.PENDING)
+    ]
+    if not jobs:
+        return
+
+    workers = {worker.id: worker for worker in await db.list_workers()}
+    pending = iter(jobs)
+
+    async def reconcile_worker() -> None:
+        for job in pending:
+            worker = workers.get(job.worker_id or "")
+            if worker is None:
+                continue
+            try:
+                await job_manager.refresh_job_status(worker, job)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Failed to reconcile job %s", job.id)
+
+    worker_count = min(max(1, max_concurrent), len(jobs))
+    await asyncio.gather(*(reconcile_worker() for _ in range(worker_count)))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start reliability background work and deterministically clean up.
@@ -234,23 +269,21 @@ async def lifespan(app: FastAPI):
     tunnel and every queued lane waiter belongs to this FastAPI app.
     """
     app.state.reaper_task = asyncio.create_task(reap_loop(app))
+    background_tasks = [app.state.reaper_task]
     sweeper = getattr(app.state, "pi_delegation_sweeper", None)
     if sweeper is not None:
         app.state.pi_sweeper_task = asyncio.create_task(sweeper())
+        background_tasks.append(app.state.pi_sweeper_task)
+    reconciler = getattr(app.state, "job_reconciler", None)
+    if reconciler is not None:
+        app.state.job_reconciler_task = asyncio.create_task(reconciler())
+        background_tasks.append(app.state.job_reconciler_task)
     try:
         yield
     finally:
-        app.state.reaper_task.cancel()
-        if sweeper is not None:
-            app.state.pi_sweeper_task.cancel()
-            try:
-                await app.state.pi_sweeper_task
-            except asyncio.CancelledError:
-                pass
-        try:
-            await app.state.reaper_task
-        except asyncio.CancelledError:
-            pass
+        for task in background_tasks:
+            task.cancel()
+        await asyncio.gather(*background_tasks, return_exceptions=True)
         reaped = app.state.tunnels.shutdown()
         app.state.metrics.reaped_tunnels_total.inc(reaped)
         await app.state.lanes.shutdown()
@@ -1582,18 +1615,25 @@ def create_app(db: Database, router_client=None) -> FastAPI:
 
         refreshed = []
         for job in jobs:
-            # Delegated jobs are reported/reconciled by their worker-local
-            # relay. A transient SSH read must not overwrite that projection.
-            if job.kind == JobKind.SSH and job.status in (JobStatus.RUNNING, JobStatus.PENDING):
-                worker = workers.get(job.worker_id or "")
-                if worker:
-                    job = await jm.refresh_job_status(worker, job)
             item = job.model_dump(mode="json")
             worker_ref = workers.get(job.worker_id or "")
             item["worker_name"] = worker_ref.name if worker_ref else None
             refreshed.append(item)
 
         return refreshed
+
+    async def _job_reconciler() -> None:
+        interval = _positive_int_env("WH_JOB_RECONCILE_INTERVAL_SECONDS", 10)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await reconcile_active_ssh_jobs(db, jm)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Job reconciliation iteration failed")
+
+    app.state.job_reconciler = _job_reconciler
 
     @app.get("/api/v1/jobs/{job_id}/logs")
     async def jobs_logs(

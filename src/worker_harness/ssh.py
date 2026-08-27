@@ -329,13 +329,22 @@ async def ssh_tmux_kill(worker: Worker, job_id: str) -> SSHResult:
     return await async_ssh_run(worker, cmd, timeout=10)
 
 
-async def ssh_tmux_running(worker: Worker, job_id: str) -> bool:
+async def ssh_tmux_running(worker: Worker, job_id: str) -> bool | None:
+    """Return remote running state, or None when the SSH probe failed."""
     log_path = f"{_worker_harness_dir(worker)}/{job_id}/output.log"
     result = await async_ssh_run(
         worker,
         f"grep -q '^EXIT:' '{log_path}' 2>/dev/null && echo 'done' || echo 'running'",
         timeout=5,
     )
+    if result.returncode != 0:
+        log.warning(
+            "Could not probe job %s on %s: %s",
+            job_id,
+            worker.name,
+            result.stderr.strip() or f"exit {result.returncode}",
+        )
+        return None
     return result.stdout.strip() == "running"
 
 

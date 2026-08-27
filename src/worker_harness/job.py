@@ -91,21 +91,27 @@ class JobManager:
             return job
 
         is_running = await ssh_tmux_running(worker, job.id)
-        if not is_running:
-            exit_code = await ssh_get_exit_code(worker, job.id)
-            # None means retrieval failed; treat as unknown but don't falsely mark as DONE
-            if exit_code is None:
-                job.status = JobStatus.FAILED
-            else:
-                job.status = JobStatus.FAILED if exit_code != 0 else JobStatus.DONE
-            job.exit_code = exit_code
-            job.finished_at = int(datetime.now(timezone.utc).timestamp())
-            await self.db.update_job(job)
+        if is_running is None or is_running:
+            return job
 
-            if job.status == JobStatus.FAILED:
-                await self._record_failure(worker, job)
+        exit_code = await ssh_get_exit_code(worker, job.id)
+        if exit_code is None:
+            log.warning(
+                "Job %s on %s reported completion but its exit code is unavailable",
+                job.id,
+                worker.name,
+            )
+            return job
 
-            log.info(f"Job {job.id} finished with exit code {exit_code}")
+        job.status = JobStatus.FAILED if exit_code != 0 else JobStatus.DONE
+        job.exit_code = exit_code
+        job.finished_at = int(datetime.now(timezone.utc).timestamp())
+        await self.db.update_job(job)
+
+        if job.status == JobStatus.FAILED:
+            await self._record_failure(worker, job)
+
+        log.info(f"Job {job.id} finished with exit code {exit_code}")
         return job
 
     async def get_logs(

@@ -15,7 +15,8 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from worker_harness.db import Database
-from worker_harness.heartbeat import create_app
+from worker_harness.heartbeat import create_app, reconcile_active_ssh_jobs
+from worker_harness.job import JobManager
 from worker_harness.models import GPUInfo, Job, JobKind, JobStatus, WorkerRegistration
 from worker_harness.ssh import SSHResult
 
@@ -53,8 +54,6 @@ class SyncJobsApiTests(unittest.TestCase):
         Path(self.tmp.name).unlink(missing_ok=True)
 
     def test_delegated_job_refresh_never_probes_ssh(self):
-        from worker_harness.job import JobManager
-
         worker = asyncio.run(self.db.get_worker("w-test"))
         job = Job(
             id="delegated-job",
@@ -67,6 +66,76 @@ class SyncJobsApiTests(unittest.TestCase):
             refreshed = asyncio.run(JobManager(self.db).refresh_job_status(worker, job))
         self.assertIs(refreshed, job)
         self.assertEqual(refreshed.status, JobStatus.RUNNING)
+
+    def test_jobs_list_returns_cached_state_without_ssh(self):
+        job = Job(id="cached-job", worker_id="w-test", status=JobStatus.RUNNING)
+        asyncio.run(self.db.insert_job(job))
+        refresh = AsyncMock(side_effect=AssertionError("listing must not probe SSH"))
+
+        with patch("worker_harness.heartbeat.JobManager.refresh_job_status", new=refresh):
+            response = self.client.get("/api/v1/jobs")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()[0]["id"], job.id)
+        self.assertEqual(response.json()[0]["status"], "running")
+        refresh.assert_not_awaited()
+
+    def test_refresh_transport_failure_preserves_running_job(self):
+        worker = asyncio.run(self.db.get_worker("w-test"))
+        job = Job(id="unreachable-job", worker_id="w-test", status=JobStatus.RUNNING)
+        asyncio.run(self.db.insert_job(job))
+        exit_probe = AsyncMock(side_effect=AssertionError("unknown status must not read exit code"))
+
+        with patch("worker_harness.job.ssh_tmux_running", new=AsyncMock(return_value=None)), \
+             patch("worker_harness.job.ssh_get_exit_code", new=exit_probe):
+            refreshed = asyncio.run(JobManager(self.db).refresh_job_status(worker, job))
+
+        self.assertEqual(refreshed.status, JobStatus.RUNNING)
+        self.assertEqual(asyncio.run(self.db.get_job(job.id)).status, JobStatus.RUNNING)
+        exit_probe.assert_not_awaited()
+
+    def test_missing_exit_code_preserves_running_job(self):
+        worker = asyncio.run(self.db.get_worker("w-test"))
+        job = Job(id="unknown-exit-job", worker_id="w-test", status=JobStatus.RUNNING)
+        asyncio.run(self.db.insert_job(job))
+
+        with patch("worker_harness.job.ssh_tmux_running", new=AsyncMock(return_value=False)), \
+             patch("worker_harness.job.ssh_get_exit_code", new=AsyncMock(return_value=None)):
+            refreshed = asyncio.run(JobManager(self.db).refresh_job_status(worker, job))
+
+        self.assertEqual(refreshed.status, JobStatus.RUNNING)
+        self.assertEqual(refreshed.finished_at, 0)
+        self.assertEqual(asyncio.run(self.db.get_job(job.id)).status, JobStatus.RUNNING)
+
+    def test_reconciler_bounds_concurrent_status_probes(self):
+        for index in range(6):
+            asyncio.run(self.db.insert_job(Job(
+                id=f"running-{index}",
+                worker_id="w-test",
+                status=JobStatus.RUNNING,
+            )))
+
+        active = 0
+        peak = 0
+        reconciled: list[str] = []
+
+        async def refresh(_manager, _worker, job):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(0.01)
+                reconciled.append(job.id)
+                return job
+            finally:
+                active -= 1
+
+        manager = JobManager(self.db)
+        with patch.object(JobManager, "refresh_job_status", new=refresh):
+            asyncio.run(reconcile_active_ssh_jobs(self.db, manager, max_concurrent=2))
+
+        self.assertEqual(peak, 2)
+        self.assertEqual(len(reconciled), 6)
 
     def test_sync_job_returns_stdout(self):
         """Sync mode blocks and returns the command output."""

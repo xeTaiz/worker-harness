@@ -24,7 +24,8 @@ access is intentionally separate.
 
 ### Jobs
 - POST /api/v1/jobs
-- GET /api/v1/jobs
+- GET /api/v1/jobs — return persisted job state immediately; bounded background
+  reconciliation updates active SSH jobs without delaying reads
 - GET /api/v1/jobs/:id/logs
 - GET /api/v1/jobs/:id/logs/stream
 - DELETE /api/v1/jobs/:id
