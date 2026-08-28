@@ -119,6 +119,16 @@ delegated workers. `Alt-u/y`, prefix Ctrl-j/l/h/k, and in-stream `Ctrl-^`/
 `Ctrl-_` cycle through that same order. Zellij keeps its existing `Ctrl-b`
 tmux-emulation mode entry as well.
 
+Inside a Herdr pane, `wh attach` uses the same native protocol-v2 stream and
+reports the selected Pi/OMP session plus host metadata to Herdr's Agent sidebar.
+Working/idle lifecycle comes from the Worker Harness session stream rather than
+Herdr screen matching. The client re-applies its current pane dimensions after
+the relay backend becomes ready, so Herdr startup and dynamic pane resizes reach
+the source TUI. `Ctrl-]` releases Worker Harness lifecycle authority and
+metadata before returning to the pane's shell. Managed `wh start` sessions do
+not inherit the outer Herdr pane identity; the visible attachment client alone
+owns that sidebar projection.
+
 After `wh launch` selects a machine and cwd, its interactive action picker shows
 active Worker Harness sessions, inactive target-local Pi histories, and Start
 new. Active sessions attach without relaunching. Previous sessions are listed
@@ -347,16 +357,25 @@ apptainer pull worker-harness-worker.sif docker-daemon://xetaiz/wh-worker:latest
 Recommended deploy flow:
 
 ```bash
-just dist
-rsync -a dist/ target:/path/to/worker-harness/
+just deploy target
 ```
 
-Then on the target host:
+`target` may be a host alias from `~/.ssh/config` or `user@hostname`. The recipe
+builds `dist/`, mirrors it to `target:~/worker-harness`, and runs the installer
+there. The installer:
 
-```bash
-cd /path/to/worker-harness
-./install-service.sh
-```
+1. installs prerequisites through the host package manager, then installs
+   rclone from the official `https://rclone.org/install.sh` script when rclone
+   is absent or lacks the SMB backend,
+2. creates and validates the mount directories described by
+   `rclone-*.service`,
+3. symlinks and starts only services whose remotes are reachable,
+4. binds successful rclone mounts at `/data_shared`, `/data_ibex`, and
+   `/data_ibex_c2324`, and
+5. symlinks and starts the worker harness service.
+
+Keep the host-specific rclone credentials in the gitignored
+`worker_rclone.conf`; `just dist` packages it as `dist/rclone.conf`.
 
 If you want to run it manually instead of systemd, put env vars in `.env` (or set `WH_ENV_FILE`) and run:
 
@@ -372,7 +391,7 @@ Notes:
 - Worker runtime user is auto-detected and registered as `ssh_user` (fallback `root`).
 - `start-wh.sh` uses `--fakeroot` only when subordinate UID/GID ranges exist; override with `WH_FAKEROOT=1` or `0`.
 - Tailscale SSH always uses Tailnet port `22`; this does not require publishing host port `22`.
-- `just dist` stages a rsync-friendly bundle from the repo `.env` (generated `dist/.env` is gitignored).
+- `just dist` stages a deploy bundle from the repo `.env`; generated credentials, `.env`, and `.sif` files under `dist/` are gitignored.
 
 ### Auto-start on reboot (systemd user service)
 
@@ -382,7 +401,7 @@ If you want the worker to restart automatically after a crash:
 ./install-service.sh
 ```
 
-`install-service.sh` keeps `start-wh.sh` and `worker-harness-worker.sif` in the install directory, and creates symlinks from `~/.config/systemd/user/` and `~/.config/worker-harness/` back into that directory. The runtime env remains mutable at `~/worker-harness/.env` (linked as `~/.config/worker-harness/worker-harness.env`). Updating scripts or units therefore requires no recopy; run `systemctl --user daemon-reload` after unit changes and restart the affected service as needed. Existing copied installations can migrate once with `./migrate-to-symlinks.sh`; it preserves a regular config env as the source of truth and backs up replaced files.
+`install-service.sh` keeps `start-wh.sh`, `worker-harness-worker.sif`, `rclone.conf`, and all service units in `~/worker-harness`. It creates symlinks from `~/.config/systemd/user/`, `~/.config/worker-harness/`, and `~/.config/rclone/` back into that directory. The runtime env remains mutable at `~/worker-harness/.env` (linked as `~/.config/worker-harness/worker-harness.env`). Updating scripts or units therefore requires no recopy; run `systemctl --user daemon-reload` after unit changes and restart the affected service as needed. Existing copied installations can migrate once with `./migrate-to-symlinks.sh`; it preserves a regular config env as the source of truth and backs up replaced files.
 
 For boot without login, enable user lingering:
 
@@ -416,8 +435,8 @@ Defaults (if unset):
 - `WORKER_NAME=<container hostname>`
 - `WH_OVERLAY` - path to a writable ext3 overlay file (default: `$WH_DIR/overlay.ext3`). Created automatically on first start if the runtime supports it. Lets `apt install` persist across container restarts.
 - `WH_OVERLAY_SIZE` - overlay size in MiB (default: `8192` = 8 GB)
-- `WH_EXTRA_BINDS` - semicolon-separated `host:container` bind mount pairs (default: empty). e.g. `WH_EXTRA_BINDS="$HOME/Dev:/code;/data/datasets:/data"`
-- `WH_MOUNT_HOME_FOLDERS` - set to `0` to disable auto-mounting non-hidden directories from `$HOME` into the container (default: `1`, enabled). Hidden dirs (`.ssh`, `.gnupg`, `.config`, `.aws`, etc.) are excluded automatically by the glob.
+- `WH_EXTRA_BINDS` - semicolon-separated `host:container` bind mount pairs (default: empty). The installer manages rclone mounts here; explicit operator entries are retained.
+- `WH_MOUNT_HOME_FOLDERS` - set to `0` to disable mapping non-hidden directories from `$HOME` to `/code/<directory>` (default: `1`). `$HOME/mnt` and hidden directories are excluded. Direct host mountpoints at `/mnt` or `/mnt/<name>` are independently mapped in lexical order to `/data`, `/data2`, `/data3`, and so on.
 
 ## Orchestrator container env vars
 

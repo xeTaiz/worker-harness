@@ -1,0 +1,23 @@
+[Unit]
+Description=Rclone SMB Mount
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+ExecStart=/usr/bin/rclone mount Ibex:/weka_user/engeld %h/mnt/ibex \
+    --config=%h/.config/rclone/rclone.conf \
+    --cache-dir=%h/.cache/rclone-ibex \
+    --vfs-cache-mode=full \
+    --vfs-cache-max-size=500G \
+    --vfs-cache-max-age=8760h \
+    --vfs-cache-min-free-space=50G
+
+ExecStop=/usr/bin/fusermount3 -uz %h/mnt/ibex
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

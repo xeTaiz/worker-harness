@@ -30,6 +30,17 @@ cp systemd/worker-harness-update.sh dist/worker-harness-update.sh
 cp systemd/worker-harness-restart.path dist/worker-harness-restart.path
 cp systemd/worker-harness-restart.service dist/worker-harness-restart.service
 cp systemd/worker-harness-restart.sh dist/worker-harness-restart.sh
+for rclone_unit in systemd/rclone-*.service; do
+  [ -e "$rclone_unit" ] || continue
+  cp "$rclone_unit" "dist/$(basename "$rclone_unit")"
+done
+
+# This host-specific credential file is intentionally untracked. The bundle
+# uses rclone's conventional filename so it can be linked into ~/.config.
+if [ -f worker_rclone.conf ]; then
+  cp worker_rclone.conf dist/rclone.conf
+  chmod 600 dist/rclone.conf
+fi
 chmod +x dist/worker-harness-update.sh dist/worker-harness-restart.sh
 
 # Copy the repo .env as-is — install-service.sh handles it on the target.
@@ -55,22 +66,23 @@ Contents:
 - `worker-harness-update.path` / `.service` — auto-swap new image + restart
 - `worker-harness-restart.path` / `.service` — restart on trigger file
 - `.env`
+- `rclone.conf` and `rclone-*.service` (when configured)
 - `worker-harness-worker.sif` (if built)
 
 Usage:
-1. `rsync -a dist/ target:/path/to/worker-harness/`
-2. On target: `cd /path/to/worker-harness && ./install-service.sh`
+1. From the repository, run `just deploy target`.
+2. `target` may be an SSH config host or `user@hostname`.
 3. If needed: `loginctl enable-linger "$USER"`
 
 The generated `.env` is derived from the repo `.env` and contains the runtime worker env.
-`install-service.sh` links the systemd units, path-service scripts, and runtime env from `~/.config/...` back to this install directory; update files here, then run `systemctl --user daemon-reload` after changing a unit.
-You can add extra vars (e.g. `WH_EXTRA_BINDS`, `WH_MOUNT_HOME_FOLDERS`) to `.env` before running install-service.sh — they remain the source of truth.
+`install-service.sh` links the units, scripts, rclone config, and runtime env from `~/.config/...` back to this directory. It installs the official rclone release when needed, validates each remote, and binds successful mounts at `/data_shared`, `/data_ibex`, and `/data_ibex_c2324`. The launcher maps home directories under `/code` and direct `/mnt` mountpoints to `/data`, `/data2`, and so on.
 All `WH_*` variables are automatically carried through.
 EOF
 
 cat > dist/.gitignore <<'EOF'
 *.env
 *.sif
+rclone.conf
 EOF
 
 echo "[make-dist] bundle ready in $repo_dir/dist"

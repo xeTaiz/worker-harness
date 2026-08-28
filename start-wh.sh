@@ -46,10 +46,9 @@ ssh_user="${SSH_USER:-$(id -un)}"
 ssh_uid="$(id -u)"
 ssh_gid="$(id -g)"
 ssh_shell="${SSH_SHELL:-/bin/bash}"
-# Keep the SIF home backed by WH_DIR (rather than the host's full home), but
-# expose it at the conventional /home/<user> path. Non-hidden host home
-# directories are bound into this location below, so ~, $HOME, and absolute
-# /home/<user>/... paths all resolve to the same view in the SIF.
+# Keep the SIF home backed by WH_DIR (rather than the host's full home), while
+# exposing it at the conventional /home/<user> path. Non-hidden host home
+# directories are separately exposed under /code.
 ssh_home_container="/home/${ssh_user}"
 compat_dir="${wh_dir_host}/compat"
 passwd_file="${compat_dir}/passwd"
@@ -180,12 +179,56 @@ if [ -n "$overlay_file" ] && [ -f "$overlay_file" ]; then
   mount_args+=(--overlay "$overlay_file")
 fi
 
-# Extra bind mounts (semicolon-separated host:container pairs).
-# Their container destinations are the complete, operator-chosen data inventory.
-# e.g. WH_EXTRA_BINDS="$HOME/Dev:/code;/data/datasets:/data"
+# Build the standard host layout, then append operator-provided binds.
+effective_binds=""
+append_effective_bind() {
+  local pair="$1"
+  if [ -z "$effective_binds" ]; then
+    effective_binds="$pair"
+  elif [[ ";$effective_binds;" != *";$pair;"* ]]; then
+    effective_binds="$effective_binds;$pair"
+  fi
+}
+
+# Every visible host home directory becomes /code/<name>. Hidden directories
+# remain excluded.
+if [ "${WH_MOUNT_HOME_FOLDERS:-1}" = "1" ]; then
+  for _dir in "$HOME"/*/; do
+    [ -d "$_dir" ] || continue
+    _name="$(basename "$_dir")"
+    [ "$_name" != "mnt" ] || continue
+    append_effective_bind "${_dir%/}:/code/$_name"
+  done
+fi
+
+# Direct mountpoints at /mnt or immediately below it become /data, /data2, ...
+# in stable lexical order. Deeper mountpoints are covered by their parent.
+_data_index=0
+while IFS= read -r _mount_dir; do
+  if [ "$_mount_dir" != "/mnt" ]; then
+    _mount_suffix="${_mount_dir#/mnt/}"
+    [[ "$_mount_dir" == /mnt/* && "$_mount_suffix" != */* ]] || continue
+  fi
+  _data_index=$((_data_index + 1))
+  if [ "$_data_index" -eq 1 ]; then
+    _data_destination="/data"
+  else
+    _data_destination="/data$_data_index"
+  fi
+  append_effective_bind "$_mount_dir:$_data_destination"
+done < <(findmnt --raw --noheadings --output TARGET 2>/dev/null | LC_ALL=C sort -u)
+
+if [ -n "${WH_EXTRA_BINDS:-}" ]; then
+  IFS=';' read -ra _extra_pairs <<< "$WH_EXTRA_BINDS"
+  for _pair in "${_extra_pairs[@]}"; do
+    [ -n "$_pair" ] && append_effective_bind "$_pair"
+  done
+fi
+
+# Record every container-visible data root for worker path discovery.
 bind_manifest="$wh_dir_host/data/bind-paths.json"
 mkdir -p "$(dirname "$bind_manifest")"
-python3 - "$bind_manifest" "${WH_EXTRA_BINDS:-}" <<'PY'
+python3 - "$bind_manifest" "$effective_binds" <<'PY'
 import json
 import os
 import sys
@@ -193,8 +236,8 @@ import sys
 manifest, raw = sys.argv[1:]
 paths = []
 for pair in filter(None, raw.split(";")):
-    # WH_EXTRA_BINDS follows Apptainer's host:container[:ro] shorthand.
-    # Literal ':' in the host source is intentionally unsupported here.
+    # Bind syntax is host:container[:ro]. Literal ':' in the host source is
+    # intentionally unsupported.
     fields = pair.split(":")
     if len(fields) < 2:
         continue
@@ -209,24 +252,10 @@ with open(temporary, "w", encoding="utf-8") as handle:
 os.replace(temporary, manifest)
 PY
 
-if [ -n "${WH_EXTRA_BINDS:-}" ]; then
-  IFS=';' read -ra _extra_pairs <<< "$WH_EXTRA_BINDS"
+if [ -n "$effective_binds" ]; then
+  IFS=';' read -ra _extra_pairs <<< "$effective_binds"
   for _pair in "${_extra_pairs[@]}"; do
     mount_args+=(--bind "$_pair")
-  done
-fi
-
-# Bind-mount the host's non-hidden home subdirs into the SIF's $HOME
-# (wh_dir_container/home/<user>/<subdir>). This makes `~/<subdir>` inside
-# the SIF point at the host's `~/<subdir>`, so the install dir at
-# `~/worker-harness/` is visible from inside the SIF.
-# Hidden folders (.ssh, .gnupg, .config, .aws, .cache, ...) are excluded
-# by the glob */ which doesn't match dotfiles.
-# Enable with WH_MOUNT_HOME_FOLDERS=1 (default). Set to 0 to skip.
-if [ "${WH_MOUNT_HOME_FOLDERS:-1}" = "1" ]; then
-  for _dir in "$HOME"/*/; do
-    _name="$(basename "$_dir")"
-    mount_args+=(--bind "${_dir%/}:$ssh_home_container/$_name")
   done
 fi
 

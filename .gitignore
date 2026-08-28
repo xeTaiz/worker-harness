@@ -4,6 +4,7 @@
 .apptainer-tmp/
 .pip-cache/
 systemd/*.env
+worker_rclone.conf
 dist/*
 dist/.env
 !dist/.gitignore
