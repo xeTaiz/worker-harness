@@ -108,39 +108,101 @@ def _run(cmd: list[str], timeout: int = 5) -> str:
         return ""
 
 
-def get_gpu_info() -> dict[str, Any]:
-    """Collect GPU info via nvidia-smi. Falls back to empty if unavailable."""
+GPU_PROCESS_IGNORE_MB = 512
+GPU_MOSTLY_FREE_FRACTION = 0.90
+IGNORED_GPU_PROCESS_NAMES = {
+    "xorg",
+    "xwayland",
+    "gnome-shell",
+    "kwin_wayland",
+}
+
+
+def _gpu_process_usage(command: str) -> tuple[set[str], dict[str, int]]:
+    """Return GPU UUIDs with significant compute and ignored memory by UUID."""
     try:
-        # nvidia-smi may not be on PATH; try common locations
-        for cmd in ["nvidia-smi", "/usr/bin/nvidia-smi", "/usr/local/nvidia/bin/nvidia-smi"]:
+        out = subprocess.check_output(
+            [
+                command,
+                "--query-compute-apps=gpu_uuid,process_name,used_gpu_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).decode()
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return set(), {}
+
+    significant: set[str] = set()
+    ignored_memory: dict[str, int] = {}
+    for line in out.strip().splitlines():
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split(",", 2)]
+        if len(parts) != 3:
+            continue
+        gpu_uuid, process_name, used_mb_text = parts
+        try:
+            used_mb = int(used_mb_text)
+        except ValueError:
+            continue
+        executable = Path(process_name).name.lower()
+        if used_mb < GPU_PROCESS_IGNORE_MB or executable in IGNORED_GPU_PROCESS_NAMES:
+            ignored_memory[gpu_uuid] = ignored_memory.get(gpu_uuid, 0) + used_mb
+        else:
+            significant.add(gpu_uuid)
+    return significant, ignored_memory
+
+
+def get_gpu_info() -> dict[str, Any]:
+    """Collect GPU capacity and workload state via nvidia-smi."""
+    try:
+        # nvidia-smi may not be on PATH; try common locations.
+        for command in ("nvidia-smi", "/usr/bin/nvidia-smi", "/usr/local/nvidia/bin/nvidia-smi"):
             try:
                 out = subprocess.check_output(
-                    [cmd, "--query-gpu=index,name,memory.total,memory.used",
-                     "--format=csv,noheader,nounits"],
-                    stderr=subprocess.DEVNULL, timeout=5,
+                    [
+                        command,
+                        "--query-gpu=index,uuid,name,memory.total,memory.used",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
                 ).decode()
                 break
             except (FileNotFoundError, subprocess.CalledProcessError):
                 continue
         else:
             log.debug("nvidia-smi not found in any known location")
-            return {"count": 0, "gpus": []}
+            return {"gpu_count": 0, "gpus": []}
 
+        significant_processes, ignored_memory = _gpu_process_usage(command)
         gpus = []
         for line in out.strip().splitlines():
             if not line:
                 continue
-            idx, name, total_mb, used_mb = line.split(", ")
+            idx, gpu_uuid, name, total_mb_text, used_mb_text = line.split(", ", 4)
+            total_mb = int(total_mb_text.strip())
+            used_mb = int(used_mb_text.strip())
+            relevant_used_mb = max(0, used_mb - ignored_memory.get(gpu_uuid.strip(), 0))
+            mostly_free_limit_mb = max(
+                GPU_PROCESS_IGNORE_MB,
+                round(total_mb * (1.0 - GPU_MOSTLY_FREE_FRACTION)),
+            )
             gpus.append({
                 "index": int(idx.strip()),
                 "name": name.strip(),
-                "vram_total_gb": round(int(total_mb.strip()) / 1024, 1),
-                "vram_used_gb": round(int(used_mb.strip()) / 1024, 1),
+                "vram_total_gb": round(total_mb / 1024, 1),
+                "vram_used_gb": round(used_mb / 1024, 1),
+                "busy": (
+                    gpu_uuid.strip() in significant_processes
+                    or relevant_used_mb > mostly_free_limit_mb
+                ),
             })
         return {"gpu_count": len(gpus), "gpus": gpus}
     except Exception as e:
         log.debug(f"nvidia-smi not available: {e}")
-        return {"count": 0, "gpus": []}
+        return {"gpu_count": 0, "gpus": []}
 
 
 def get_tailscale_identity() -> tuple[str, str]:

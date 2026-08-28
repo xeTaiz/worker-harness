@@ -84,6 +84,7 @@ class Database:
                 gpu_names TEXT DEFAULT '[]',
                 gpu_vram_gb TEXT DEFAULT '[]',
                 gpu_used_vram_gb TEXT DEFAULT '[]',
+                gpu_busy TEXT DEFAULT '[]',
                 cpu_cores INTEGER DEFAULT 0,
                 total_ram_gb REAL DEFAULT 0,
                 used_ram_gb REAL DEFAULT 0,
@@ -108,6 +109,11 @@ class Database:
                 "ALTER TABLE workers ADD COLUMN gpu_used_vram_gb TEXT DEFAULT '[]'"
             )
             colnames.add("gpu_used_vram_gb")
+        if "gpu_busy" not in colnames:
+            await self._db.execute(
+                "ALTER TABLE workers ADD COLUMN gpu_busy TEXT DEFAULT '[]'"
+            )
+            colnames.add("gpu_busy")
 
         # Migration: rename worker address column zerotier_ip -> worker_ip.
         if "worker_ip" not in colnames:
@@ -391,14 +397,15 @@ class Database:
         await self._db.execute(
             """INSERT INTO workers
                (id, name, worker_ip, dns_name, ssh_user, harness_dir, gpu_count, gpu_names, gpu_vram_gb,
-                gpu_used_vram_gb, cpu_cores, total_ram_gb, used_ram_gb, total_disk_gb, used_disk_gb,
-                data_paths, pi_relay_port, pi_relay_available, pi_relay_protocol_version,
+                gpu_used_vram_gb, gpu_busy, cpu_cores, total_ram_gb, used_ram_gb, total_disk_gb,
+                used_disk_gb, data_paths, pi_relay_port, pi_relay_available, pi_relay_protocol_version,
                 status, last_heartbeat_ts, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 w.id, w.name, w.worker_ip, w.dns_name, w.ssh_user, w.harness_dir, w.gpu_count,
                 json.dumps(w.gpu_names), json.dumps(w.gpu_vram_gb),
                 json.dumps(w.gpu_used_vram_gb),
+                json.dumps(w.gpu_busy),
                 w.cpu_cores, w.total_ram_gb, w.used_ram_gb,
                 w.total_disk_gb, w.used_disk_gb, json.dumps(w.data_paths),
                 w.pi_relay_port, int(w.pi_relay_available), w.pi_relay_protocol_version,
@@ -411,14 +418,15 @@ class Database:
         await self._db.execute(
             """UPDATE workers SET
                name=?, worker_ip=?, dns_name=?, ssh_user=?, harness_dir=?, gpu_count=?, gpu_names=?,
-               gpu_vram_gb=?, gpu_used_vram_gb=?, cpu_cores=?, total_ram_gb=?, used_ram_gb=?,
-               total_disk_gb=?, used_disk_gb=?, data_paths=?, pi_relay_port=?, pi_relay_available=?,
-               pi_relay_protocol_version=?, status=?, last_heartbeat_ts=?
+               gpu_vram_gb=?, gpu_used_vram_gb=?, gpu_busy=?, cpu_cores=?, total_ram_gb=?,
+               used_ram_gb=?, total_disk_gb=?, used_disk_gb=?, data_paths=?, pi_relay_port=?,
+               pi_relay_available=?, pi_relay_protocol_version=?, status=?, last_heartbeat_ts=?
                WHERE id=?""",
             (
                 w.name, w.worker_ip, w.dns_name, w.ssh_user, w.harness_dir, w.gpu_count,
                 json.dumps(w.gpu_names), json.dumps(w.gpu_vram_gb),
                 json.dumps(w.gpu_used_vram_gb),
+                json.dumps(w.gpu_busy),
                 w.cpu_cores, w.total_ram_gb, w.used_ram_gb,
                 w.total_disk_gb, w.used_disk_gb, json.dumps(w.data_paths),
                 w.pi_relay_port, int(w.pi_relay_available), w.pi_relay_protocol_version,
@@ -439,6 +447,7 @@ class Database:
             gpu_names=json.loads(row["gpu_names"]),
             gpu_vram_gb=json.loads(row["gpu_vram_gb"]),
             gpu_used_vram_gb=json.loads(row["gpu_used_vram_gb"]),
+            gpu_busy=json.loads(row["gpu_busy"] or "[]"),
             cpu_cores=row["cpu_cores"],
             total_ram_gb=row["total_ram_gb"],
             used_ram_gb=row["used_ram_gb"],
