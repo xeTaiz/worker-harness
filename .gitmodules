@@ -1,0 +1,3 @@
+[submodule "extensions/pi-worker-harness"]
+	path = extensions/pi-worker-harness
+	url = git@github.com:xeTaiz/pi-worker-harness.git
