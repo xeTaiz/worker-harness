@@ -278,9 +278,9 @@ def get_active_jobs() -> list[dict[str, Any]]:
 def get_data_paths() -> list[str]:
     """Return immediate shareable directories below configured bind roots.
 
-    The host launcher writes bind destinations from ``WH_EXTRA_BINDS`` to the
-    manifest.  Each destination is a collection root, not itself an advertised
-    dataset: enumerate its direct, non-symlink directory children only.  This
+    The host launcher writes effective container bind destinations to the
+    manifest. Each destination is a collection root, not itself an advertised
+    dataset: enumerate its direct, non-symlink directory children only. This
     deliberately avoids recursive indexing, file metadata, and host paths.
     """
     manifest = WH_DIR / "data" / "bind-paths.json"

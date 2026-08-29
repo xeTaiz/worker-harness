@@ -114,31 +114,37 @@ a latent capability or deployment risk.
 
 ### Goal
 
-Advertise the immediate data directories inside each data-visible container
-path chosen by the operator in `WH_EXTRA_BINDS`. Do not recursively index
-content or scan outside those configured bind destinations.
+Advertise the immediate directories inside each effective container bind
+destination. Effective binds include deployment-managed `/code`,
+`/data/local`, and `/data/shared` collections plus non-overlapping operator
+entries from `WH_EXTRA_BINDS`. Do not recursively index content or scan outside
+those configured destinations.
 
 ### Bind manifest
 
-`start-wh.sh` already parses the semicolon-delimited `WH_EXTRA_BINDS` value and
-passes each pair to Apptainer/Singularity.  During that same parsing it writes
-an atomic manifest in the host `WH_DIR`:
+`start-wh.sh` assembles the effective binds passed to Apptainer/Singularity and
+writes their container destinations to an atomic manifest in the host `WH_DIR`:
 
 ```text
 $WH_DIR/data/bind-paths.json
 ```
 
-Example host configuration:
+Example effective layout:
 
-```bash
-WH_EXTRA_BINDS="/mnt/institution/datasets:/data/institution;/srv/project:/code/project"
+```text
+~/Work                 → /code/work
+~/Dev                  → /code/dev
+/mnt                   → /data/local
+~/mnt/datawaha         → /data/shared/datawaha
+~/mnt/ibex             → /data/shared/ibex
+~/mnt/ibex_c2324       → /data/shared/ibex_c2324
 ```
 
 Manifest visible in the SIF:
 
 ```json
 {
-  "paths": ["/data/institution", "/code/project"]
+  "paths": ["/code/dev", "/code/work", "/data/local", "/data/shared/datawaha", "/data/shared/ibex", "/data/shared/ibex_c2324"]
 }
 ```
 
@@ -165,11 +171,13 @@ It does not:
 
 A missing or unreadable bind is simply absent from that heartbeat.
 
-The operator chooses a collection-level bind destination:
+Collection roots use semantic namespaces:
 
 ```text
-/mnt/nas/datasets   → /data                # advertises /data/imagenet, /data/coco, …
-/mnt/nas/projects   → /code                # advertises /code/project-a, /code/project-b, …
+/data/shared/<name>  # same deploy-managed network collection across workers
+/data/local/<name>   # worker-local filesystem; same name does not imply identity
+/code/work           # repositories below ~/Work
+/code/dev            # repositories below ~/Dev
 ```
 
 Each returned directory is a copyable unit. Agents may inspect it with their

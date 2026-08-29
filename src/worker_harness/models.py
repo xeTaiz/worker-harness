@@ -87,8 +87,8 @@ class WorkerRegistration(BaseModel):
     used_disk_gb: float = 0.0
     active_jobs: list[dict[str, Any]] = Field(default_factory=list)
     active_ports: list[dict[str, Any]] = Field(default_factory=list)
-    # Exact container destinations declared by WH_EXTRA_BINDS. This is a
-    # discovery hint, not a recursive filesystem inventory.
+    # Immediate non-symlink directory children below effective container bind
+    # destinations. This is a shallow discovery hint, not a recursive inventory.
     data_paths: list[str] = Field(default_factory=list)
     # Worker-local Pi relay published through userspace Tailscale Serve.
     # `available` is false when bind/publication failed, even though a port is

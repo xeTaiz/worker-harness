@@ -42,6 +42,29 @@ class WorkerDataDiscoveryTests(unittest.TestCase):
                 [str(bind_root / "ds1"), str(bind_root / "ds2")],
             )
 
+    def test_shared_and_local_collection_roots_advertise_their_children(self):
+        daemon = load_daemon_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            shared = tmp_path / "data" / "shared" / "ibex"
+            local = tmp_path / "data" / "local"
+            (shared / "MotionSeg" / "frames").mkdir(parents=True)
+            (local / "hdd" / "scratch").mkdir(parents=True)
+
+            wh_dir = tmp_path / "wh"
+            manifest = wh_dir / "data" / "bind-paths.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                json.dumps({"paths": [str(shared), str(local)]}),
+                encoding="utf-8",
+            )
+            daemon.WH_DIR = wh_dir
+
+            self.assertEqual(
+                daemon.get_data_paths(),
+                [str(local / "hdd"), str(shared / "MotionSeg")],
+            )
+
     def test_missing_or_invalid_bind_roots_are_not_advertised(self):
         daemon = load_daemon_module()
         with tempfile.TemporaryDirectory() as tmp:

@@ -386,8 +386,10 @@ worker has been observed in production.
 
 During installation, rclone comes from the official
 `https://rclone.org/install.sh` script when it is absent or lacks the SMB
-backend. Working mounts use `/data_shared`, `/data_ibex`, and
-`/data_ibex_c2324`.
+backend. Working network mounts use `/data/shared/datawaha`,
+`/data/shared/ibex`, and `/data/shared/ibex_c2324`. Local filesystems mounted
+at `/mnt` use `/data/local`; direct child mounts use
+`/data/local/<mount-name>`.
 
 Keep the common worker credentials in the gitignored `worker_rclone.conf`;
 `just dist` packages it as `dist/rclone.conf`, and that bundled config is
@@ -462,8 +464,14 @@ Defaults (if unset):
 - `WORKER_NAME=<container hostname>`
 - `WH_OVERLAY` - path to a writable ext3 overlay file (default: `$WH_DIR/overlay.ext3`). Created automatically on first start if the runtime supports it. Lets `apt install` persist across container restarts.
 - `WH_OVERLAY_SIZE` - overlay size in MiB (default: `8192` = 8 GB)
-- `WH_EXTRA_BINDS` - semicolon-separated `host:container` bind mount pairs (default: empty). The installer manages rclone mounts here. Entries whose host source is already managed by automatic home or `/mnt` mapping are ignored to prevent duplicate container trees; other operator entries are retained.
-- `WH_MOUNT_HOME_FOLDERS` - set to `0` to disable mapping non-hidden directories from `$HOME` to `/code/<directory>` (default: `1`). `$HOME/mnt`, the live deployment directory, deployment backups/failures, and hidden directories are excluded. Direct host mountpoints at `/mnt` or `/mnt/<name>` are independently mapped in lexical order to `/data`, `/data2`, `/data3`, and so on.
+- `WH_EXTRA_BINDS` - semicolon-separated `host:container` bind mount pairs (default: empty). The installer manages rclone mounts here. Entries whose host source is already covered by automatic code or `/mnt` mapping are ignored; other operator entries are retained.
+- `WH_CODE_ROOTS` - semicolon-separated host directories mapped below `/code` using lowercase basenames. Defaults to `$HOME/Work;$HOME/Dev`; deployment creates both directories. Set an explicitly empty value to disable code-root binds.
+
+Data namespace identity:
+
+- `/data/shared/<name>/...` is a deployment-managed network collection. The same full path denotes the same backing collection on every worker advertising it.
+- `/data/local/<name>/...` is worker-local. Matching paths on different workers do not imply matching content.
+- `list_data` advertises only immediate non-symlink directory children below each configured collection root. It does not recursively index files or advertise empty roots.
 
 ## Orchestrator container env vars
 

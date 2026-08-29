@@ -223,48 +223,65 @@ is_managed_source() {
   return 1
 }
 
-# Every visible host home directory becomes /code/<name>. Hidden directories
-# remain excluded.
-if [ "${WH_MOUNT_HOME_FOLDERS:-1}" = "1" ]; then
+normalize_host_source() {
+  local source="$1"
+  case "$source" in
+    '~') source="$HOME" ;;
+    '~/'*) source="$HOME/${source#\~/}" ;;
+    '$HOME') source="$HOME" ;;
+    '$HOME/'*) source="$HOME/${source#\$HOME/}" ;;
+  esac
+  while [ "$source" != "/" ] && [[ "$source" == */ ]]; do
+    source="${source%/}"
+  done
+  printf '%s\n' "$source"
+}
+
+# Code collections are explicit roots. An explicitly empty WH_CODE_ROOTS
+# disables them; otherwise deployment-created ~/Work and ~/Dev are defaults.
+code_roots="${WH_CODE_ROOTS-$HOME/Work;$HOME/Dev}"
+if [ -n "$code_roots" ]; then
   append_managed_source "$HOME"
-  for _dir in "$HOME"/*/; do
+  IFS=';' read -ra _code_roots <<< "$code_roots"
+  for _dir in "${_code_roots[@]}"; do
+    _dir="$(normalize_host_source "$_dir")"
     [ -d "$_dir" ] || continue
-    _dir="${_dir%/}"
     _name="$(basename "$_dir")"
-    case "$_name" in
-      mnt|worker-harness|worker-harness.backup.*|worker-harness.failed.*)
-        append_managed_source "$_dir"
-        continue
-        ;;
-    esac
+    _name="${_name,,}"
     append_managed_root "$_dir"
     append_effective_bind "$_dir:/code/$_name"
   done
 fi
 
-# Direct mountpoints at /mnt or immediately below it become /data, /data2, ...
-# in stable lexical order. Deeper mountpoints are covered by their parent.
-_data_index=0
-while IFS= read -r _mount_dir; do
-  if [ "$_mount_dir" != "/mnt" ]; then
+# A filesystem mounted directly at /mnt becomes /data/local. Otherwise each
+# direct child mount gets a stable basename under /data/local.
+mapfile -t _mnt_targets < <(
+  findmnt --raw --noheadings --output TARGET 2>/dev/null | LC_ALL=C sort -u
+)
+_mnt_root=0
+for _mount_dir in "${_mnt_targets[@]}"; do
+  if [ "$_mount_dir" = "/mnt" ]; then
+    _mnt_root=1
+    break
+  fi
+done
+if [ "$_mnt_root" -eq 1 ]; then
+  append_effective_bind "/mnt:/data/local"
+  append_managed_root "/mnt"
+else
+  for _mount_dir in "${_mnt_targets[@]}"; do
     _mount_suffix="${_mount_dir#/mnt/}"
     [[ "$_mount_dir" == /mnt/* && "$_mount_suffix" != */* ]] || continue
-  fi
-  _data_index=$((_data_index + 1))
-  if [ "$_data_index" -eq 1 ]; then
-    _data_destination="/data"
-  else
-    _data_destination="/data$_data_index"
-  fi
-  append_effective_bind "$_mount_dir:$_data_destination"
-  append_managed_root "$_mount_dir"
-done < <(findmnt --raw --noheadings --output TARGET 2>/dev/null | LC_ALL=C sort -u)
+    append_effective_bind "$_mount_dir:/data/local/$(basename "$_mount_dir")"
+    append_managed_root "$_mount_dir"
+  done
+fi
 
 if [ -n "${WH_EXTRA_BINDS:-}" ]; then
   IFS=';' read -ra _extra_pairs <<< "$WH_EXTRA_BINDS"
   for _pair in "${_extra_pairs[@]}"; do
     [ -n "$_pair" ] || continue
-    _extra_source="${_pair%%:*}"
+    _extra_source="$(normalize_host_source "${_pair%%:*}")"
     is_managed_source "$_extra_source" && continue
     append_effective_bind "$_pair"
   done

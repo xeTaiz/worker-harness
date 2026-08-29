@@ -159,12 +159,7 @@ install_rclone_dependencies() {
 rclone_bind_destination() {
   local mount_name
   mount_name="$(basename "$1")"
-  case "$mount_name" in
-    datawaha) printf '/data_shared\n' ;;
-    ibex) printf '/data_ibex\n' ;;
-    ibex_c2324) printf '/data_ibex_c2324\n' ;;
-    *) printf '/data_%s\n' "$mount_name" ;;
-  esac
+  printf '/data/shared/%s\n' "$mount_name"
 }
 
 append_semicolon_value() {
@@ -199,7 +194,7 @@ for path in "$service_src" "$launcher_src" "$image_src"; do
   fi
 done
 
-mkdir -p "$unit_dir" "$config_dir"
+mkdir -p "$unit_dir" "$config_dir" "$HOME/Work" "$HOME/Dev"
 link_file "$service_src" "$service_dst"
 chmod +x "$launcher_src"
 
@@ -354,7 +349,7 @@ if [ "${#configured_rclone_mounts[@]}" -gt 0 ]; then
     bind_destination="${bind_pair#*:}"
     bind_destination="${bind_destination%%:*}"
     case "$bind_destination" in
-      /data_shared|/data_ibex|/data_ibex_c2324) keep_bind=0 ;;
+      /data_shared|/data_ibex|/data_ibex_c2324|/data/shared/*) keep_bind=0 ;;
     esac
     for mount_dir in "${configured_rclone_mounts[@]}"; do
       if [ "${bind_pair%%:*}" = "$mount_dir" ]; then

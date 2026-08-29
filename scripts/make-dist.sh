@@ -77,7 +77,7 @@ Usage:
 3. If needed: `loginctl enable-linger "$USER"`
 
 The generated `.env` is derived from the repo `.env` and contains the runtime worker env.
-`install-service.sh` links the units, scripts, config, and runtime env from `~/.config/...` back to this directory. The bundled common rclone config is authoritative, each remote is validated, and successful mounts bind at `/data_shared`, `/data_ibex`, and `/data_ibex_c2324`. The launcher maps home directories under `/code` and direct `/mnt` mountpoints to `/data`, `/data2`, and so on while suppressing duplicate `WH_EXTRA_BINDS` sources.
+`install-service.sh` links units, scripts, config, and runtime env from `~/.config/...` back to this directory. The common rclone config is authoritative; successful network mounts bind below `/data/shared/<name>`, while local `/mnt` storage binds below `/data/local`. Deployment creates `~/Work` and `~/Dev`, which map to `/code/work` and `/code/dev`. `list_data` shallowly advertises the immediate directories inside each collection.
 Linked systemd units are enabled by their source paths; rerun the installer instead of enabling the symlink names manually.
 All `WH_*` variables are automatically carried through.
 
