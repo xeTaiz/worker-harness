@@ -122,6 +122,18 @@ restore_path_set() {
   done
 }
 
+enable_unit_file() {
+  local unit_name="$1" unit_path="$unit_dir/$1"
+  if [ -L "$unit_path" ]; then
+    unit_path="$(readlink -f "$unit_path" 2>/dev/null || true)"
+  fi
+  if [ -n "$unit_path" ] && [ -f "$unit_path" ]; then
+    systemctl --user enable "$unit_path"
+  else
+    systemctl --user enable "$unit_name"
+  fi
+}
+
 restore_service_state() {
   local unit_name
   systemctl --user daemon-reload || true
@@ -129,7 +141,7 @@ restore_service_state() {
     systemctl --user disable "$unit_name" >/dev/null 2>&1 || true
   done
   for unit_name in "${enabled_units[@]}"; do
-    systemctl --user enable "$unit_name" >/dev/null 2>&1 || true
+    enable_unit_file "$unit_name" >/dev/null 2>&1 || true
   done
   for unit_name in "${active_units[@]}"; do
     systemctl --user start "$unit_name" >/dev/null 2>&1 || \
@@ -175,7 +187,7 @@ restore_prelock_paths() {
   for path_unit in worker-harness-update.path worker-harness-restart.path; do
     for value in "${enabled_units[@]}"; do
       if [ "$value" = "$path_unit" ]; then
-        systemctl --user enable "$path_unit" >/dev/null 2>&1 || true
+        enable_unit_file "$path_unit" >/dev/null 2>&1 || true
       fi
     done
     for value in "${active_units[@]}"; do

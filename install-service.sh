@@ -307,7 +307,7 @@ if [ "${#rclone_units[@]}" -gt 0 ]; then
       echo "[install-service] checking $remote_spec for $unit_name"
       if rclone lsf --config="$rclone_config_dst" --max-depth 1 "$remote_spec" >/dev/null; then
         link_file "$unit_src" "$unit_dir/$unit_name"
-        valid_rclone_units+=("$unit_name|$mount_dir")
+        valid_rclone_units+=("$unit_name|$unit_src|$mount_dir")
       else
         echo "[install-service] WARNING: $remote_spec is unavailable; skipping $unit_name" >&2
         systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
@@ -321,8 +321,10 @@ systemctl --user daemon-reload
 working_rclone_binds=()
 for unit_and_mount in "${valid_rclone_units[@]}"; do
   unit_name="${unit_and_mount%%|*}"
-  mount_dir="${unit_and_mount#*|}"
-  systemctl --user enable "$unit_name"
+  unit_source_and_mount="${unit_and_mount#*|}"
+  unit_src="${unit_source_and_mount%%|*}"
+  mount_dir="${unit_source_and_mount#*|}"
+  systemctl --user enable "$unit_src"
   if ! systemctl --user restart "$unit_name"; then
     echo "[install-service] WARNING: $unit_name failed to restart; disabling it" >&2
     systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
@@ -373,7 +375,7 @@ if [ "${#configured_rclone_mounts[@]}" -gt 0 ]; then
   write_extra_binds "$extra_binds"
 fi
 
-systemctl --user enable worker-harness.service
+systemctl --user enable "$service_src"
 systemctl --user restart worker-harness.service
 sleep 1
 if ! systemctl --user is-active --quiet worker-harness.service; then
@@ -383,9 +385,11 @@ fi
 
 # Restart path units so active manual installs pick up the linked definitions.
 for path_unit in worker-harness-update.path worker-harness-restart.path; do
-  systemctl --user enable "$path_unit" 2>/dev/null || true
-  systemctl --user restart "$path_unit" 2>/dev/null || \
-    echo "[install-service] WARNING: could not restart $path_unit" >&2
+  if path_src="$(find_optional_source "$path_unit")"; then
+    systemctl --user enable "$path_src" 2>/dev/null || true
+    systemctl --user restart "$path_unit" 2>/dev/null || \
+      echo "[install-service] WARNING: could not restart $path_unit" >&2
+  fi
 done
 
 echo "[install-service] installed: $service_dst"

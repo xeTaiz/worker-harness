@@ -191,17 +191,36 @@ append_effective_bind() {
 }
 
 managed_bind_sources=""
-append_managed_source() {
-  local source="$1"
-  if [ -z "$managed_bind_sources" ]; then
-    managed_bind_sources="$source"
-  elif [[ ";$managed_bind_sources;" != *";$source;"* ]]; then
-    managed_bind_sources="$managed_bind_sources;$source"
+managed_bind_roots=""
+append_semicolon_item() {
+  local current="$1" item="$2"
+  if [ -z "$current" ]; then
+    printf '%s\n' "$item"
+  elif [[ ";$current;" == *";$item;"* ]]; then
+    printf '%s\n' "$current"
+  else
+    printf '%s;%s\n' "$current" "$item"
   fi
 }
 
+append_managed_source() {
+  managed_bind_sources="$(append_semicolon_item "$managed_bind_sources" "$1")"
+}
+
+append_managed_root() {
+  managed_bind_roots="$(append_semicolon_item "$managed_bind_roots" "$1")"
+}
+
 is_managed_source() {
-  [[ ";$managed_bind_sources;" == *";$1;"* ]]
+  local source="$1" root
+  [[ ";$managed_bind_sources;" == *";$source;"* ]] && return 0
+  IFS=';' read -ra _managed_roots <<< "$managed_bind_roots"
+  for root in "${_managed_roots[@]}"; do
+    if [ "$source" = "$root" ] || [[ "$source" == "$root/"* ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # Every visible host home directory becomes /code/<name>. Hidden directories
@@ -212,10 +231,13 @@ if [ "${WH_MOUNT_HOME_FOLDERS:-1}" = "1" ]; then
     [ -d "$_dir" ] || continue
     _dir="${_dir%/}"
     _name="$(basename "$_dir")"
-    append_managed_source "$_dir"
     case "$_name" in
-      mnt|worker-harness|worker-harness.backup.*|worker-harness.failed.*) continue ;;
+      mnt|worker-harness|worker-harness.backup.*|worker-harness.failed.*)
+        append_managed_source "$_dir"
+        continue
+        ;;
     esac
+    append_managed_root "$_dir"
     append_effective_bind "$_dir:/code/$_name"
   done
 fi
@@ -235,7 +257,7 @@ while IFS= read -r _mount_dir; do
     _data_destination="/data$_data_index"
   fi
   append_effective_bind "$_mount_dir:$_data_destination"
-  append_managed_source "$_mount_dir"
+  append_managed_root "$_mount_dir"
 done < <(findmnt --raw --noheadings --output TARGET 2>/dev/null | LC_ALL=C sort -u)
 
 if [ -n "${WH_EXTRA_BINDS:-}" ]; then

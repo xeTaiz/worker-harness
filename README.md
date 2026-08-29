@@ -426,6 +426,10 @@ If you want the worker to restart automatically after a crash:
 
 `install-service.sh` keeps `start-wh.sh`, `worker-harness-worker.sif`, `rclone.conf`, and all service units in `~/worker-harness`. It creates symlinks from `~/.config/systemd/user/`, `~/.config/worker-harness/`, and `~/.config/rclone/` back into that directory. The runtime env remains mutable at `~/worker-harness/.env` (linked as `~/.config/worker-harness/worker-harness.env`). Updating scripts or units therefore requires no recopy; run `systemctl --user daemon-reload` after unit changes and restart the affected service as needed. Existing copied installations can migrate once with `./migrate-to-symlinks.sh`; it preserves a regular config env as the source of truth and backs up replaced files.
 
+Systemd treats these as linked units. The installer enables them by their
+source paths; use `just deploy` or rerun `install-service.sh` rather than
+manually running `systemctl enable` against the symlink name.
+
 For boot without login, enable user lingering:
 
 ```bash
