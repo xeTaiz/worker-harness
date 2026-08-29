@@ -273,7 +273,9 @@ done
 
 valid_rclone_units=()
 configured_rclone_mounts=("${legacy_rclone_mounts[@]}")
-preserve_external_config "$rclone_config_src" "$rclone_config_dst" "rclone configuration"
+if [ "${WH_USE_BUNDLED_RCLONE_CONFIG:-0}" != "1" ]; then
+  preserve_external_config "$rclone_config_src" "$rclone_config_dst" "rclone configuration"
+fi
 if [ "${#rclone_units[@]}" -gt 0 ]; then
   if [ ! -f "$rclone_config_src" ]; then
     echo "[install-service] WARNING: rclone services found without rclone.conf; skipping them" >&2

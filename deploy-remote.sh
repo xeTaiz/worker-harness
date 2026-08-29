@@ -78,8 +78,8 @@ fi
 printf '%s\n' "${active_units[@]}" > "$state/active-units"
 printf '%s\n' "${enabled_units[@]}" > "$state/enabled-units"
 
-# Machine-local configuration is authoritative. Dereference it into the stage
-# before the live directory moves, because an old symlink may point into it.
+# The remote worker environment is authoritative. The bundled common rclone
+# config is authoritative when present; an existing config is only a fallback.
 preserve_into_stage() {
   local destination="$1"
   shift
@@ -94,9 +94,11 @@ preserve_into_stage() {
 preserve_into_stage "$stage/.env" \
   "$worker_config_dir/worker-harness.env" \
   "$live/.env" || true
-preserve_into_stage "$stage/rclone.conf" \
-  "$rclone_config_dir/rclone.conf" \
-  "$live/rclone.conf" || true
+if [ ! -f "$stage/rclone.conf" ]; then
+  preserve_into_stage "$stage/rclone.conf" \
+    "$rclone_config_dir/rclone.conf" \
+    "$live/rclone.conf" || true
+fi
 chmod 600 "$stage/.env"
 if [ -f "$stage/rclone.conf" ]; then
   chmod 600 "$stage/rclone.conf"
@@ -275,7 +277,7 @@ mv "$stage" "$live"
 activated=1
 
 cd "$live"
-WH_MIGRATION_SUFFIX="$txid" ./install-service.sh
+WH_MIGRATION_SUFFIX="$txid" WH_USE_BUNDLED_RCLONE_CONFIG=1 ./install-service.sh
 
 # Match the image updater's health contract: both systemd and the actual worker
 # daemon must remain live for several consecutive polls.

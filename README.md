@@ -389,9 +389,10 @@ During installation, rclone comes from the official
 backend. Working mounts use `/data_shared`, `/data_ibex`, and
 `/data_ibex_c2324`.
 
-Keep host-specific rclone credentials in the gitignored
-`worker_rclone.conf`; `just dist` packages it as `dist/rclone.conf`, while an
-existing worker's configuration remains authoritative during migration.
+Keep the common worker credentials in the gitignored `worker_rclone.conf`;
+`just dist` packages it as `dist/rclone.conf`, and that bundled config is
+authoritative during deployment. An existing worker config is used only when
+the bundle has none and is always retained in the rollback backup.
 
 The transaction covers user services managed under
 `~/.config/systemd/user`. System-wide units under `/etc/systemd/system` and
@@ -457,8 +458,8 @@ Defaults (if unset):
 - `WORKER_NAME=<container hostname>`
 - `WH_OVERLAY` - path to a writable ext3 overlay file (default: `$WH_DIR/overlay.ext3`). Created automatically on first start if the runtime supports it. Lets `apt install` persist across container restarts.
 - `WH_OVERLAY_SIZE` - overlay size in MiB (default: `8192` = 8 GB)
-- `WH_EXTRA_BINDS` - semicolon-separated `host:container` bind mount pairs (default: empty). The installer manages rclone mounts here; explicit operator entries are retained.
-- `WH_MOUNT_HOME_FOLDERS` - set to `0` to disable mapping non-hidden directories from `$HOME` to `/code/<directory>` (default: `1`). `$HOME/mnt` and hidden directories are excluded. Direct host mountpoints at `/mnt` or `/mnt/<name>` are independently mapped in lexical order to `/data`, `/data2`, `/data3`, and so on.
+- `WH_EXTRA_BINDS` - semicolon-separated `host:container` bind mount pairs (default: empty). The installer manages rclone mounts here. Entries whose host source is already managed by automatic home or `/mnt` mapping are ignored to prevent duplicate container trees; other operator entries are retained.
+- `WH_MOUNT_HOME_FOLDERS` - set to `0` to disable mapping non-hidden directories from `$HOME` to `/code/<directory>` (default: `1`). `$HOME/mnt`, the live deployment directory, deployment backups/failures, and hidden directories are excluded. Direct host mountpoints at `/mnt` or `/mnt/<name>` are independently mapped in lexical order to `/data`, `/data2`, `/data3`, and so on.
 
 ## Orchestrator container env vars
 

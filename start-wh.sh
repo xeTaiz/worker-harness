@@ -190,14 +190,33 @@ append_effective_bind() {
   fi
 }
 
+managed_bind_sources=""
+append_managed_source() {
+  local source="$1"
+  if [ -z "$managed_bind_sources" ]; then
+    managed_bind_sources="$source"
+  elif [[ ";$managed_bind_sources;" != *";$source;"* ]]; then
+    managed_bind_sources="$managed_bind_sources;$source"
+  fi
+}
+
+is_managed_source() {
+  [[ ";$managed_bind_sources;" == *";$1;"* ]]
+}
+
 # Every visible host home directory becomes /code/<name>. Hidden directories
 # remain excluded.
 if [ "${WH_MOUNT_HOME_FOLDERS:-1}" = "1" ]; then
+  append_managed_source "$HOME"
   for _dir in "$HOME"/*/; do
     [ -d "$_dir" ] || continue
+    _dir="${_dir%/}"
     _name="$(basename "$_dir")"
-    [ "$_name" != "mnt" ] || continue
-    append_effective_bind "${_dir%/}:/code/$_name"
+    append_managed_source "$_dir"
+    case "$_name" in
+      mnt|worker-harness|worker-harness.backup.*|worker-harness.failed.*) continue ;;
+    esac
+    append_effective_bind "$_dir:/code/$_name"
   done
 fi
 
@@ -216,12 +235,16 @@ while IFS= read -r _mount_dir; do
     _data_destination="/data$_data_index"
   fi
   append_effective_bind "$_mount_dir:$_data_destination"
+  append_managed_source "$_mount_dir"
 done < <(findmnt --raw --noheadings --output TARGET 2>/dev/null | LC_ALL=C sort -u)
 
 if [ -n "${WH_EXTRA_BINDS:-}" ]; then
   IFS=';' read -ra _extra_pairs <<< "$WH_EXTRA_BINDS"
   for _pair in "${_extra_pairs[@]}"; do
-    [ -n "$_pair" ] && append_effective_bind "$_pair"
+    [ -n "$_pair" ] || continue
+    _extra_source="${_pair%%:*}"
+    is_managed_source "$_extra_source" && continue
+    append_effective_bind "$_pair"
   done
 fi
 
