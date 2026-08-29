@@ -20,7 +20,7 @@ Usage:
 3. If needed: `loginctl enable-linger "$USER"`
 
 The generated `.env` is derived from the repo `.env` and contains the runtime worker env.
-`install-service.sh` links units, scripts, config, and runtime env from `~/.config/...` back to this directory. The common rclone config is authoritative; successful network mounts bind below `/data/shared/<name>`, while local `/mnt` storage binds below `/data/local`. Deployment creates `~/Work` and `~/Dev`, which map to `/code/work` and `/code/dev`. `list_data` shallowly advertises the immediate directories inside each collection.
+`install-service.sh` links units, scripts, config, and runtime env from `~/.config/...` back to this directory. The common rclone config is authoritative; network mounts bind below `/data/shared/<name>` and local `/mnt` storage below `/data/local`. Deployment chooses existing `~/Work`, then `~/Dev`, or creates `~/Work`, and mounts that single collection at `/code`. `list_data` shallowly advertises immediate directories inside each collection.
 Linked systemd units are enabled by their source paths; rerun the installer instead of enabling the symlink names manually.
 All `WH_*` variables are automatically carried through.
 

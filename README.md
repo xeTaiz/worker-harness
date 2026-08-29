@@ -432,6 +432,13 @@ Systemd treats these as linked units. The installer enables them by their
 source paths; use `just deploy` or rerun `install-service.sh` rather than
 manually running `systemctl enable` against the symlink name.
 
+`~/worker-harness` is host deployment state and is intentionally not mounted
+under `/code` or into the container home. Image administration uploads to
+`/var/lib/worker-harness/harness/new-image.sif`, backed on the host by
+`~/.local/worker-harness/harness/new-image.sif`; the host update service then
+swaps `~/worker-harness/worker-harness-worker.sif`. The container home is the
+separate persistent `WH_DIR/home/<user>` tree.
+
 For boot without login, enable user lingering:
 
 ```bash
@@ -465,7 +472,7 @@ Defaults (if unset):
 - `WH_OVERLAY` - path to a writable ext3 overlay file (default: `$WH_DIR/overlay.ext3`). Created automatically on first start if the runtime supports it. Lets `apt install` persist across container restarts.
 - `WH_OVERLAY_SIZE` - overlay size in MiB (default: `8192` = 8 GB)
 - `WH_EXTRA_BINDS` - semicolon-separated `host:container` bind mount pairs (default: empty). The installer manages rclone mounts here. Entries whose host source is already covered by automatic code or `/mnt` mapping are ignored; other operator entries are retained.
-- `WH_CODE_ROOTS` - semicolon-separated host directories mapped below `/code` using lowercase basenames. Defaults to `$HOME/Work;$HOME/Dev`; deployment creates both directories. Set an explicitly empty value to disable code-root binds.
+- `WH_CODE_ROOT` - optional host directory mounted directly at `/code`. By default the launcher chooses `$HOME/Work`, then `$HOME/Dev`; deployment creates `$HOME/Work` only when neither exists.
 
 Data namespace identity:
 

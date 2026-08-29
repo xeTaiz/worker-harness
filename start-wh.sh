@@ -234,23 +234,28 @@ normalize_host_source() {
   while [ "$source" != "/" ] && [[ "$source" == */ ]]; do
     source="${source%/}"
   done
+  if [ -e "$source" ]; then
+    source="$(readlink -f "$source")"
+  fi
   printf '%s\n' "$source"
 }
 
-# Code collections are explicit roots. An explicitly empty WH_CODE_ROOTS
-# disables them; otherwise deployment-created ~/Work and ~/Dev are defaults.
-code_roots="${WH_CODE_ROOTS-$HOME/Work;$HOME/Dev}"
-if [ -n "$code_roots" ]; then
+# Workers use one host code collection. Prefer ~/Work, fall back to ~/Dev, and
+# allow an explicit WH_CODE_ROOT path. Deployment creates ~/Work only when
+# neither conventional directory exists.
+code_root="${WH_CODE_ROOT:-}"
+if [ -z "$code_root" ]; then
+  if [ -d "$HOME/Work" ]; then
+    code_root="$HOME/Work"
+  elif [ -d "$HOME/Dev" ]; then
+    code_root="$HOME/Dev"
+  fi
+fi
+code_root="$(normalize_host_source "$code_root")"
+if [ -d "$code_root" ]; then
   append_managed_source "$HOME"
-  IFS=';' read -ra _code_roots <<< "$code_roots"
-  for _dir in "${_code_roots[@]}"; do
-    _dir="$(normalize_host_source "$_dir")"
-    [ -d "$_dir" ] || continue
-    _name="$(basename "$_dir")"
-    _name="${_name,,}"
-    append_managed_root "$_dir"
-    append_effective_bind "$_dir:/code/$_name"
-  done
+  append_managed_root "$code_root"
+  append_effective_bind "$code_root:/code"
 fi
 
 # A filesystem mounted directly at /mnt becomes /data/local. Otherwise each

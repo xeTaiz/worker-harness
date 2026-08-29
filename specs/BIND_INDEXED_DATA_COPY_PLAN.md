@@ -132,8 +132,7 @@ $WH_DIR/data/bind-paths.json
 Example effective layout:
 
 ```text
-~/Work                 → /code/work
-~/Dev                  → /code/dev
+~/Work or ~/Dev        → /code
 /mnt                   → /data/local
 ~/mnt/datawaha         → /data/shared/datawaha
 ~/mnt/ibex             → /data/shared/ibex
@@ -144,7 +143,7 @@ Manifest visible in the SIF:
 
 ```json
 {
-  "paths": ["/code/dev", "/code/work", "/data/local", "/data/shared/datawaha", "/data/shared/ibex", "/data/shared/ibex_c2324"]
+  "paths": ["/code", "/data/local", "/data/shared/datawaha", "/data/shared/ibex", "/data/shared/ibex_c2324"]
 }
 ```
 
@@ -176,8 +175,7 @@ Collection roots use semantic namespaces:
 ```text
 /data/shared/<name>  # same deploy-managed network collection across workers
 /data/local/<name>   # worker-local filesystem; same name does not imply identity
-/code/work           # repositories below ~/Work
-/code/dev            # repositories below ~/Dev
+/code                # repositories below the selected ~/Work or ~/Dev root
 ```
 
 Each returned directory is a copyable unit. Agents may inspect it with their

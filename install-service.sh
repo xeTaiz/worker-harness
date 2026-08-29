@@ -194,7 +194,10 @@ for path in "$service_src" "$launcher_src" "$image_src"; do
   fi
 done
 
-mkdir -p "$unit_dir" "$config_dir" "$HOME/Work" "$HOME/Dev"
+mkdir -p "$unit_dir" "$config_dir"
+if [ ! -d "$HOME/Work" ] && [ ! -d "$HOME/Dev" ]; then
+  mkdir -p "$HOME/Work"
+fi
 link_file "$service_src" "$service_dst"
 chmod +x "$launcher_src"
 
