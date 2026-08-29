@@ -10,6 +10,9 @@
 # roll back to the previous one.
 set -euo pipefail
 
+exec 9>"$HOME/.worker-harness-deploy.lock"
+flock 9
+
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
 NEW="$HOME/.local/worker-harness/harness/new-image.sif"

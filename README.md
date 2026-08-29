@@ -361,21 +361,43 @@ just deploy target
 ```
 
 `target` may be a host alias from `~/.ssh/config` or `user@hostname`. The recipe
-builds `dist/`, mirrors it to `target:~/worker-harness`, and runs the installer
-there. The installer:
+builds `dist/`, uploads it to a new staging directory, and runs a transactional
+migration on the worker:
 
-1. installs prerequisites through the host package manager, then installs
-   rclone from the official `https://rclone.org/install.sh` script when rclone
-   is absent or lacks the SMB backend,
-2. creates and validates the mount directories described by
-   `rclone-*.service`,
-3. symlinks and starts only services whose remotes are reachable,
-4. binds successful rclone mounts at `/data_shared`, `/data_ibex`, and
-   `/data_ibex_c2324`, and
-5. symlinks and starts the worker harness service.
+1. preserve the worker env and rclone credentials in the stage,
+2. disable new update/restart triggers and let any active updater finish,
+3. acquire the same host lock used by the update and restart helpers,
+4. defer any pending `new-image.sif` or restart trigger,
+5. stop the worker and each rclone service, confirming old mounts are gone,
+6. rename `~/worker-harness` to a timestamped backup and atomically rename the
+   stage into its place,
+7. migrate regular systemd user units and configs to symlinks, validate rclone
+   remotes, and normalize their bind destinations,
+8. restart the rclone, worker, and path units, then require both systemd and the
+   worker daemon to remain healthy, and
+9. automatically restore the old directory, config/unit state, enabled/active
+   service state, and pending triggers if any step fails.
 
-Keep the host-specific rclone credentials in the gitignored
-`worker_rclone.conf`; `just dist` packages it as `dist/rclone.conf`.
+The successful deployment retains the previous installation at
+`~/worker-harness.backup.<transaction>`, including a `.deployment-state`
+snapshot. Pending update/restart triggers are retained there rather than
+running immediately after deployment. Remove the backup manually after the
+worker has been observed in production.
+
+During installation, rclone comes from the official
+`https://rclone.org/install.sh` script when it is absent or lacks the SMB
+backend. Working mounts use `/data_shared`, `/data_ibex`, and
+`/data_ibex_c2324`.
+
+Keep host-specific rclone credentials in the gitignored
+`worker_rclone.conf`; `just dist` packages it as `dist/rclone.conf`, while an
+existing worker's configuration remains authoritative during migration.
+
+The transaction covers user services managed under
+`~/.config/systemd/user`. System-wide units under `/etc/systemd/system` and
+unrelated rclone service names are not migrated. `SIGINT`, `SIGTERM`, and
+ordinary command failures roll back automatically; power loss or `SIGKILL`
+can still require selecting the timestamped backup manually.
 
 If you want to run it manually instead of systemd, put env vars in `.env` (or set `WH_ENV_FILE`) and run:
 

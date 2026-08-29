@@ -100,9 +100,6 @@ build-singularity-from-docker output="worker-harness-worker.sif":
 dist:
     @./scripts/make-dist.sh
 
-# Build the bundle, replace ~/worker-harness on the target, then install it.
+# Build, stage, atomically migrate, health-check, and roll back on failure.
 deploy remote: dist
-    @echo "[just deploy] Deploying dist/ to {{remote}}:~/worker-harness"
-    @ssh -- "{{remote}}" 'mkdir -p "$HOME/worker-harness"'
-    @rsync -az --delete -e ssh dist/ "{{remote}}:worker-harness/"
-    @ssh -t -- "{{remote}}" 'cd "$HOME/worker-harness" && ./install-service.sh'
+    @./scripts/deploy-worker.sh "{{remote}}"

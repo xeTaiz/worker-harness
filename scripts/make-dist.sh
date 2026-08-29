@@ -23,6 +23,7 @@ mkdir -p dist
 cp start-wh.sh dist/start-wh.sh
 cp install-service.sh dist/install-service.sh
 cp migrate-to-symlinks.sh dist/migrate-to-symlinks.sh
+cp deploy-remote.sh dist/deploy-remote.sh
 cp systemd/worker-harness.service dist/worker-harness.service
 cp systemd/worker-harness-update.path dist/worker-harness-update.path
 cp systemd/worker-harness-update.service dist/worker-harness-update.service
@@ -51,7 +52,7 @@ if [ -f worker-harness-worker.sif ]; then
   cp worker-harness-worker.sif dist/worker-harness-worker.sif
 fi
 
-chmod +x dist/start-wh.sh dist/install-service.sh dist/migrate-to-symlinks.sh
+chmod +x dist/start-wh.sh dist/install-service.sh dist/migrate-to-symlinks.sh dist/deploy-remote.sh
 
 cat > dist/README.md <<'EOF'
 # worker-harness dist
@@ -62,6 +63,7 @@ Contents:
 - `start-wh.sh`
 - `install-service.sh`
 - `migrate-to-symlinks.sh` — one-time migration for existing installs
+- `deploy-remote.sh` — transactional activation and automatic rollback
 - `worker-harness.service` — main service (Restart=always)
 - `worker-harness-update.path` / `.service` — auto-swap new image + restart
 - `worker-harness-restart.path` / `.service` — restart on trigger file
@@ -77,6 +79,8 @@ Usage:
 The generated `.env` is derived from the repo `.env` and contains the runtime worker env.
 `install-service.sh` links the units, scripts, rclone config, and runtime env from `~/.config/...` back to this directory. It installs the official rclone release when needed, validates each remote, and binds successful mounts at `/data_shared`, `/data_ibex`, and `/data_ibex_c2324`. The launcher maps home directories under `/code` and direct `/mnt` mountpoints to `/data`, `/data2`, and so on.
 All `WH_*` variables are automatically carried through.
+
+`just deploy` stages this bundle outside the live installation, locks out image/restart helpers, stops the worker and packaged rclone mounts, atomically swaps the install directory, and performs a health check. Failure restores the previous directory, configs, units, service state, and deferred triggers. A successful migration retains `~/worker-harness.backup.<transaction>` for manual cleanup. System-wide units and unrelated rclone service names remain outside the transaction.
 EOF
 
 cat > dist/.gitignore <<'EOF'

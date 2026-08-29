@@ -2,6 +2,7 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+migration_suffix="${WH_MIGRATION_SUFFIX:-$(date +%Y%m%d%H%M%S)}"
 bundle_mode=0
 if [ ! -d "$script_dir/.git" ]; then
   bundle_mode=1
@@ -50,11 +51,35 @@ fi
 link_file() {
   local src="$1" dst="$2" backup
   if [ -e "$dst" ] && [ ! -L "$dst" ]; then
-    backup="${dst}.pre-symlink.$(date +%Y%m%d%H%M%S)"
+    backup="${dst}.pre-symlink.$migration_suffix"
     mv "$dst" "$backup"
     echo "[install-service] backed up $dst -> $backup"
   fi
   ln -sfnT "$src" "$dst"
+}
+
+preserve_external_config() {
+  local src="$1" dst="$2" label="$3" external="" backup
+  if [ -L "$dst" ]; then
+    external="$(readlink -f "$dst" 2>/dev/null || true)"
+    if [ -n "$external" ] && [ "$external" != "$src" ] && [ -f "$external" ]; then
+      if [ -e "$src" ]; then
+        backup="${src}.pre-config-migration.$migration_suffix"
+        mv "$src" "$backup"
+        echo "[install-service] backed up $src -> $backup"
+      fi
+      cp -p "$external" "$src"
+      echo "[install-service] migrated linked $label from $external -> $src"
+    fi
+  elif [ -e "$dst" ]; then
+    if [ -e "$src" ]; then
+      backup="${src}.pre-config-migration.$migration_suffix"
+      mv "$src" "$backup"
+      echo "[install-service] backed up $src -> $backup"
+    fi
+    mv "$dst" "$src"
+    echo "[install-service] migrated $label $dst -> $src"
+  fi
 }
 
 find_optional_source() {
@@ -65,6 +90,22 @@ find_optional_source() {
       return 0
     fi
   done
+  return 1
+}
+
+unit_mount_dir() {
+  local unit="$1" line exec_start="" rclone_bin rclone_action remote_spec mount_spec
+  while IFS= read -r line; do
+    if [[ "$line" == ExecStart=* ]]; then
+      exec_start="${line#ExecStart=}"
+      break
+    fi
+  done < "$unit"
+  read -r rclone_bin rclone_action remote_spec mount_spec _ <<< "$exec_start"
+  if [ "$rclone_action" = "mount" ] && [ -n "${mount_spec:-}" ]; then
+    printf '%s\n' "${mount_spec//\%h/$HOME}"
+    return 0
+  fi
   return 1
 }
 
@@ -190,15 +231,8 @@ done
 if [ -z "$env_src" ]; then
   env_src="$script_dir/.env"
 fi
-if [ -e "$env_dst" ] && [ ! -L "$env_dst" ]; then
-  if [ -e "$env_src" ]; then
-    backup="${env_src}.pre-config-migration.$(date +%Y%m%d%H%M%S)"
-    mv "$env_src" "$backup"
-    echo "[install-service] backed up $env_src -> $backup"
-  fi
-  mv "$env_dst" "$env_src"
-  echo "[install-service] migrated $env_dst -> $env_src"
-elif [ ! -e "$env_src" ]; then
+preserve_external_config "$env_src" "$env_dst" "worker environment"
+if [ ! -e "$env_src" ]; then
   touch "$env_src"
 fi
 chmod 600 "$env_src"
@@ -229,8 +263,17 @@ if ! command -v systemctl >/dev/null 2>&1; then
   exit 1
 fi
 
+legacy_rclone_mounts=()
+for unit_src in "${rclone_units[@]}"; do
+  installed_unit="$unit_dir/$(basename "$unit_src")"
+  if [ -f "$installed_unit" ] && legacy_mount="$(unit_mount_dir "$installed_unit")"; then
+    legacy_rclone_mounts+=("$legacy_mount")
+  fi
+done
+
 valid_rclone_units=()
-configured_rclone_mounts=()
+configured_rclone_mounts=("${legacy_rclone_mounts[@]}")
+preserve_external_config "$rclone_config_src" "$rclone_config_dst" "rclone configuration"
 if [ "${#rclone_units[@]}" -gt 0 ]; then
   if [ ! -f "$rclone_config_src" ]; then
     echo "[install-service] WARNING: rclone services found without rclone.conf; skipping them" >&2
@@ -277,7 +320,12 @@ working_rclone_binds=()
 for unit_and_mount in "${valid_rclone_units[@]}"; do
   unit_name="${unit_and_mount%%|*}"
   mount_dir="${unit_and_mount#*|}"
-  systemctl --user enable --now "$unit_name"
+  systemctl --user enable "$unit_name"
+  if ! systemctl --user restart "$unit_name"; then
+    echo "[install-service] WARNING: $unit_name failed to restart; disabling it" >&2
+    systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
+    continue
+  fi
   for _attempt in {1..20}; do
     mountpoint -q "$mount_dir" && break
     sleep 0.25
@@ -299,6 +347,11 @@ if [ "${#configured_rclone_mounts[@]}" -gt 0 ]; then
   for bind_pair in "${existing_bind_pairs[@]}"; do
     [ -n "$bind_pair" ] || continue
     keep_bind=1
+    bind_destination="${bind_pair#*:}"
+    bind_destination="${bind_destination%%:*}"
+    case "$bind_destination" in
+      /data_shared|/data_ibex|/data_ibex_c2324) keep_bind=0 ;;
+    esac
     for mount_dir in "${configured_rclone_mounts[@]}"; do
       if [ "${bind_pair%%:*}" = "$mount_dir" ]; then
         keep_bind=0
@@ -318,17 +371,26 @@ if [ "${#configured_rclone_mounts[@]}" -gt 0 ]; then
   write_extra_binds "$extra_binds"
 fi
 
-systemctl --user enable --now worker-harness.service
+systemctl --user enable worker-harness.service
+systemctl --user restart worker-harness.service
+sleep 1
+if ! systemctl --user is-active --quiet worker-harness.service; then
+  echo "[install-service] ERROR: worker-harness.service is not active after restart" >&2
+  exit 1
+fi
 
-# Enable path units for image updates and restart triggers
-systemctl --user enable worker-harness-update.path 2>/dev/null && systemctl --user start worker-harness-update.path 2>/dev/null || true
-systemctl --user enable worker-harness-restart.path 2>/dev/null && systemctl --user start worker-harness-restart.path 2>/dev/null || true
+# Restart path units so active manual installs pick up the linked definitions.
+for path_unit in worker-harness-update.path worker-harness-restart.path; do
+  systemctl --user enable "$path_unit" 2>/dev/null || true
+  systemctl --user restart "$path_unit" 2>/dev/null || \
+    echo "[install-service] WARNING: could not restart $path_unit" >&2
+done
 
 echo "[install-service] installed: $service_dst"
 echo "[install-service] env:       $env_dst"
 echo "[install-service] launcher:  $launcher_src"
 echo "[install-service] image:     $image_src"
-echo "[install-service] path units: update + restart watchers enabled"
+echo "[install-service] path units: update + restart watchers refreshed"
 
 if command -v loginctl >/dev/null 2>&1; then
   if loginctl enable-linger "$USER" >/dev/null 2>&1; then
