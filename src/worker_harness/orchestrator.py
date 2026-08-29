@@ -15,6 +15,7 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -25,6 +26,17 @@ from .db import Database
 from .heartbeat import run_control_server, run_registration_server
 
 console = Console()
+
+
+async def prune_stale_workers_once(
+    db: Database,
+    cutoff_seconds: int,
+    *,
+    now: int | None = None,
+) -> int:
+    """Remove worker registrations that missed the heartbeat cutoff."""
+    current = int(time.time()) if now is None else now
+    return await db.prune_workers(current - cutoff_seconds)
 
 
 async def serve(config: Config) -> None:
@@ -46,17 +58,20 @@ async def serve(config: Config) -> None:
     signal.signal(signal.SIGTERM, shutdown)
 
     try:
-        # Periodically mark stale workers as offline
-        import time as _time
-        async def offline_sweeper():
+        # Cluster workers are ephemeral. Remove stale registrations rather than
+        # retaining an ever-growing offline inventory; a returning worker
+        # re-registers with its persisted ID on its next heartbeat.
+        async def stale_worker_pruner():
             while not stop_event.is_set():
-                await asyncio.sleep(30)  # check every 30s regardless of cutoff
-                cutoff = int(_time.time()) - config.heartbeat.offline_cutoff_seconds
-                count = await db.mark_workers_offline(cutoff)
+                await asyncio.sleep(30)
+                count = await prune_stale_workers_once(
+                    db,
+                    config.heartbeat.offline_cutoff_seconds,
+                )
                 if count > 0:
-                    console.print(f"[dim]Marked {count} worker(s) offline[/]")
+                    console.print(f"[dim]Pruned {count} stale worker(s)[/]")
 
-        sweeper_task = asyncio.create_task(offline_sweeper())
+        sweeper_task = asyncio.create_task(stale_worker_pruner())
         registration_task = asyncio.create_task(
             run_registration_server(db, config.heartbeat.host, config.heartbeat.port)
         )

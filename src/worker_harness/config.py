@@ -18,7 +18,7 @@ class SSHConfig(BaseModel):
 class HeartbeatConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 12888
-    offline_cutoff_seconds: int = 180  # mark worker offline if no heartbeat in 3min
+    offline_cutoff_seconds: int = 180  # remove worker if no heartbeat in 3min
 
 
 class ControlConfig(BaseModel):
