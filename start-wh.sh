@@ -240,15 +240,23 @@ normalize_host_source() {
   printf '%s\n' "$source"
 }
 
-# Workers use one host code collection. Prefer ~/Work, fall back to ~/Dev, and
-# allow an explicit WH_CODE_ROOT path. Deployment creates ~/Work only when
-# neither conventional directory exists.
+# Cluster nodes reach the shared collections natively instead of through
+# rclone. The user filesystem is the same directory other workers mount as
+# /data/shared/ibex, and it also holds the checked-out repositories.
+ibex_user_root="${WH_IBEX_USER_ROOT-/ibex/user/$(id -un)}"
+[ -d "$ibex_user_root" ] || ibex_user_root=""
+
+# Workers use one host code collection. Prefer ~/Work, fall back to ~/Dev or
+# the cluster user filesystem, and allow an explicit WH_CODE_ROOT path.
+# Deployment creates ~/Work only when neither conventional directory exists.
 code_root="${WH_CODE_ROOT:-}"
 if [ -z "$code_root" ]; then
   if [ -d "$HOME/Work" ]; then
     code_root="$HOME/Work"
   elif [ -d "$HOME/Dev" ]; then
     code_root="$HOME/Dev"
+  else
+    code_root="$ibex_user_root"
   fi
 fi
 code_root="$(normalize_host_source "$code_root")"
@@ -281,6 +289,23 @@ else
     append_managed_root "$_mount_dir"
   done
 fi
+
+if [ -n "$ibex_user_root" ]; then
+  ibex_user_root="$(normalize_host_source "$ibex_user_root")"
+  append_effective_bind "$ibex_user_root:/data/shared/ibex"
+  append_managed_root "$ibex_user_root"
+fi
+
+# Project filesystems keep the same collection names the rclone mounts use,
+# so /data/shared/ibex_c2324 means one directory across the whole fleet.
+IFS=';' read -ra _ibex_projects <<< "${WH_IBEX_PROJECTS-c2324}"
+for _project in "${_ibex_projects[@]}"; do
+  [ -n "$_project" ] || continue
+  _project_dir="${WH_IBEX_PROJECT_ROOT-/ibex/project}/$_project"
+  [ -d "$_project_dir" ] || continue
+  append_effective_bind "$_project_dir:/data/shared/ibex_$_project"
+  append_managed_root "$_project_dir"
+done
 
 if [ -n "${WH_EXTRA_BINDS:-}" ]; then
   IFS=';' read -ra _extra_pairs <<< "$WH_EXTRA_BINDS"

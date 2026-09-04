@@ -107,3 +107,7 @@ deploy remote: dist
 # Same transactional migration on this machine, without SSH.
 deploy-local: dist
     @./scripts/deploy-worker.sh local
+
+# Refresh a Slurm-launched install (launcher + helpers only, no services).
+deploy-slurm dir *args:
+    @./scripts/deploy-slurm.sh "{{dir}}" {{args}}
