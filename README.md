@@ -416,36 +416,6 @@ unrelated rclone service names are not migrated. `SIGINT`, `SIGTERM`, and
 ordinary command failures roll back automatically; power loss or `SIGKILL`
 can still require selecting the timestamped backup manually.
 
-## Slurm-launched workers
-
-Cluster nodes have no systemd user services and no rclone: a batch job runs
-`bash <install-dir>/start-wh.sh` directly, so only the launcher and the Slurm
-helpers need updating. Point the recipe at the install directory, either on the
-cluster filesystem or through its mount on any worker:
-
-```bash
-just deploy-slurm /data/shared/ibex/worker-harness
-just deploy-slurm /ibex/user/engeld/worker-harness --with-image
-```
-
-Each file is replaced through a temporary name in the same directory, so a job
-starting mid-update reads either the old or the new file. Queued and running
-jobs are untouched: the batch scripts do not change, and every new job in the
-self-chaining sequence picks up the current launcher.
-
-On these nodes the launcher binds the same collections natively:
-
-```text
-/ibex/user/<user>      → /code and /data/shared/ibex
-/ibex/project/c2324    → /data/shared/ibex_c2324
-```
-
-`WH_IBEX_USER_ROOT`, `WH_IBEX_PROJECT_ROOT`, and the semicolon-separated
-`WH_IBEX_PROJECTS` override the detected paths. The user filesystem is
-deliberately bound twice, because it holds both the repositories and the shared
-collection other workers reach through rclone. Hosts without those directories
-are unaffected.
-
 If you want to run it manually instead of systemd, put env vars in `.env` (or set `WH_ENV_FILE`) and run:
 
 ```bash
@@ -488,6 +458,36 @@ For boot without login, enable user lingering:
 ```bash
 loginctl enable-linger "$USER"
 ```
+
+## Slurm-launched workers
+
+Cluster nodes have no systemd user services and no rclone: a batch job runs
+`bash <install-dir>/start-wh.sh` directly, so only the launcher and the Slurm
+helpers need updating. Point the recipe at the install directory, either on the
+cluster filesystem or through its mount on any worker:
+
+```bash
+just deploy-slurm /data/shared/ibex/worker-harness
+just deploy-slurm /ibex/user/engeld/worker-harness --with-image
+```
+
+Each file is replaced through a temporary name in the same directory, so a job
+starting mid-update reads either the old or the new file. Queued and running
+jobs are untouched: the batch scripts do not change, and every new job in the
+self-chaining sequence picks up the current launcher.
+
+On these nodes the launcher binds the same collections natively:
+
+```text
+/ibex/user/<user>      → /code and /data/shared/ibex
+/ibex/project/c2324    → /data/shared/ibex_c2324
+```
+
+`WH_IBEX_USER_ROOT`, `WH_IBEX_PROJECT_ROOT`, and the semicolon-separated
+`WH_IBEX_PROJECTS` override the detected paths. The user filesystem is
+deliberately bound twice, because it holds both the repositories and the shared
+collection other workers reach through rclone. Hosts without those directories
+are unaffected.
 
 ## Worker container env vars
 
