@@ -25,8 +25,12 @@ if [ "$local_mode" -eq 1 ]; then
   cleanup_stage() { rm -rf -- "$stage_dir"; }
   trap cleanup_stage EXIT
 
-  if [ "$stage_dir" -ef "$repo_dir" ] || [ "$HOME/worker-harness" -ef "$repo_dir" ]; then
-    echo "[deploy] ERROR: refusing to deploy over the repository itself" >&2
+  # The transaction renames ~/worker-harness aside. Anything inside that tree —
+  # including this repository and the running script — would move with it.
+  live_dir="$(cd "$HOME" && mkdir -p worker-harness && cd worker-harness && pwd -P)"
+  repo_real="$(cd "$repo_dir" && pwd -P)"
+  if [ "$repo_real" = "$live_dir" ] || [[ "$repo_real" == "$live_dir/"* ]]; then
+    echo "[deploy] ERROR: repository lives inside $live_dir; deployment would move it" >&2
     exit 1
   fi
 
