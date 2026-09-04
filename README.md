@@ -391,6 +391,11 @@ backend. Working network mounts use `/data/shared/datawaha`,
 at `/mnt` use `/data/local`; direct child mounts use
 `/data/local/<mount-name>`.
 
+Rclone mount activation waits up to 30 seconds by default
+(`WH_RCLONE_MOUNT_TIMEOUT`). A failed mount is stopped and disabled, but its
+unit remains linked under `~/.config/systemd/user` for inspection or a later
+restart; the installer prints recent status and journal output.
+
 Keep the common worker credentials in the gitignored `worker_rclone.conf`;
 `just dist` packages it as `dist/rclone.conf`, and that bundled config is
 authoritative during deployment. An existing worker config is used only when

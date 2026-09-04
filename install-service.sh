@@ -58,6 +58,23 @@ link_file() {
   ln -sfnT "$src" "$dst"
 }
 
+disable_but_keep_linked() {
+  local unit_src="$1" unit_name="$2"
+  systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
+  # `systemctl disable` also removes links created for out-of-search-path unit
+  # files. Recreate the canonical config link so operators can inspect/start it.
+  link_file "$unit_src" "$unit_dir/$unit_name"
+  systemctl --user daemon-reload
+}
+
+show_unit_failure() {
+  local unit_name="$1"
+  systemctl --user status "$unit_name" --no-pager -l >&2 || true
+  if command -v journalctl >/dev/null 2>&1; then
+    journalctl --user -u "$unit_name" -n 30 --no-pager >&2 || true
+  fi
+}
+
 preserve_external_config() {
   local src="$1" dst="$2" label="$3" external="" backup
   if [ -L "$dst" ]; then
@@ -302,13 +319,13 @@ if [ "${#rclone_units[@]}" -gt 0 ]; then
       mount_dir="${mount_spec//\%h/$HOME}"
       configured_rclone_mounts+=("$mount_dir")
       mkdir -p "$mount_dir"
+      link_file "$unit_src" "$unit_dir/$unit_name"
       echo "[install-service] checking $remote_spec for $unit_name"
       if rclone lsf --config="$rclone_config_dst" --max-depth 1 "$remote_spec" >/dev/null; then
-        link_file "$unit_src" "$unit_dir/$unit_name"
         valid_rclone_units+=("$unit_name|$unit_src|$mount_dir")
       else
         echo "[install-service] WARNING: $remote_spec is unavailable; skipping $unit_name" >&2
-        systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
+        disable_but_keep_linked "$unit_src" "$unit_name"
       fi
     done
   fi
@@ -317,6 +334,11 @@ fi
 systemctl --user daemon-reload
 
 working_rclone_binds=()
+mount_timeout="${WH_RCLONE_MOUNT_TIMEOUT:-30}"
+if [[ ! "$mount_timeout" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[install-service] ERROR: WH_RCLONE_MOUNT_TIMEOUT must be a positive integer" >&2
+  exit 1
+fi
 for unit_and_mount in "${valid_rclone_units[@]}"; do
   unit_name="${unit_and_mount%%|*}"
   unit_source_and_mount="${unit_and_mount#*|}"
@@ -325,11 +347,13 @@ for unit_and_mount in "${valid_rclone_units[@]}"; do
   systemctl --user enable "$unit_src"
   if ! systemctl --user restart "$unit_name"; then
     echo "[install-service] WARNING: $unit_name failed to restart; disabling it" >&2
-    systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
+    show_unit_failure "$unit_name"
+    disable_but_keep_linked "$unit_src" "$unit_name"
     continue
   fi
-  for _attempt in {1..20}; do
+  for ((_attempt = 0; _attempt < mount_timeout * 4; _attempt++)); do
     mountpoint -q "$mount_dir" && break
+    systemctl --user is-active --quiet "$unit_name" || break
     sleep 0.25
   done
   if systemctl --user is-active --quiet "$unit_name" && mountpoint -q "$mount_dir"; then
@@ -337,8 +361,9 @@ for unit_and_mount in "${valid_rclone_units[@]}"; do
     working_rclone_binds+=("$mount_dir:$container_dir")
     echo "[install-service] mounted: $mount_dir -> $container_dir"
   else
-    echo "[install-service] WARNING: $unit_name did not mount $mount_dir; disabling it" >&2
-    systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
+    echo "[install-service] WARNING: $unit_name did not mount $mount_dir within ${mount_timeout}s; disabling it" >&2
+    show_unit_failure "$unit_name"
+    disable_but_keep_linked "$unit_src" "$unit_name"
   fi
 done
 

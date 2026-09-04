@@ -137,9 +137,6 @@ enable_unit_file() {
 restore_service_state() {
   local unit_name
   systemctl --user daemon-reload || true
-  for unit_name in "${managed_units[@]}"; do
-    systemctl --user disable "$unit_name" >/dev/null 2>&1 || true
-  done
   for unit_name in "${enabled_units[@]}"; do
     enable_unit_file "$unit_name" >/dev/null 2>&1 || true
   done
@@ -211,6 +208,11 @@ rollback() {
   echo "[deploy-remote] ERROR: deployment failed; rolling back" >&2
   for unit_name in "${managed_units[@]}"; do
     systemctl --user stop "$unit_name" >/dev/null 2>&1 || true
+  done
+  # Disable the failed deployment before restoring saved unit-file links:
+  # systemd may delete out-of-search-path links while disabling.
+  for unit_name in "${managed_units[@]}"; do
+    systemctl --user disable "$unit_name" >/dev/null 2>&1 || true
   done
   restore_path_set "$state/systemd" "$unit_dir" "${managed_units[@]}"
   restore_path_set "$state/worker-config" "$worker_config_dir" "${worker_config_names[@]}"
