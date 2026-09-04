@@ -378,6 +378,15 @@ migration on the worker:
 9. automatically restore the old directory, config/unit state, enabled/active
    service state, and pending triggers if any step fails.
 
+To migrate the machine you are on, use the SSH-free variant:
+
+```bash
+just deploy-local
+```
+
+It stages, swaps, health-checks, and rolls back exactly like a remote
+deployment, and refuses to run if `~/worker-harness` is the repository itself.
+
 The successful deployment retains the previous installation at
 `~/worker-harness.backup.<transaction>`, including a `.deployment-state`
 snapshot. Pending update/restart triggers are retained there rather than

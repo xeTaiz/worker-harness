@@ -103,3 +103,7 @@ dist:
 # Build, stage, atomically migrate, health-check, and roll back on failure.
 deploy remote: dist
     @./scripts/deploy-worker.sh "{{remote}}"
+
+# Same transactional migration on this machine, without SSH.
+deploy-local: dist
+    @./scripts/deploy-worker.sh local
