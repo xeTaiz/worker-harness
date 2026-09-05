@@ -17,6 +17,8 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    secrets:
+      - wh_operator_token
     tmpfs:
       - /tmp:size=16m,mode=1777
       - /var/cache/nginx:size=16m,mode=1777
@@ -25,3 +27,7 @@ networks:
   wh-internal:
     name: ${WH_DOCKER_NETWORK:-wh-internal}
     external: true
+
+secrets:
+  wh_operator_token:
+    file: ${WH_OPERATOR_TOKEN_FILE:?set WH_OPERATOR_TOKEN_FILE to the private server token file}

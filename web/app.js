@@ -1,10 +1,11 @@
 const $ = (selector) => document.querySelector(selector);
 const listView = $("#session-list-view");
-const globalView = $("#global-router-view");
+const globalView = $("#global-view");
 const detailView = $("#session-detail-view");
 const sessionList = $("#session-list");
 const emptyState = $("#empty-state");
 const transcript = $("#transcript");
+const sessionMeta = $("#session-meta");
 const sessionControls = $("#session-controls");
 const modelControl = $("#model-control");
 const thinkingControl = $("#thinking-control");
@@ -30,13 +31,9 @@ const globalRefresh = $("#global-refresh");
 const globalRoster = $("#global-roster");
 const globalTurns = $("#global-turns");
 const globalComposer = $("#global-composer");
-const globalTarget = $("#global-target");
 const globalMessage = $("#global-message");
 const globalSend = $("#global-send");
 const globalStatus = $("#global-status");
-const routerModel = $("#router-model");
-const routerThinking = $("#router-thinking");
-const routerLatency = $("#router-latency");
 
 const state = {
   sessions: [],
@@ -52,14 +49,13 @@ const state = {
   showHistory: false,
   followLatest: true,
   installPrompt: null,
-  globalSnapshot: null,
-  globalSources: new Map(),
-  globalModels: [],
   globalOpen: false,
   globalExpanded: new Set(),
   globalRenderTimer: null,
   globalLoading: false,
   globalGeneration: 0,
+  globalSources: new Map(),
+  globalSending: false,
 };
 
 function node(tag, className, text) {
@@ -91,6 +87,56 @@ function sessionLabel(session) {
 function sessionContext(session) {
   return [session.host, session.cwd].filter(Boolean).join(" · ") || session.tmux_session || session.id;
 }
+function roleBadge(session) {
+  const role = ["orchestrator", "pm", "task"].includes(session.role) ? session.role : "";
+  return role ? node("span", `role-badge role-${role}`, role) : null;
+}
+
+function sessionFacts(session, { linkPr = true } = {}) {
+  const meta = session.meta && typeof session.meta === "object" ? session.meta : {};
+  const facts = node("div", "session-facts");
+  if (meta.project) facts.append(node("span", "session-fact", `Project: ${meta.project}`));
+  if (meta.branch) facts.append(node("span", "session-fact", `Branch: ${meta.branch}`));
+  if (meta.pr_url) {
+    if (linkPr) {
+      const link = node("a", "session-pr-link", "Open PR");
+      try {
+        const url = new URL(String(meta.pr_url), location.origin);
+        if (!["http:", "https:"].includes(url.protocol)) throw new Error("Unsupported URL");
+        link.href = url.href;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        facts.append(link);
+      } catch {
+        facts.append(node("span", "session-fact", "PR available"));
+      }
+    } else {
+      facts.append(node("span", "session-fact", "PR available"));
+    }
+  }
+  return facts.childElementCount ? facts : null;
+}
+
+function renderSessionMeta() {
+  if (!state.selected) return;
+  sessionMeta.replaceChildren();
+  const badges = node("div", "session-meta-badges");
+  badges.append(
+    node("span", `session-state-badge ${state.selected.state}`, state.selected.state.replaceAll("_", " ")),
+  );
+  const role = roleBadge(state.selected);
+  if (role) badges.prepend(role);
+  sessionMeta.append(badges);
+  if (state.selected.question) {
+    sessionMeta.append(node("p", "session-question", `Waiting on: ${state.selected.question}`));
+  }
+  const facts = sessionFacts(state.selected);
+  if (facts) sessionMeta.append(facts);
+  sessionMeta.classList.toggle("hidden", sessionMeta.childElementCount === 0);
+  sessionMeta.setAttribute("aria-hidden", String(sessionMeta.childElementCount === 0));
+  sessionMeta.classList.toggle("blocked", state.selected.state === "blocked");
+}
+
 
 function isInternalSession(session) {
   return session.name?.startsWith("subagent-");
@@ -116,7 +162,9 @@ async function api(path, options = {}) {
 async function loadSessions({ quiet = false } = {}) {
   if (!quiet) setConnection("connecting");
   try {
-    state.sessions = await api("/api/v1/pi/sessions");
+    const previous = new Map(state.sessions.map((session) => [session.id, session]));
+    const loaded = await api("/api/v1/pi/sessions");
+    state.sessions = loaded.map((session) => ({ ...previous.get(session.id), ...session }));
     state.sessions.sort((a, b) => (b.updated_at || b.created_at) - (a.updated_at || a.created_at));
     renderSessionList();
     if (state.selected) {
@@ -126,10 +174,17 @@ async function loadSessions({ quiet = false } = {}) {
         renderSessionHeader();
       }
     }
+    if (state.globalOpen) {
+      renderGlobal();
+      connectGlobalSources();
+    }
     if (!state.selected) setConnection("online");
+    return true;
   } catch (error) {
+    console.warn("Unable to load sessions", error);
     setConnection("offline");
     if (!quiet) showListError(error.message);
+    return false;
   }
 }
 
@@ -163,7 +218,7 @@ function renderSessionList() {
   globalButton.classList.toggle("active", state.globalOpen);
   globalButton.setAttribute("aria-current", state.globalOpen ? "page" : "false");
   for (const session of visible) {
-    const card = node("button", `session-card${session.id === state.selected?.id ? " active" : ""}`);
+    const card = node("button", `session-card${session.id === state.selected?.id ? " active" : ""}${session.state === "blocked" ? " blocked" : ""}`);
     card.type = "button";
     if (session.id === state.selected?.id) card.setAttribute("aria-current", "page");
     card.addEventListener("click", () => {
@@ -176,13 +231,19 @@ function renderSessionList() {
       node("span", "session-name", sessionLabel(session)),
       node("span", "session-state", session.state.replaceAll("_", " ")),
     );
+    const role = roleBadge(session);
+    if (role) head.insertBefore(role, head.lastElementChild);
     const context = node("p", "session-context", sessionContext(session));
     const foot = node("div", "session-foot");
     foot.append(
       node("span", "", `${session.session_type} · ${session.id.slice(0, 6)}`),
       node("span", "", relativeTime(session.updated_at || session.created_at)),
     );
-    card.append(head, context, foot);
+    card.append(head, context);
+    if (session.question) card.append(node("p", "session-question", `Waiting on: ${session.question}`));
+    const facts = sessionFacts(session, { linkPr: false });
+    if (facts) card.append(facts);
+    card.append(foot);
     sessionList.append(card);
   }
 }
@@ -200,71 +261,35 @@ function closeGlobalSources() {
 }
 
 function globalInteractiveSessions() {
-  return Array.isArray(state.globalSnapshot?.sessions) ? state.globalSnapshot.sessions : [];
+  return state.sessions.filter((session) => !isInternalSession(session) && !isHistoricalSession(session));
 }
 
-function renderRouterControls() {
-  const config = state.globalSnapshot?.config;
-  const selected = `${config?.provider || ""}::${config?.model || ""}`;
-  routerModel.replaceChildren();
-  for (const model of state.globalModels) {
-    const option = node("option", "", `${model.name || model.id} · ${model.provider}`);
-    option.value = `${model.provider}::${model.id}`;
-    option.selected = option.value === selected;
-    routerModel.append(option);
-  }
-  if (config && ![...routerModel.options].some((option) => option.value === selected)) {
-    const option = node("option", "", `${config.model} · ${config.provider}`);
-    option.value = selected;
-    option.selected = true;
-    routerModel.prepend(option);
-  }
-  if (!routerModel.options.length) {
-    const option = node("option", "", "Models unavailable");
-    option.value = "";
-    routerModel.append(option);
-  }
-  routerModel.disabled = !state.globalModels.length;
-  routerThinking.value = config?.thinking_level || "off";
-  routerThinking.disabled = !config;
-  const latest = state.globalSnapshot?.latest_route;
-  routerLatency.textContent = latest?.latency_ms
-    ? `${latest.model} · ${latest.thinking_level} · ${latest.latency_ms} ms`
-    : "No routes yet";
+function orchestratorSession() {
+  return globalInteractiveSessions().find((session) => session.role === "orchestrator") || null;
 }
 
-function renderGlobalTarget() {
-  const selected = globalTarget.value;
-  globalTarget.replaceChildren(node("option", "", "Auto · choose semantically"));
-  globalTarget.firstElementChild.value = "";
-  for (const session of globalInteractiveSessions()) {
-    const option = node("option", "", `${sessionLabel(session)} · ${session.host || "local"} · ${session.state}`);
-    option.value = session.id;
-    option.selected = session.id === selected;
-    globalTarget.append(option);
-  }
+function renderGlobalComposer() {
+  globalMessage.disabled = state.globalSending;
+  globalSend.disabled = state.globalSending;
+  globalMessage.placeholder = "Message the orchestrator…";
 }
 
-function renderGlobal({ controls = true } = {}) {
-  if (!state.globalSnapshot) return;
+function renderGlobal() {
   const sessions = globalInteractiveSessions();
   const activeIds = new Set(sessions.map((session) => session.id));
   for (const id of state.globalExpanded) {
     if (!activeIds.has(id)) state.globalExpanded.delete(id);
   }
-  if (controls) {
-    renderRouterControls();
-    renderGlobalTarget();
-  }
+  renderGlobalComposer();
   globalRoster.replaceChildren();
   globalTurns.replaceChildren();
   if (!sessions.length) {
-    globalRoster.append(node("p", "global-empty", "No active interactive sessions."));
-    globalTurns.append(node("p", "global-empty", "Start Pi with the bridge to populate Global."));
+    globalRoster.append(node("p", "global-empty", "No active sessions."));
+    globalTurns.append(node("p", "global-empty", "Start an agent to populate the fleet view."));
     return;
   }
   for (const session of sessions) {
-    const row = node("article", "global-agent-row");
+    const row = node("article", `global-agent-row${session.state === "blocked" ? " blocked" : ""}`);
     const identity = node("button", "global-agent-identity");
     identity.type = "button";
     identity.addEventListener("click", () => { location.hash = `session/${encodeURIComponent(session.id)}`; });
@@ -272,28 +297,33 @@ function renderGlobal({ controls = true } = {}) {
     heading.append(
       node("span", `state-dot ${session.state}`),
       node("strong", "", sessionLabel(session)),
-      node("span", "global-agent-host", session.host || "local"),
     );
-    identity.append(heading, node("p", "global-agent-prompt", String(session.latest_user_prompt || "No prompt captured yet").slice(-240)));
+    const role = roleBadge(session);
+    if (role) heading.append(role);
+    heading.append(node("span", "global-agent-host", session.host || "local"));
+    identity.append(heading);
+    if (session.question) {
+      identity.append(node("p", "session-question", `Waiting on: ${session.question}`));
+    } else {
+      identity.append(node("p", "global-agent-prompt", String(session.latest_user_prompt || "No prompt captured yet").slice(-240)));
+    }
+    const facts = sessionFacts(session, { linkPr: false });
+    if (facts) identity.append(facts);
     const actions = node("div", "global-agent-actions");
     if (session.current_tool) actions.append(node("span", "tool-badge active", session.current_tool));
     for (const tool of (session.recent_tools || []).filter((tool) => tool !== session.current_tool).slice(0, 2)) {
       actions.append(node("span", "tool-badge", tool));
     }
     if (session.has_pending_messages) actions.append(node("span", "queued-badge", "queued"));
+    const linkedFacts = sessionFacts(session);
+    const prLink = linkedFacts?.querySelector(".session-pr-link");
+    if (prLink) actions.append(prLink);
     if (session.state === "working" || session.has_pending_messages) {
       const interrupt = node("button", "interrupt-button", "Interrupt");
       interrupt.type = "button";
       interrupt.addEventListener("click", () => void interruptSession(session.id));
       actions.append(interrupt);
     }
-    const sendHere = node("button", "send-here-button", "Send here");
-    sendHere.type = "button";
-    sendHere.addEventListener("click", () => {
-      globalTarget.value = session.id;
-      globalMessage.focus();
-    });
-    actions.append(sendHere);
     row.append(identity, actions);
     globalRoster.append(row);
   }
@@ -302,7 +332,7 @@ function renderGlobal({ controls = true } = {}) {
     .sort((a, b) => (b.last_user_at || b.updated_at || 0) - (a.last_user_at || a.updated_at || 0))
     .slice(0, 24);
   for (const session of ordered) {
-    const card = node("details", "global-turn-card");
+    const card = node("details", `global-turn-card${session.state === "blocked" ? " blocked" : ""}`);
     card.open = state.globalExpanded.has(session.id);
     card.addEventListener("toggle", () => {
       if (card.open) state.globalExpanded.add(session.id);
@@ -311,7 +341,12 @@ function renderGlobal({ controls = true } = {}) {
     const summary = node("summary");
     const heading = node("div", "global-turn-heading");
     heading.append(node("span", `state-dot ${session.state}`), node("strong", "", sessionLabel(session)));
-    const prompt = node("p", "global-turn-prompt", String(session.latest_user_prompt || "No prompt captured yet").slice(-240));
+    const role = roleBadge(session);
+    if (role) heading.append(role);
+    const promptText = session.question
+      ? `Waiting on: ${session.question}`
+      : String(session.latest_user_prompt || "No prompt captured yet").slice(-240);
+    const prompt = node("p", session.question ? "global-turn-prompt session-question" : "global-turn-prompt", promptText);
     const output = node("p", "global-turn-output", String(session.assistant_tail || "Waiting for output…").slice(-1200));
     const tools = node("div", "global-turn-tools");
     for (const tool of (session.recent_tools || []).slice(0, 3)) tools.append(node("span", "tool-badge", tool));
@@ -319,16 +354,10 @@ function renderGlobal({ controls = true } = {}) {
     const time = session.last_user_at || session.updated_at;
     summary.append(heading, prompt, output, tools, node("span", "global-turn-meta", `${relativeTime(time)} · Expand`));
     const expanded = node("div", "global-turn-expanded");
-    const open = node("button", "send-here-button", "Open transcript");
+    const open = node("button", "open-session-button", "Open transcript");
     open.type = "button";
     open.addEventListener("click", () => { location.hash = `session/${encodeURIComponent(session.id)}`; });
-    const reply = node("button", "send-here-button", "Reply here");
-    reply.type = "button";
-    reply.addEventListener("click", () => {
-      globalTarget.value = session.id;
-      globalMessage.focus();
-    });
-    expanded.append(open, reply);
+    expanded.append(open);
     card.append(summary, expanded);
     globalTurns.append(card);
   }
@@ -338,7 +367,7 @@ function scheduleGlobalRender() {
   if (state.globalRenderTimer) return;
   state.globalRenderTimer = setTimeout(() => {
     state.globalRenderTimer = null;
-    if (state.globalOpen) renderGlobal({ controls: false });
+    if (state.globalOpen) renderGlobal();
   }, 200);
 }
 
@@ -371,10 +400,13 @@ function applyGlobalEvent(sessionId, event) {
     session.recent_tools = [session.current_tool, ...(session.recent_tools || []).filter((item) => item !== session.current_tool)].slice(0, 3);
   } else if (event.event_type === "tool-end") {
     if (session.current_tool === payload.tool_name) session.current_tool = "";
+  } else if (event.event_type === "blocked") {
+    session.question = String(payload.question || "");
+    session.state = "blocked";
   } else if (event.event_type === "agent-start") {
-    session.state = "working";
+    session.state = session.question ? "blocked" : "working";
   } else if (event.event_type === "agent-settled") {
-    session.state = "idle";
+    session.state = session.question ? "blocked" : "idle";
     session.has_pending_messages = false;
   } else if (event.event_type === "pending-state") {
     session.has_pending_messages = Boolean(payload.has_pending_messages);
@@ -402,45 +434,13 @@ function connectGlobalSources() {
   }
 }
 
-async function loadGlobalSnapshot({ quiet = false } = {}) {
+async function refreshGlobal() {
   if (state.globalLoading || !state.globalOpen) return;
-  const generation = state.globalGeneration;
   state.globalLoading = true;
-  if (!quiet) {
-    setConnection("connecting");
-    globalStatus.textContent = "Loading Global…";
-  }
   try {
-    const snapshot = await api("/api/v1/pi/router/snapshot");
-    if (!state.globalOpen || generation !== state.globalGeneration) return;
-    const existing = new Map(globalInteractiveSessions().map((session) => [session.id, session]));
-    snapshot.sessions = (Array.isArray(snapshot.sessions) ? snapshot.sessions : []).slice(0, 64).map((session) => {
-      const prior = existing.get(session.id);
-      return prior ? { ...prior, ...session, cursor: Math.max(Number(prior.cursor) || 0, Number(session.cursor) || 0) } : session;
-    });
-    state.globalSnapshot = snapshot;
-    try {
-      const models = await api("/api/v1/pi/router/models");
-      if (!state.globalOpen || generation !== state.globalGeneration) return;
-      state.globalModels = Array.isArray(models.models) ? models.models.slice(0, 256) : [];
-    } catch {
-      if (!state.globalOpen || generation !== state.globalGeneration) return;
-      state.globalModels = [];
-    }
-    renderGlobal();
-    connectGlobalSources();
-    setConnection("online");
-    if (!quiet) globalStatus.textContent = "";
-  } catch (error) {
-    if (!state.globalOpen || generation !== state.globalGeneration) return;
-    setConnection("offline");
-    globalStatus.textContent = `Global unavailable: ${error.message}`;
-    if (!state.globalSnapshot) {
-      globalRoster.replaceChildren(node("p", "global-empty", "The semantic router is unavailable."));
-      globalTurns.replaceChildren();
-    }
+    await loadSessions({ quiet: true });
   } finally {
-    if (generation === state.globalGeneration) state.globalLoading = false;
+    state.globalLoading = false;
   }
 }
 
@@ -467,11 +467,12 @@ async function openGlobal() {
   document.body.classList.add("global-open");
   document.body.classList.remove("session-open");
   title.textContent = "Global";
-  subtitle.textContent = "Semantic dispatcher · interactive sessions";
+  subtitle.textContent = "Orchestrator · fleet sessions";
   globalButton.classList.add("active");
   globalButton.setAttribute("aria-current", "page");
   if (mobileSidebar.matches) setSidebarOpen(false);
-  await loadGlobalSnapshot();
+  renderGlobal();
+  await refreshGlobal();
 }
 
 function closeGlobal() {
@@ -497,6 +498,7 @@ function renderSessionHeader() {
     if (index) subtitle.append(document.createTextNode(" · "));
     subtitle.append(node("span", index === 0 ? "header-host" : "header-cwd", value));
   }
+  renderSessionMeta();
   renderSessionControls();
   renderSessionList();
 }
@@ -926,63 +928,38 @@ function route() {
   else closeDetail();
 }
 
-async function configureRouter() {
-  const separator = routerModel.value.indexOf("::");
-  if (separator < 1 || !state.globalSnapshot?.config) return;
-  routerModel.disabled = true;
-  routerThinking.disabled = true;
-  globalStatus.textContent = "Saving router configuration…";
-  try {
-    const config = await api("/api/v1/pi/router/config", {
-      method: "PUT",
-      body: JSON.stringify({
-        provider: routerModel.value.slice(0, separator),
-        model: routerModel.value.slice(separator + 2),
-        thinking_level: routerThinking.value,
-      }),
-    });
-    state.globalSnapshot.config = config;
-    globalStatus.textContent = "Router configuration saved";
-  } catch (error) {
-    globalStatus.textContent = `Router configuration failed: ${error.message}`;
-  } finally {
-    routerModel.disabled = false;
-    routerThinking.disabled = false;
-  }
-}
-
-routerModel.addEventListener("change", () => void configureRouter());
-routerThinking.addEventListener("change", () => void configureRouter());
 globalComposer.addEventListener("submit", async (event) => {
   event.preventDefault();
   const message = globalMessage.value.trim();
-  if (!message) return;
+  if (!message || state.globalSending) return;
   const generation = state.globalGeneration;
-  globalSend.disabled = true;
-  globalStatus.textContent = globalTarget.value ? "Dispatching…" : "Routing…";
+  const starting = !orchestratorSession();
+  state.globalSending = true;
+  renderGlobalComposer();
+  globalStatus.textContent = starting ? "Starting orchestrator…" : "Sending…";
   try {
-    const result = await api("/api/v1/pi/router:dispatch", {
+    const result = await api("/api/v1/pi/orchestrator:send", {
       method: "POST",
-      body: JSON.stringify({ message, target_session_id: globalTarget.value || null }),
+      body: JSON.stringify({ message }),
     });
     if (!state.globalOpen || generation !== state.globalGeneration) return;
-    if (result.status === "dispatched" && result.selected_session_id) {
-      if (globalMessage.value.trim() === message) {
-        globalMessage.value = "";
-        resizeGlobalComposer();
-      }
-      const selected = globalInteractiveSessions().find((item) => item.id === result.selected_session_id);
-      globalStatus.textContent = `Sent to ${sessionLabel(selected || { id: result.selected_session_id })}`;
-    } else {
-      globalStatus.textContent = result.error || "Auto could not choose one recipient. Select a session and retry.";
-      globalTarget.focus();
+    if (globalMessage.value.trim() === message) {
+      globalMessage.value = "";
+      resizeGlobalComposer();
     }
-    await loadGlobalSnapshot({ quiet: true });
+    const session = result.session;
+    const existing = state.sessions.findIndex((item) => item.id === session.id);
+    if (existing === -1) state.sessions.push(session);
+    else state.sessions[existing] = { ...state.sessions[existing], ...session };
+    location.hash = `session/${encodeURIComponent(session.id)}`;
   } catch (error) {
-    if (state.globalOpen && generation === state.globalGeneration) globalStatus.textContent = `Route failed: ${error.message}`;
-  } finally {
     if (state.globalOpen && generation === state.globalGeneration) {
-      globalSend.disabled = false;
+      globalStatus.textContent = `Send failed: ${error.message}`;
+    }
+  } finally {
+    state.globalSending = false;
+    if (state.globalOpen && generation === state.globalGeneration) {
+      renderGlobalComposer();
       globalMessage.focus();
     }
   }
@@ -1004,7 +981,7 @@ globalButton.addEventListener("click", () => {
   setSidebarOpen(false);
   location.hash = "global";
 });
-globalRefresh.addEventListener("click", () => void loadGlobalSnapshot());
+globalRefresh.addEventListener("click", () => void refreshGlobal());
 
 async function queueConfiguration(payload) {
   if (!state.selected) return;
@@ -1088,7 +1065,7 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && state.sidebarOpen) setSidebarOpen(false);
 });
 refreshButton.addEventListener("click", () => {
-  if (state.globalOpen) void loadGlobalSnapshot();
+  if (state.globalOpen) void refreshGlobal();
   else void loadSessions();
 });
 window.addEventListener("hashchange", route);
@@ -1109,5 +1086,5 @@ setSidebarOpen(false);
 await loadSessions();
 route();
 setInterval(() => loadSessions({ quiet: true }), 15_000);
-setInterval(() => { if (state.globalOpen) void loadGlobalSnapshot({ quiet: true }); }, 10_000);
+setInterval(() => { if (state.globalOpen) void refreshGlobal(); }, 10_000);
 setInterval(() => { if (!state.selected && !state.globalOpen) renderSessionList(); }, 30_000);

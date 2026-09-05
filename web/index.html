@@ -10,7 +10,7 @@
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/icon-maskable.svg">
   <link rel="stylesheet" href="/vendor/katex/katex.min.css">
-  <link rel="stylesheet" href="/app.css?v=15">
+  <link rel="stylesheet" href="/app.css?v=22">
   <title>Pi Sessions</title>
 </head>
 <body>
@@ -38,7 +38,7 @@
         </div>
         <button id="global-button" class="global-nav" type="button">
           <span class="global-nav-mark" aria-hidden="true">⌁</span>
-          <span><strong>Global</strong><small>Semantic dispatcher</small></span>
+          <span><strong>Global</strong><small>Orchestrator and fleet</small></span>
           <span class="global-nav-arrow" aria-hidden="true">›</span>
         </button>
         <div id="summary" class="summary-row"></div>
@@ -59,30 +59,11 @@
         </section>
       </main>
 
-      <main id="global-router-view" class="view global-view hidden">
+      <main id="global-view" class="view global-view hidden">
         <div class="global-scroll">
-          <section class="global-controls" aria-label="Global router controls">
-            <label class="compact-control">
-              <span>Router model</span>
-              <select id="router-model" aria-label="Router model"></select>
-            </label>
-            <label class="compact-control">
-              <span>Thinking</span>
-              <select id="router-thinking" aria-label="Router thinking level">
-                <option value="off">Off</option>
-                <option value="minimal">Minimal</option>
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-                <option value="xhigh">Extra high</option>
-                <option value="max">Max</option>
-              </select>
-            </label>
-            <span id="router-latency" class="router-latency">No routes yet</span>
-          </section>
           <section class="global-section" aria-labelledby="global-agents-title">
             <div class="global-section-head">
-              <div><p class="eyebrow">INTERACTIVE AGENTS</p><h2 id="global-agents-title">Active roster</h2></div>
+              <div><p class="eyebrow">AGENT FLEET</p><h2 id="global-agents-title">Active roster</h2></div>
               <button id="global-refresh" class="icon-button" type="button" aria-label="Refresh Global">↻</button>
             </div>
             <div id="global-roster" class="global-roster" aria-live="polite"></div>
@@ -93,22 +74,16 @@
           </section>
         </div>
         <form id="global-composer" class="composer global-composer">
-          <div class="composer-controls">
-            <label class="compact-control global-target-control">
-              <span>Recipient</span>
-              <select id="global-target" name="target"><option value="">Auto</option></select>
-            </label>
-          </div>
           <div class="composer-row">
-            <textarea id="global-message" rows="1" maxlength="20000" placeholder="Message the right Pi session…" aria-label="Global message"></textarea>
-            <button id="global-send" type="submit" aria-label="Route message">↑</button>
+            <textarea id="global-message" rows="1" maxlength="20000" placeholder="Message the orchestrator…" aria-label="Message orchestrator"></textarea>
+            <button id="global-send" type="submit" aria-label="Send to orchestrator">↑</button>
           </div>
           <p id="global-status" class="composer-status" role="status"></p>
         </form>
       </main>
 
       <main id="session-detail-view" class="view detail-view hidden">
-        <section id="session-meta" class="hidden" aria-hidden="true"></section>
+        <section id="session-meta" class="session-meta hidden" aria-hidden="true"></section>
         <section id="transcript" class="transcript" aria-live="polite" aria-label="Session transcript"></section>
         <button id="jump-latest" class="jump-latest hidden">↓ Latest</button>
         <form id="composer" class="composer">
@@ -153,6 +128,6 @@
   <script src="/vendor/dompurify/purify.min.js"></script>
   <script src="/vendor/katex/katex.min.js"></script>
   <script src="/vendor/katex/auto-render.min.js"></script>
-  <script type="module" src="/app.js?v=15"></script>
+  <script type="module" src="/app.js?v=22"></script>
 </body>
 </html>
