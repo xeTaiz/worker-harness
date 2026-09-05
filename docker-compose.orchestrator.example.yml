@@ -37,7 +37,7 @@ volumes:
     name: ${WH_TAILSCALE_VOLUME:?set WH_TAILSCALE_VOLUME to the existing volume name}
   registry:
     external: true
-    name: ${WH_REGISTRY_VOLUME:?set WH_REGISTRY_VOLUME to the existing volume name}
+    name: ${WH_REGISTRY_VOLUME:?set WH_REGISTRY_VOLUME to the newly created empty registry volume}
 
 networks:
   wh-internal:

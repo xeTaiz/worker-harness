@@ -11,35 +11,35 @@ The orchestrator agent has no compute actions.
 Prepare immutable artifacts from the commits listed in the release report:
 
 - `worker-harness`: control image, web image, shim and bootstrap script.
-- `pi-worker-harness` and `pi-local-vault`: version 0.1.4 package archives.
+- `pi-worker-harness` and `pi-local-vault`: version 0.1.4, installed from pinned GitHub commits.
 - `agent-orchestrator`: prompts, skills, templates and project registry.
 - `dotfiles`: `agent-sandbox/.local/bin/agent-sandbox` and the existing OMP wrapper.
 
 PR #4 (`--json`) is independent; this rollout neither requires nor merges it.
-Do not build from the main dirty checkout: unrelated queue work may remain
-there. Use a clean detached release worktree at the reported harness commit,
-with its pinned submodule initialized. Build exact image tags/digests, not a
-moving `latest`. Publish the owning plugin commits before fetching the pinned
-submodule elsewhere. The new agent-orchestrator repository has no remote yet;
-transfer a `git archive` of its reported commit, or publish it to a remote first.
+The queue and orchestration changes are published together on `main`. Pull each
+owning repository and initialize the harness's pinned plugin submodule. Build
+from a clean checkout and record the resulting image digest for rollout.
+The agent-orchestrator repository still needs its GitHub remote created; until
+then, transfer a `git archive` of its committed `main` to the server and desktop.
 
-This is a coordinated API cutover. Do not update only the backend or only the
-plugin/web image. Existing running OMP sessions must restart to load plugins.
-No production deployment is implied by a successful local test run.
+The backend and plugins are a coordinated API cutover. Restart existing OMP
+sessions to load the new plugins. The web container is optional: leave the old
+one stopped and install the matching version when needed.
+No production deployment is implied by publication or a successful local test.
 
 ## D2. Before changing services
 
-1. Record the current control/web image digests, container environment, Docker
-   network and mounts. Preserve the existing `/var/lib/tailscale` and
-   `/root/.config/worker-harness` mounts; do not substitute empty volumes.
-2. Drain agent turns. Record active panes/worktrees, pending commands and PRs.
-   Stop the old router and delegated-agent runtimes only after saving any work.
-3. Stop the control service and take a consistent SQLite backup, including its
-   journal state (or use SQLite's backup operation). Preserve Tailscale state.
-   The migration removes historical delegated sessions and their events and
-   commands. Those records are available only from the backup after upgrade.
-4. Keep the old images, plugins, sandbox script, unit and forced-key entries for
-   rollback. Do not delete task branches or worktrees as part of deployment.
+1. Drain agent turns and record active worktrees, pending commands and PRs.
+   Stop the old router and delegated-agent runtimes after saving any work.
+2. Stop the control service. This rollout intentionally starts with a fresh
+   SQLite registry: existing session/job history may be discarded. Use a new
+   empty registry volume rather than reusing the old database and its journals.
+   Workers and restarted bridges will register again; queued jobs are not restored.
+3. Preserve the existing `/var/lib/tailscale` mount and Tailnet settings exactly.
+   A fresh database must not create a new Tailnet identity.
+4. Keep old image digests for application rollback. Keeping the old registry
+   volume is optional, not a migration requirement. Never delete project
+   branches/worktrees or the Tailscale state as part of the database reset.
 
 `~/worker-harness` is the installed GPU-worker payload. It is NOT the source
 checkout `~/Work/worker-harness`. Do not commit or overwrite source in the
@@ -112,11 +112,16 @@ For each client, as its intended Unix user:
 2. Install the reviewed sandbox script and existing `~/.local/bin/omp` wrapper.
    The wrapper must invoke the sandbox; a raw mise `omp` earlier on PATH is not
    an acceptable substitute. The backend explicitly invokes the absolute wrapper.
-3. Package each plugin once from its clean pinned source (`npm pack`) and use
-   the SAME checksummed archive on all clients. Install both archives with
-   `omp plugin install /path/to/package.tgz --scope user --force`. Do not deploy
-   mutable source symlinks. Remove/reinstall old linked installations if needed.
-   Confirm `omp plugin list` shows both at 0.1.4, then restart OMP sessions.
+3. Install the published plugins through OMP, using the same commit on every
+   client. Do not deploy mutable source symlinks. Remove/reinstall old linked
+   installations if needed. Confirm `omp plugin list` shows both at 0.1.4,
+   then restart OMP sessions.
+
+   C5
+   ```sh
+   omp plugin install github:xeTaiz/pi-worker-harness#147e501b2cbbb08f3bbf744473b00b5d1421f7f7 --force
+   omp plugin install github:xeTaiz/pi-local-vault#e2c580affe5856fc03567d6f563a34e70ee7c858 --force
+   ```
 4. Install the agent-orchestrator checkout on desktop for its working directory.
    Prompts are copied from the server into private per-session cache directories
    and exposed read-only; other clients do not need a prompt checkout merely to
@@ -156,7 +161,10 @@ Set the following deployment environment (paths are on the server):
 - `WH_ORCHESTRATOR_IMAGE`: immutable control image tag/digest.
 - `WH_WEB_IMAGE`: matching immutable web image tag/digest.
 - `WH_TAILNET_ENV_FILE`: existing private Tailnet environment file.
-- `WH_TAILSCALE_VOLUME`, `WH_REGISTRY_VOLUME`: existing external volume names.
+- `WH_TAILSCALE_VOLUME`: the existing external Tailscale volume name.
+- `WH_REGISTRY_VOLUME`: a newly created empty volume for this rollout; create it
+  with `docker volume create` before starting Compose. Never use the Tailscale
+  volume here.
 - `WH_MACHINES_FILE`: absolute path to the inventory above.
 - `WH_AGENT_ORCHESTRATOR_DIR`: pinned prompt/config release directory.
 - `WH_HERDR_SSH_DIR`: dedicated service-key/verified-known-hosts directory.
@@ -224,12 +232,12 @@ only then tear down the task worktree containing its evidence.
 ## D7. Rollback
 
 Stop new launches and stop the new control/web containers. Preserve any new
-worktrees/branches and current registry for diagnosis. Restore the old SQLite
-backup with the old control image: a binary-only rollback cannot restore deleted
-legacy session rows. Keep the SAME Tailscale state and network identity. Restore
-the paired old web image and plugin artifacts; restart clients. Revoke the new
-forced public key if abandoning the fleet rollout. Never delete project worktrees
-or reset source checkouts as rollback machinery.
+worktrees/branches. Restore the old control image with an empty registry (or the
+old registry volume, if retained), and restart compatible client plugins.
+Keep the SAME Tailscale state and network identity. Leave the web edge stopped
+unless restoring its matching version. Revoke the new forced public key if
+abandoning the fleet rollout. Never reset source checkouts or delete task worktrees
+as rollback machinery. Intentionally discarded database history is not recoverable.
 
 The sandbox hardening can remain during an application rollback. Restoring the
 old sandbox would reopen the tailscaled socket exposure, so do not do so merely
