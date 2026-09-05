@@ -111,7 +111,7 @@ def _job_list_impl(
             jm = JobManager(db)
             updated = []
             for j in jobs_list:
-                if j.status in (JobStatus.RUNNING, JobStatus.PENDING):
+                if j.status in (JobStatus.STARTING, JobStatus.RUNNING, JobStatus.PENDING):
                     w = all_workers.get(j.worker_id)
                     if w:
                         j = await jm.refresh_job_status(w, j)
@@ -140,6 +140,7 @@ def _job_list_impl(
                 for j in jobs_list:
                     worker = all_workers.get(j.worker_id)
                     status_color = {
+                        JobStatus.STARTING: "yellow",
                         JobStatus.RUNNING: "yellow",
                         JobStatus.DONE: "green",
                         JobStatus.FAILED: "red",

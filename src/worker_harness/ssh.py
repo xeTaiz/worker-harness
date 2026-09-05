@@ -362,15 +362,26 @@ async def async_machine_run_bytes(
     )
 
 
-def _build_job_command(worker: Worker, job_id: str, command: str) -> str:
+def _build_job_command(
+    worker: Worker,
+    job_id: str,
+    command: str,
+    gpu_indices: list[int] | None = None,
+) -> str:
     """Compose the remote job-launch command. Pure string assembly — no I/O."""
     harness_dir = f"{_worker_harness_dir(worker)}/{job_id}"
     script_path = f"{harness_dir}/script.sh"
     log_path = f"{harness_dir}/output.log"
+    gpu_export = (
+        f"export CUDA_VISIBLE_DEVICES={','.join(str(index) for index in gpu_indices)}\n"
+        if gpu_indices is not None
+        else ""
+    )
 
     script_content = (
         f"#!/bin/bash\n"
         f"exec >>{log_path} 2>&1\n"
+        f"{gpu_export}"
         f"({command}); ec=$?\n"
         f"echo EXIT:$ec\n"
         f"sleep 60\n"
@@ -388,9 +399,15 @@ def _build_job_command(worker: Worker, job_id: str, command: str) -> str:
     return full_cmd
 
 
-async def ssh_tmux_new(worker: Worker, job_id: str, command: str, pty_enabled: bool = True) -> SSHResult:
+async def ssh_tmux_new(
+    worker: Worker,
+    job_id: str,
+    command: str,
+    pty_enabled: bool = True,
+    gpu_indices: list[int] | None = None,
+) -> SSHResult:
     """Start a tmux job on the worker."""
-    full_cmd = _build_job_command(worker, job_id, command)
+    full_cmd = _build_job_command(worker, job_id, command, gpu_indices)
     args = _ssh_base_args(worker) + [full_cmd]
     # Note: pty_enabled is informational here (jobs always run via tmux).
     return await _exec_ssh(worker.id, args, lane_timeout=10.0, cmd_timeout=30.0, op_name="ssh_tmux_new")
@@ -404,6 +421,26 @@ async def ssh_tmux_kill(worker: Worker, job_id: str) -> SSHResult:
         f"{tmux} has-session -t '{session}' 2>/dev/null && echo still_running || echo stopped"
     )
     return await async_ssh_run(worker, cmd, timeout=10)
+
+async def ssh_job_started(worker: Worker, job_id: str) -> bool | None:
+    """Probe durable launch evidence, including jobs whose tmux session already exited."""
+    session = f"wh_{job_id}"
+    tmux = _tmux_env(worker)
+    log_path = shlex.quote(f"{_worker_harness_dir(worker)}/{job_id}/output.log")
+    result = await async_ssh_run(
+        worker,
+        f"if {tmux} has-session -t '={session}' 2>/dev/null; then echo exists; "
+        f"elif test -e {log_path}; then echo exists; else echo absent; fi",
+        timeout=5,
+    )
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    if output == "exists":
+        return True
+    if output == "absent":
+        return False
+    return None
 
 
 async def ssh_tmux_running(worker: Worker, job_id: str) -> bool | None:

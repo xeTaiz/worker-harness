@@ -15,6 +15,23 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for the paired server/client rollout, pinned
 plugin artifacts, credential placement, acceptance gates, and database rollback.
 The old router and delegated-container Pi launch paths are removed.
 
+## GPU job queue
+
+PM/task agents and operators can enqueue named jobs through `POST /api/v1/jobs/queue`,
+inspect them with `GET /api/v1/jobs/queue`, and update pending jobs through
+`PATCH /api/v1/jobs/{job_id}/queue`. The plugin exposes `enqueue`,
+`update_queued_job`, and `list_queue`.
+
+Queues are durable and FIFO per worker: a multi-GPU head job waits until its
+requested capacity is available rather than allowing smaller jobs to bypass it.
+Claimed jobs receive explicit `CUDA_VISIBLE_DEVICES` assignments. Ambiguous SSH
+launch results keep those GPUs reserved while recovery checks durable worker
+artifacts; they are not immediately retried or treated as free capacity.
+
+Run one control process against the registry. Immediate jobs are outside queue
+reservations, and external GPU use is detected through worker telemetry. Do not
+delete worker job artifacts while recovering an interrupted launch.
+
 ## Networking model
 
 - Workers run with `tag:wh-worker`.
