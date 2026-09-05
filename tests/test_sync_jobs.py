@@ -263,6 +263,22 @@ class SyncJobsApiTests(unittest.TestCase):
         # No stdout field in async mode
         self.assertNotIn("stdout", body)
 
+    def test_async_job_persists_display_name_and_id_keyed_session(self):
+        async def mock_tmux_new(worker, job_id, command, pty_enabled=True):
+            return SSHResult(stdout="started", stderr="", returncode=0)
+
+        with patch("worker_harness.job.ssh_tmux_new", new=mock_tmux_new):
+            resp = self.client.post(
+                "/api/v1/jobs",
+                json={"worker_id": "w-test", "command": "echo hi", "name": "mutable label"},
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        persisted = asyncio.run(self.db.get_job(body["id"]))
+        self.assertEqual(persisted.name, "mutable label")
+        self.assertEqual(persisted.tmux_session, f"wh_{persisted.id}")
+
     def test_sync_job_unknown_worker_returns_404(self):
         resp = self.client.post(
             "/api/v1/jobs",

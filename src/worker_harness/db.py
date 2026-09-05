@@ -45,6 +45,7 @@ class Database:
         # their conditional UPSERTs on this process's single SQLite writer.
         self._worker_job_report_lock = asyncio.Lock()
         self._pi_bridge_lock = asyncio.Lock()
+        self._queue_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self._db = await aiosqlite.connect(str(self.path))
@@ -143,14 +144,20 @@ class Database:
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
                 worker_id TEXT REFERENCES workers(id),
+                name TEXT NOT NULL DEFAULT '',
                 tmux_session TEXT,
                 command TEXT NOT NULL,
                 status TEXT DEFAULT 'pending',
+                queue_managed INTEGER NOT NULL DEFAULT 0,
                 exit_code INTEGER,
                 pty_enabled INTEGER DEFAULT 1,
                 kind TEXT NOT NULL DEFAULT 'ssh',
                 origin_session_id TEXT,
                 report_revision INTEGER NOT NULL DEFAULT 0,
+                expected_seconds INTEGER NOT NULL DEFAULT 0,
+                gpu_count INTEGER NOT NULL DEFAULT 0,
+                gpu_indices TEXT NOT NULL DEFAULT '[]',
+                queue_order INTEGER NOT NULL DEFAULT 0,
                 started_at INTEGER DEFAULT 0,
                 finished_at INTEGER DEFAULT 0
             )
@@ -163,8 +170,34 @@ class Database:
             await self._db.execute("ALTER TABLE jobs ADD COLUMN origin_session_id TEXT")
         if "report_revision" not in job_cols:
             await self._db.execute("ALTER TABLE jobs ADD COLUMN report_revision INTEGER NOT NULL DEFAULT 0")
+        if "name" not in job_cols:
+            await self._db.execute("ALTER TABLE jobs ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+        if "queue_managed" not in job_cols:
+            await self._db.execute(
+                "ALTER TABLE jobs ADD COLUMN queue_managed INTEGER NOT NULL DEFAULT 0"
+            )
+        if "expected_seconds" not in job_cols:
+            await self._db.execute(
+                "ALTER TABLE jobs ADD COLUMN expected_seconds INTEGER NOT NULL DEFAULT 0"
+            )
+        if "gpu_count" not in job_cols:
+            await self._db.execute(
+                "ALTER TABLE jobs ADD COLUMN gpu_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "gpu_indices" not in job_cols:
+            await self._db.execute(
+                "ALTER TABLE jobs ADD COLUMN gpu_indices TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "queue_order" not in job_cols:
+            await self._db.execute(
+                "ALTER TABLE jobs ADD COLUMN queue_order INTEGER NOT NULL DEFAULT 0"
+            )
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_jobs_origin_session_id ON jobs(origin_session_id)"
+        )
+        await self._db.execute(
+            """CREATE INDEX IF NOT EXISTS idx_jobs_queue_active
+               ON jobs(queue_managed, worker_id, status, queue_order)"""
         )
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS port_forwards (
@@ -985,29 +1018,37 @@ class Database:
 
     async def insert_job(self, job: Job) -> None:
         await self._db.execute(
-            """INSERT INTO jobs (id, worker_id, tmux_session, command, status,
-                                 exit_code, pty_enabled, kind, origin_session_id,
-                                 report_revision, started_at, finished_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO jobs
+               (id, worker_id, name, tmux_session, command, status, queue_managed,
+                exit_code, pty_enabled, kind, origin_session_id, report_revision,
+                expected_seconds, gpu_count, gpu_indices, queue_order, started_at, finished_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                job.id, job.worker_id, job.tmux_session, job.command,
-                job.status.value, job.exit_code, int(job.pty_enabled), job.kind.value,
-                job.origin_session_id, job.report_revision, job.started_at, job.finished_at,
+                job.id, job.worker_id, job.name, job.tmux_session, job.command,
+                job.status.value, int(job.queue_managed), job.exit_code,
+                int(job.pty_enabled), job.kind.value, job.origin_session_id,
+                job.report_revision, job.expected_seconds, job.gpu_count,
+                json.dumps(job.gpu_indices), job.queue_order, job.started_at,
+                job.finished_at,
             ),
         )
         await self._db.commit()
 
     async def update_job(self, job: Job) -> None:
         await self._db.execute(
-            """UPDATE jobs SET worker_id=?, tmux_session=?, command=?, status=?,
-                                 exit_code=?, pty_enabled=?, kind=?, origin_session_id=?,
-                                 report_revision=?, started_at=?, finished_at=?
+            """UPDATE jobs
+               SET worker_id=?, name=?, tmux_session=?, command=?, status=?,
+                   queue_managed=?, exit_code=?, pty_enabled=?, kind=?,
+                   origin_session_id=?, report_revision=?, expected_seconds=?,
+                   gpu_count=?, gpu_indices=?, queue_order=?, started_at=?, finished_at=?
                WHERE id=?""",
             (
-                job.worker_id, job.tmux_session, job.command,
-                job.status.value, job.exit_code, int(job.pty_enabled), job.kind.value,
-                job.origin_session_id, job.report_revision, job.started_at, job.finished_at,
-                job.id,
+                job.worker_id, job.name, job.tmux_session, job.command,
+                job.status.value, int(job.queue_managed), job.exit_code,
+                int(job.pty_enabled), job.kind.value, job.origin_session_id,
+                job.report_revision, job.expected_seconds, job.gpu_count,
+                json.dumps(job.gpu_indices), job.queue_order, job.started_at,
+                job.finished_at, job.id,
             ),
         )
         await self._db.commit()
@@ -1039,11 +1080,276 @@ class Database:
         query += " ORDER BY started_at DESC"
         rows = await self._db.execute_fetchall(query, params)
         return [self._row_to_job(r) for r in rows]
+    async def insert_queued_job(self, job: Job) -> Job:
+        async with self._queue_lock:
+            cursor = await self._db.execute(
+                """SELECT COALESCE(MAX(queue_order), 0)
+                   FROM jobs
+                   WHERE queue_managed = 1 AND worker_id = ? AND status = ?""",
+                (job.worker_id, JobStatus.PENDING.value),
+            )
+            job.queue_managed = True
+            job.status = JobStatus.PENDING
+            job.gpu_indices = []
+            job.queue_order = (await cursor.fetchone())[0] + 1
+            job.started_at = 0
+            job.finished_at = 0
+            await self._db.execute(
+                """INSERT INTO jobs
+                   (id, worker_id, name, tmux_session, command, status, queue_managed,
+                    exit_code, pty_enabled, kind, origin_session_id, report_revision,
+                    expected_seconds, gpu_count, gpu_indices, queue_order, started_at, finished_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    job.id, job.worker_id, job.name, job.tmux_session, job.command,
+                    job.status.value, 1, job.exit_code, int(job.pty_enabled),
+                    job.kind.value, job.origin_session_id, job.report_revision,
+                    job.expected_seconds, job.gpu_count, "[]", job.queue_order, 0, 0,
+                ),
+            )
+            await self._db.commit()
+            return job
+
+    async def list_queued_jobs(self, worker_id: str | None = None) -> list[Job]:
+        query = """
+            SELECT * FROM jobs
+            WHERE queue_managed = 1
+              AND status IN (?, ?, ?)
+        """
+        params: list[object] = [
+            JobStatus.STARTING.value,
+            JobStatus.RUNNING.value,
+            JobStatus.PENDING.value,
+        ]
+        if worker_id is not None:
+            query += " AND worker_id = ?"
+            params.append(worker_id)
+        query += """
+            ORDER BY worker_id,
+                     CASE status
+                       WHEN 'starting' THEN 0
+                       WHEN 'running' THEN 1
+                       ELSE 2
+                     END,
+                     CASE WHEN status = 'pending' THEN queue_order ELSE started_at END,
+                     id
+        """
+        rows = await self._db.execute_fetchall(query, params)
+        return [self._row_to_job(row) for row in rows]
+
+    async def claim_queued_job(
+        self,
+        job_id: str,
+        gpu_indices: list[int],
+        started_at: int,
+    ) -> Job | None:
+        async with self._queue_lock:
+            cursor = await self._db.execute(
+                """UPDATE jobs
+                   SET status = ?, gpu_indices = ?, started_at = ?, queue_order = 0
+                   WHERE id = ? AND queue_managed = 1 AND status = ?""",
+                (
+                    JobStatus.STARTING.value,
+                    json.dumps(gpu_indices),
+                    started_at,
+                    job_id,
+                    JobStatus.PENDING.value,
+                ),
+            )
+            if not cursor.rowcount:
+                await self._db.rollback()
+                return None
+            await self._db.commit()
+            return await self.get_job(job_id)
+
+    async def update_pending_job(
+        self,
+        job_id: str,
+        *,
+        worker_id: str | None,
+        position: int | None,
+        name: str | None,
+        expected_seconds: int | None,
+        gpu_count: int | None,
+    ) -> Job:
+        async with self._queue_lock:
+            row = await (
+                await self._db.execute(
+                    "SELECT * FROM jobs WHERE id = ? AND queue_managed = 1",
+                    (job_id,),
+                )
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            if row["status"] != JobStatus.PENDING.value:
+                raise ValueError("queued job is not pending")
+
+            source_worker_id = row["worker_id"]
+            destination_worker_id = worker_id if worker_id is not None else source_worker_id
+            source_rows = await self._db.execute_fetchall(
+                """SELECT id FROM jobs
+                   WHERE queue_managed = 1 AND worker_id = ? AND status = ? AND id != ?
+                   ORDER BY queue_order, id""",
+                (source_worker_id, JobStatus.PENDING.value, job_id),
+            )
+            source_ids = [item["id"] for item in source_rows]
+
+            if destination_worker_id == source_worker_id:
+                destination_ids = source_ids
+                if position is None:
+                    original_rows = await self._db.execute_fetchall(
+                        """SELECT id FROM jobs
+                           WHERE queue_managed = 1 AND worker_id = ? AND status = ?
+                           ORDER BY queue_order, id""",
+                        (source_worker_id, JobStatus.PENDING.value),
+                    )
+                    insertion_index = next(
+                        index for index, item in enumerate(original_rows) if item["id"] == job_id
+                    )
+                else:
+                    insertion_index = min(position - 1, len(destination_ids))
+                destination_ids.insert(insertion_index, job_id)
+            else:
+                destination_rows = await self._db.execute_fetchall(
+                    """SELECT id FROM jobs
+                       WHERE queue_managed = 1 AND worker_id = ? AND status = ?
+                       ORDER BY queue_order, id""",
+                    (destination_worker_id, JobStatus.PENDING.value),
+                )
+                destination_ids = [item["id"] for item in destination_rows]
+                insertion_index = (
+                    len(destination_ids)
+                    if position is None
+                    else min(position - 1, len(destination_ids))
+                )
+                destination_ids.insert(insertion_index, job_id)
+
+            cursor = await self._db.execute(
+                """UPDATE jobs
+                   SET worker_id = ?, name = ?, expected_seconds = ?, gpu_count = ?
+                   WHERE id = ? AND queue_managed = 1 AND status = ?""",
+                (
+                    destination_worker_id,
+                    name if name is not None else row["name"],
+                    expected_seconds if expected_seconds is not None else row["expected_seconds"],
+                    gpu_count if gpu_count is not None else row["gpu_count"],
+                    job_id,
+                    JobStatus.PENDING.value,
+                ),
+            )
+            if not cursor.rowcount:
+                await self._db.rollback()
+                raise ValueError("queued job is not pending")
+
+            if destination_worker_id != source_worker_id:
+                await self._db.executemany(
+                    "UPDATE jobs SET queue_order = ? WHERE id = ?",
+                    [(index, queued_id) for index, queued_id in enumerate(source_ids, 1)],
+                )
+            await self._db.executemany(
+                "UPDATE jobs SET queue_order = ? WHERE id = ?",
+                [(index, queued_id) for index, queued_id in enumerate(destination_ids, 1)],
+            )
+            await self._db.commit()
+            updated = await self.get_job(job_id)
+            if updated is None:
+                raise RuntimeError("queued job disappeared after update")
+            return updated
+
+    async def fail_pending_job(self, job_id: str, finished_at: int) -> Job | None:
+        async with self._queue_lock:
+            row = await (
+                await self._db.execute(
+                    """SELECT worker_id FROM jobs
+                       WHERE id = ? AND queue_managed = 1 AND status = ?""",
+                    (job_id, JobStatus.PENDING.value),
+                )
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = await self._db.execute(
+                """UPDATE jobs
+                   SET status = ?, exit_code = -1, finished_at = ?, queue_order = 0
+                   WHERE id = ? AND queue_managed = 1 AND status = ?""",
+                (
+                    JobStatus.FAILED.value,
+                    finished_at,
+                    job_id,
+                    JobStatus.PENDING.value,
+                ),
+            )
+            if not cursor.rowcount:
+                await self._db.rollback()
+                return None
+            pending = await self._db.execute_fetchall(
+                """SELECT id FROM jobs
+                   WHERE queue_managed = 1 AND worker_id = ? AND status = ?
+                   ORDER BY queue_order, id""",
+                (row["worker_id"], JobStatus.PENDING.value),
+            )
+            await self._db.executemany(
+                "UPDATE jobs SET queue_order = ? WHERE id = ?",
+                [(index, item["id"]) for index, item in enumerate(pending, 1)],
+            )
+            await self._db.commit()
+            return await self.get_job(job_id)
+
+    async def running_queue_gpu_indices(self, worker_id: str) -> set[int]:
+        rows = await self._db.execute_fetchall(
+            """SELECT gpu_indices FROM jobs
+               WHERE queue_managed = 1 AND worker_id = ? AND status IN (?, ?)""",
+            (worker_id, JobStatus.STARTING.value, JobStatus.RUNNING.value),
+        )
+        return {
+            index
+            for row in rows
+            for index in json.loads(row["gpu_indices"])
+        }
+
+    async def reconcile_starting_job(
+        self,
+        job_id: str,
+        *,
+        session_exists: bool,
+    ) -> Job | None:
+        async with self._queue_lock:
+            row = await (
+                await self._db.execute(
+                    """SELECT worker_id FROM jobs
+                       WHERE id = ? AND queue_managed = 1 AND status = ?""",
+                    (job_id, JobStatus.STARTING.value),
+                )
+            ).fetchone()
+            if row is None:
+                return None
+            if session_exists:
+                cursor = await self._db.execute(
+                    """UPDATE jobs SET status = ?
+                       WHERE id = ? AND queue_managed = 1 AND status = ?""",
+                    (JobStatus.RUNNING.value, job_id, JobStatus.STARTING.value),
+                )
+            else:
+                await self._db.execute(
+                    """UPDATE jobs SET queue_order = queue_order + 1
+                       WHERE queue_managed = 1 AND worker_id = ? AND status = ?""",
+                    (row["worker_id"], JobStatus.PENDING.value),
+                )
+                cursor = await self._db.execute(
+                    """UPDATE jobs
+                       SET status = ?, gpu_indices = '[]', started_at = 0, queue_order = 1
+                       WHERE id = ? AND queue_managed = 1 AND status = ?""",
+                    (JobStatus.PENDING.value, job_id, JobStatus.STARTING.value),
+                )
+            if not cursor.rowcount:
+                await self._db.rollback()
+                return None
+            await self._db.commit()
+            return await self.get_job(job_id)
 
     async def get_running_job_count_for_worker(self, worker_id: str) -> int:
         cursor = await self._db.execute(
-            "SELECT COUNT(*) FROM jobs WHERE worker_id = ? AND status = ?",
-            (worker_id, JobStatus.RUNNING.value),
+            "SELECT COUNT(*) FROM jobs WHERE worker_id = ? AND status IN (?, ?)",
+            (worker_id, JobStatus.STARTING.value, JobStatus.RUNNING.value),
         )
         row = await cursor.__aenter__()
         count = (await row.fetchone())[0]
@@ -1064,16 +1370,23 @@ class Database:
                 raise ValueError("origin session not found for worker")
             cursor = await self._db.execute(
                 """INSERT INTO jobs
-                   (id, worker_id, tmux_session, command, status, exit_code, pty_enabled,
-                    kind, origin_session_id, report_revision, started_at, finished_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   (id, worker_id, name, tmux_session, command, status, queue_managed,
+                    exit_code, pty_enabled, kind, origin_session_id, report_revision,
+                    expected_seconds, gpu_count, gpu_indices, queue_order, started_at, finished_at)
+                   VALUES (?, ?, '', ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, 0, '[]', 0, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
+                     name=excluded.name,
                      tmux_session=excluded.tmux_session,
                      command=excluded.command,
                      status=excluded.status,
+                     queue_managed=excluded.queue_managed,
                      exit_code=excluded.exit_code,
                      pty_enabled=excluded.pty_enabled,
                      report_revision=excluded.report_revision,
+                     expected_seconds=excluded.expected_seconds,
+                     gpu_count=excluded.gpu_count,
+                     gpu_indices=excluded.gpu_indices,
+                     queue_order=excluded.queue_order,
                      started_at=excluded.started_at,
                      finished_at=excluded.finished_at
                    WHERE jobs.worker_id=excluded.worker_id
@@ -1082,8 +1395,9 @@ class Database:
                      AND jobs.report_revision < excluded.report_revision""",
                 (
                     report.id, worker_id, report.tmux_session, report.command,
-                    report.status.value, report.exit_code, int(report.pty_enabled), JobKind.DELEGATED.value,
-                    report.origin_session_id, report.report_revision, report.started_at, report.finished_at,
+                    report.status.value, report.exit_code, int(report.pty_enabled),
+                    JobKind.DELEGATED.value, report.origin_session_id,
+                    report.report_revision, report.started_at, report.finished_at,
                 ),
             )
             changed = bool(cursor.rowcount)
@@ -1103,14 +1417,20 @@ class Database:
         return Job(
             id=row["id"],
             worker_id=row["worker_id"],
+            name=row["name"] if "name" in row.keys() else "",
             tmux_session=row["tmux_session"],
             command=row["command"],
             status=JobStatus(row["status"]),
+            queue_managed=bool(row["queue_managed"]) if "queue_managed" in row.keys() else False,
             exit_code=row["exit_code"],
             pty_enabled=bool(row["pty_enabled"]),
             kind=JobKind(row["kind"]) if "kind" in row.keys() else JobKind.SSH,
             origin_session_id=row["origin_session_id"] if "origin_session_id" in row.keys() else None,
             report_revision=row["report_revision"] if "report_revision" in row.keys() else 0,
+            expected_seconds=row["expected_seconds"] if "expected_seconds" in row.keys() else 0,
+            gpu_count=row["gpu_count"] if "gpu_count" in row.keys() else 0,
+            gpu_indices=json.loads(row["gpu_indices"]) if "gpu_indices" in row.keys() else [],
+            queue_order=row["queue_order"] if "queue_order" in row.keys() else 0,
             started_at=row["started_at"],
             finished_at=row["finished_at"],
         )

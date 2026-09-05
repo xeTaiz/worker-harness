@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from worker_harness.db import Database
 from worker_harness.heartbeat import create_app
 from worker_harness.models import GPUInfo, Job, JobStatus, WorkerRegistration
+from worker_harness.ssh import SSHResult
 
 
 class JobsDeleteApiTests(unittest.TestCase):
@@ -103,6 +104,64 @@ class JobsDeleteApiTests(unittest.TestCase):
         self.assertTrue(body["stopped"])
         self.assertFalse(body["already_terminal"])
         self.assertEqual(body["status"], "failed")
+
+    def test_delete_pending_queue_job_skips_ssh(self):
+        job = Job(
+            id="queued-pending",
+            worker_id="w-test",
+            name="pending",
+            command="sleep 10",
+            queue_managed=True,
+            expected_seconds=10,
+            gpu_count=1,
+        )
+        asyncio.run(self.db.insert_queued_job(job))
+        kill = AsyncMock(side_effect=AssertionError("pending cancellation must not use SSH"))
+
+        with patch("worker_harness.job.ssh_tmux_kill", new=kill):
+            resp = self.client.delete(f"/api/v1/jobs/{job.id}")
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        kill.assert_not_awaited()
+        self.assertEqual(asyncio.run(self.db.get_job(job.id)).status, JobStatus.FAILED)
+
+    def test_delete_running_queue_job_releases_gpu_and_advances(self):
+        running = Job(
+            id="queued-running",
+            worker_id="w-test",
+            name="running",
+            command="sleep 10",
+            queue_managed=True,
+            expected_seconds=10,
+            gpu_count=1,
+        )
+        pending = Job(
+            id="queued-next",
+            worker_id="w-test",
+            name="next",
+            command="echo next",
+            queue_managed=True,
+            expected_seconds=10,
+            gpu_count=1,
+        )
+        asyncio.run(self.db.insert_queued_job(running))
+        running = asyncio.run(self.db.claim_queued_job(running.id, [0], int(time.time())))
+        running.status = JobStatus.RUNNING
+        asyncio.run(self.db.update_job(running))
+        asyncio.run(self.db.insert_queued_job(pending))
+
+        with patch(
+            "worker_harness.job.ssh_tmux_kill",
+            new=AsyncMock(return_value=SSHResult(stdout="stopped\n", stderr="", returncode=0)),
+        ), patch(
+            "worker_harness.job.ssh_tmux_new",
+            new=AsyncMock(return_value=SSHResult(stdout="started", stderr="", returncode=0)),
+        ):
+            resp = self.client.delete(f"/api/v1/jobs/{running.id}")
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(asyncio.run(self.db.get_job(running.id)).status, JobStatus.FAILED)
+        self.assertEqual(asyncio.run(self.db.get_job(pending.id)).status, JobStatus.RUNNING)
 
 
 if __name__ == "__main__":

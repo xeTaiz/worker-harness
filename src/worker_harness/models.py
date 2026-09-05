@@ -20,6 +20,7 @@ class WorkerStatus(str, Enum):
 
 class JobStatus(str, Enum):
     PENDING = "pending"
+    STARTING = "starting"
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
@@ -321,9 +322,11 @@ class PiDelegation(BaseModel):
 class Job(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     worker_id: str | None = None
+    name: str = ""
     tmux_session: str = ""
     command: str = ""
     status: JobStatus = JobStatus.PENDING
+    queue_managed: bool = False
     exit_code: int | None = None
     pty_enabled: bool = True
     # SSH-created jobs keep the legacy default.  A delegated Pi child reports
@@ -331,6 +334,10 @@ class Job(BaseModel):
     kind: JobKind = JobKind.SSH
     origin_session_id: str | None = None
     report_revision: int = 0
+    expected_seconds: int = 0
+    gpu_count: int = 0
+    gpu_indices: list[int] = Field(default_factory=list)
+    queue_order: int = 0
     started_at: int = 0
     finished_at: int = 0
 

@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator, Awaitable, Callable, Literal, TypeVar
+from typing import AsyncIterator, Awaitable, Callable, Literal, Self, TypeVar
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -19,7 +19,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
@@ -93,6 +93,51 @@ class JobCreateRequest(BaseModel):
     no_pty: bool = False
     sync: bool = False       # block until command finishes, return stdout
     sync_timeout: int = 120  # seconds to wait in sync mode
+
+class JobEnqueueRequest(BaseModel):
+    worker_id: str
+    command: str
+    name: str = Field(min_length=1)
+    expected_seconds: int = Field(ge=1)
+    gpu_count: int = Field(default=1, ge=1)
+    no_pty: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("name must not be blank")
+        return value
+
+
+class QueuedJobUpdateRequest(BaseModel):
+    worker_id: str | None = None
+    position: int | None = Field(default=None, ge=1)
+    name: str | None = None
+    expected_seconds: int | None = Field(default=None, ge=1)
+    gpu_count: int | None = Field(default=None, ge=1)
+
+    @field_validator("name")
+    @classmethod
+    def validate_optional_name(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("name must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def validate_update(self) -> Self:
+        if all(
+            value is None
+            for value in (
+                self.worker_id,
+                self.position,
+                self.name,
+                self.expected_seconds,
+                self.gpu_count,
+            )
+        ):
+            raise ValueError("at least one queue field must be supplied")
+        return self
 
 
 class TunnelCreateRequest(BaseModel):
@@ -237,7 +282,10 @@ async def reconcile_active_ssh_jobs(
         job
         for job in await db.list_jobs()
         if job.kind == JobKind.SSH
-        and job.status in (JobStatus.RUNNING, JobStatus.PENDING)
+        and (
+            job.status == JobStatus.RUNNING
+            or (job.status == JobStatus.PENDING and not job.queue_managed)
+        )
     ]
     if not jobs:
         return
@@ -259,6 +307,33 @@ async def reconcile_active_ssh_jobs(
 
     worker_count = min(max(1, max_concurrent), len(jobs))
     await asyncio.gather(*(reconcile_worker() for _ in range(worker_count)))
+
+async def reconcile_queued_jobs(db: Database, job_manager: JobManager) -> None:
+    """Recover claimed queue jobs, then advance every online worker queue."""
+    workers = {
+        worker.id: worker
+        for worker in await db.list_workers()
+        if worker.status == WorkerStatus.ONLINE
+    }
+    starting_jobs = [
+        job
+        for job in await db.list_queued_jobs()
+        if job.status == JobStatus.STARTING and job.worker_id in workers
+    ]
+    for job in starting_jobs:
+        try:
+            await job_manager.reconcile_starting_job(workers[job.worker_id], job)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Failed to reconcile queued job %s", job.id)
+    for worker in workers.values():
+        try:
+            await job_manager.dispatch_worker(worker)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Failed to dispatch queue for worker %s", worker.id)
 
 
 @asynccontextmanager
@@ -1551,6 +1626,121 @@ def create_app(db: Database, router_client=None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Worker not found: {worker_id}")
         return worker.model_dump(mode="json")
 
+    @app.post("/api/v1/jobs/queue")
+    async def jobs_queue_create(payload: JobEnqueueRequest):
+        worker = await resolve_worker(payload.worker_id)
+        if not worker:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Worker not found: {payload.worker_id}",
+            )
+        if payload.gpu_count > worker.gpu_count:
+            raise HTTPException(
+                status_code=422,
+                detail=f"gpu_count exceeds worker capacity ({worker.gpu_count})",
+            )
+        job = await jm.enqueue_job(
+            worker,
+            payload.command,
+            payload.name,
+            payload.expected_seconds,
+            gpu_count=payload.gpu_count,
+            pty_enabled=not payload.no_pty,
+        )
+        return job.model_dump(mode="json")
+
+    @app.get("/api/v1/jobs/queue")
+    async def jobs_queue_list(worker_id: str | None = None):
+        jobs = await db.list_queued_jobs(worker_id)
+        workers = {worker.id: worker for worker in await db.list_workers()}
+        pending_positions: dict[str, int] = {}
+        result = []
+        for job in jobs:
+            item = job.model_dump(mode="json")
+            worker_key = job.worker_id or ""
+            worker = workers.get(worker_key)
+            item["worker_name"] = worker.name if worker else None
+            if job.status == JobStatus.PENDING:
+                pending_positions[worker_key] = pending_positions.get(worker_key, 0) + 1
+                item["position"] = pending_positions[worker_key]
+            else:
+                item["position"] = 0
+            result.append(item)
+        return result
+
+    @app.patch("/api/v1/jobs/{job_id}/queue")
+    async def jobs_queue_update(job_id: str, payload: QueuedJobUpdateRequest):
+        job = await db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+        if not job.queue_managed or job.status != JobStatus.PENDING:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="only pending queued jobs can be updated",
+            )
+
+        source_worker = await db.get_worker(job.worker_id or "")
+        destination_worker = source_worker
+        destination_worker_id = None
+        if payload.worker_id is not None:
+            destination_worker = await resolve_worker(payload.worker_id)
+            if not destination_worker:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Worker not found: {payload.worker_id}",
+                )
+            destination_worker_id = destination_worker.id
+        if destination_worker is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Worker not found: {job.worker_id}",
+            )
+
+        requested_gpu_count = payload.gpu_count or job.gpu_count
+        if requested_gpu_count > destination_worker.gpu_count:
+            raise HTTPException(
+                status_code=422,
+                detail=f"gpu_count exceeds worker capacity ({destination_worker.gpu_count})",
+            )
+        try:
+            await db.update_pending_job(
+                job_id,
+                worker_id=destination_worker_id,
+                position=payload.position,
+                name=payload.name,
+                expected_seconds=payload.expected_seconds,
+                gpu_count=payload.gpu_count,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+        dispatch_workers = {
+            worker.id: worker
+            for worker in (source_worker, destination_worker)
+            if worker is not None
+        }
+        for worker in dispatch_workers.values():
+            await jm.dispatch_worker(worker)
+
+        updated = await db.get_job(job_id)
+        if updated is None:
+            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+        item = updated.model_dump(mode="json")
+        item["worker_name"] = destination_worker.name
+        item["position"] = 0
+        if updated.status == JobStatus.PENDING:
+            pending = [
+                queued
+                for queued in await db.list_queued_jobs(updated.worker_id)
+                if queued.status == JobStatus.PENDING
+            ]
+            item["position"] = next(
+                index for index, queued in enumerate(pending, 1) if queued.id == updated.id
+            )
+        return item
+
     @app.post("/api/v1/jobs")
     async def jobs_create(payload: JobCreateRequest):
         worker = await resolve_worker(payload.worker_id)
@@ -1576,7 +1766,7 @@ def create_app(db: Database, router_client=None) -> FastAPI:
         deadline = _time.monotonic() + payload.sync_timeout
         while _time.monotonic() < deadline:
             job = await jm.refresh_job_status(worker, job)
-            if job.status not in (JobStatus.RUNNING, JobStatus.PENDING):
+            if job.status not in (JobStatus.STARTING, JobStatus.RUNNING, JobStatus.PENDING):
                 break
             await asyncio.sleep(0.5)
 
@@ -1628,6 +1818,7 @@ def create_app(db: Database, router_client=None) -> FastAPI:
             await asyncio.sleep(interval)
             try:
                 await reconcile_active_ssh_jobs(db, jm)
+                await reconcile_queued_jobs(db, jm)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1726,7 +1917,11 @@ def create_app(db: Database, router_client=None) -> FastAPI:
     async def stop_marimo_session(session: MarimoSession) -> None:
         job = await db.get_job(session.job_id)
         worker = await db.get_worker(session.worker_id)
-        if job and worker and job.status in (JobStatus.RUNNING, JobStatus.PENDING):
+        if job and worker and job.status in (
+            JobStatus.STARTING,
+            JobStatus.RUNNING,
+            JobStatus.PENDING,
+        ):
             if not await jm.stop_job(worker, job.id):
                 raise RuntimeError(f"failed to stop marimo job {job.id}")
 
@@ -1842,7 +2037,11 @@ def create_app(db: Database, router_client=None) -> FastAPI:
         for session in sessions:
             job = await db.get_job(session.job_id)
             worker = workers.get(session.worker_id)
-            if job and worker and job.status in (JobStatus.RUNNING, JobStatus.PENDING):
+            if job and worker and job.status in (
+                JobStatus.STARTING,
+                JobStatus.RUNNING,
+                JobStatus.PENDING,
+            ):
                 job = await jm.refresh_job_status(worker, job)
             entry = app.state.tunnels.get(session.tunnel_id)
             tunnel_live = bool(entry and entry.proc.poll() is None)
@@ -1859,7 +2058,11 @@ def create_app(db: Database, router_client=None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Marimo session not found: {session_id}")
         worker = await db.get_worker(session.worker_id)
         job = await db.get_job(session.job_id)
-        if job and worker and job.status in (JobStatus.RUNNING, JobStatus.PENDING):
+        if job and worker and job.status in (
+            JobStatus.STARTING,
+            JobStatus.RUNNING,
+            JobStatus.PENDING,
+        ):
             job = await jm.refresh_job_status(worker, job)
         entry = app.state.tunnels.get(session.tunnel_id)
         tunnel_live = bool(entry and entry.proc.poll() is None)
