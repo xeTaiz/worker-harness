@@ -33,7 +33,13 @@ def _db_lifespan(db):
     return _ls()
 
 
-def _workers_list_impl():
+def _workers_list_impl(
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Print workers as JSON.",
+    ),
+):
     async def run():
         db = _get_db()
         async with _db_lifespan(db):
@@ -43,7 +49,7 @@ def _workers_list_impl():
 
             output_mode = _state.get("output", "text")
 
-            if output_mode == "json":
+            if json_output or output_mode == "json":
                 import json
                 data = [w.model_dump(mode="json") for w in workers_list]
                 console.print(json.dumps(data, indent=2))
