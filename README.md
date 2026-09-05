@@ -4,6 +4,17 @@ Worker Harness manages containerized worker nodes that register to an orchestrat
 
 This repository targets **Tailscale + Headscale**.
 
+## Agent fleet
+
+The control service coordinates one orchestrator, one PM per configured project,
+and disposable task worktrees on Herdr client machines. GPU workers remain the
+compute plane. Role-scoped bearer tokens protect agent APIs; operator clients
+and the Tailnet-only web edge use a separate operator secret.
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the paired server/client rollout, pinned
+plugin artifacts, credential placement, acceptance gates, and database rollback.
+The old router and delegated-container Pi launch paths are removed.
+
 ## Networking model
 
 - Workers run with `tag:wh-worker`.
@@ -14,7 +25,7 @@ Required ACL directions:
 
 1. `tag:wh-worker` -> `tag:wh-orchestrator:12888` (heartbeat/register API only)
 2. `tag:wh-orchestrator` -> `tag:wh-worker:*` (worker control traffic)
-3. Operator/client Tailnet members -> `tag:wh-orchestrator:12889` (privileged control API, including Pi delegation)
+3. Operator/client Tailnet members -> `tag:wh-orchestrator:12889` (privileged control API, including agent fleet control)
 
 `tag:wh-worker` must not be granted access to port `12889`; worker registration
 and the operator control plane are deliberately separate services. In
@@ -24,137 +35,18 @@ HTTP, SSE, and WebSocket routes to `wh-orch:12889` over a private Docker network
 It uses the existing Tailnet trust boundary—there is no separate browser
 credential. The orchestrator can still serve an explicitly configured
 `WH_WEB_DIR` for local development, but its production image does not bundle the
-web assets. Working/idle delegated sessions expose a **Terminal preview** tab
-through the worker relay on port
-`27888`. Ordinary interactive Pi sessions launched inside tmux or Zellij expose
-the same tab through an auto-started host relay on the host's Tailnet port
-`27888`; random terminals remain non-attachable. The host relay binds only to
-loopback and uses Tailscale Serve, so grant the local operator permission once
-on each interactive host. Interactive terminal attachment additionally requires
-Bun plus the source multiplexer (`tmux`, or Zellij 0.44.2+); missing prerequisites
-leave semantic registration available but mark raw terminal attachment unavailable.
-
-```bash
-bun --version
-sudo tailscale set --operator="$(id -un)"
-```
-
-Host and delegated relays allow up to eight concurrent read-write attachments
-per Pi session, matching normal single-operator tmux behavior. If a new attach
-arrives at capacity, the longest-idle attachment is detached and returned to
-its selector, preventing lockout when old clients do not disconnect cleanly.
-Connections otherwise remain attached until the client, network, PTY, or route
-disconnects. Client activity is tracked only to choose the longest-idle victim;
-the most recent client resize controls the shared tmux window. Native clients
-prefer the direct Tailnet relay and fall back through the orchestrator gateway;
-the PWA uses the same-origin gateway first.
-
-For a native terminal attachment, install the CLI on each operator device and
-capture the prepared interactive shell's host runtime before launching Pi:
-
-```bash
-uv tool install --editable ~/Dev/worker-harness
-wh host setup                        # capture wh/agents/Bun/Node/tmux/Tailscale paths
-wh host doctor                       # validate from a clean SSH-like environment
-wh start --agent omp --name research # new omp in the hidden managed tmux backend
-wh attach                            # interactive fzf picker across agents
-wh attach <id-prefix-or-name>        # select directly
-wh launch                            # machine/cwd → running/history/new picker
-wh resume <exact-id> --cwd /repo     # identity-safe target-local Pi resume
-```
-
-`uv tool install` intentionally cannot run project post-install hooks. On an
-ordinary fleet host, chain the explicit setup step after a pinned install:
-
-```bash
-uv tool install --force --reinstall \
-  'git+ssh://git@github.com/xeTaiz/worker-harness.git@<commit>' \
-  && wh host setup
-```
-
-`wh host setup` writes a private, atomic
-`~/.config/worker-harness/host-runtime.json` manifest. It records the absolute
-executables and stable PATH needed by non-interactive SSH launches and managed
-tmux panes, including Pi's `#!/usr/bin/env node` dependency, omp when present,
-and the Bun path used to start the host relay. It does not edit shell profiles.
-Rerun setup after moving or upgrading Node, Bun, Pi, omp, tmux, Tailscale, or
-the `wh` installation;
-`wh host doctor` reports stale paths and exits nonzero. Set
-`WH_HOST_RUNTIME_CONFIG` only when an alternate manifest path is required.
-
-`wh start` creates one single-pane window in a dedicated status-free tmux
-server, waits for its exact local route, and attaches over loopback. Pi accepts
-the generated session ID; omp chooses its own ID, which `wh` resolves from the
-registered tmux pane. `--name` is the human-facing label. The
-managed backend retains 50,000 lines per new pane and enables tmux mouse mode,
-so scrolling up enters tmux copy mode even through Zellij. Press `Ctrl-]` to
-detach without stopping Pi. Tmux sources always stream through a
-disposable relay client, including on the source host, so an unrelated outer
-tmux keeps its own status and navigation. A same-client local Zellij source is
-the sole direct-focus exception because streaming it recursively would render
-Zellij inside itself. Remote clients prefer the direct Tailnet relay and fall
-back to the orchestrator gateway. `--stream` remains as a compatibility no-op.
-
-The companion tmux dotfiles reserve `Ctrl-a` as a Worker Harness prefix while
-leaving tmux's normal `Ctrl-b` prefix unchanged. `Ctrl-a Ctrl-a` opens a
-transient popup picker, then creates or focuses one dedicated WH-owned window by
-exact Pi UUID. `Ctrl-a Ctrl-s` opens the same transient handoff for `wh launch`;
-running-session attach, history resume, and new-session launch all finish in the
-same dedicated/reused window rather than inside the popup. Only that invoking
-tmux client is switched. The window title and Catppuccin status entry retain the
-state glyph and use blue/green/red/gray for
-working/idle/error/disconnected; ordinary windows are untouched. `Ctrl-a
-Ctrl-j/Ctrl-l` cycles next, `Ctrl-a Ctrl-h/Ctrl-k` cycles previous, and `Ctrl-a
-x` detaches. A dedicated attachment retries bounded unexpected transport
-closures; `Ctrl-]` remains an intentional close. Transport failures report the
-direct/gateway path, duration, fallback use, and close code/reason. In Zellij,
-`Alt-a` and `Ctrl-a Ctrl-a` open
-the picker in a floating pane. A managed/remote/delegated selection opens one
-single-pane tab (`π ● name` working, `π ✓ name` idle, `π ! name` error, `π ?
-name` disconnected), while reopening that session focuses its existing tab.
-`Ctrl-]` closes the attachment tab without stopping Pi. Same-client plain
-Zellij sources still focus their original pane. Picker order is Global, Local
-(initial selection; Up selects Global), remote interactive machines, then
-delegated workers. `Alt-u/y`, prefix Ctrl-j/l/h/k, and in-stream `Ctrl-^`/
-`Ctrl-_` cycle through that same order. Zellij keeps its existing `Ctrl-b`
-tmux-emulation mode entry as well.
-
-Inside a Herdr pane, `wh attach` uses the same native protocol-v2 stream and
-reports the selected Pi/OMP session plus host metadata to Herdr's Agent sidebar.
-Working/idle lifecycle comes from the Worker Harness session stream rather than
-Herdr screen matching. The client re-applies its current pane dimensions after
-the relay backend becomes ready, so Herdr startup and dynamic pane resizes reach
-the source TUI. `Ctrl-]` releases Worker Harness lifecycle authority and
-metadata before returning to the pane's shell. Managed `wh start` sessions do
-not inherit the outer Herdr pane identity; the visible attachment client alone
-owns that sidebar projection.
-
-After `wh launch` selects a machine and cwd, its interactive action picker shows
-active Worker Harness sessions, inactive target-local Pi histories, and Start
-new. Active sessions attach without relaunching. Previous sessions are listed
-through the installed Pi `SessionManager.list(cwd)` API, which requires Pi
-`>=0.83.0,<1.0.0`; opaque IDs are re-resolved on the target and refused if
-already active before Pi is invoked with exact `--session`. Stored names are
-preserved by default. SSH errors include the destination and failing phase, and
-all operator-controlled paths, names, IDs, and Pi arguments remain argv/shell
-quoted.
-
-Tailscale SSH policy is also required (see `headscale-policy.example.json`).
+web assets. Interactive session terminals continue through the host relay.
 
 ## Build images
 
 ```bash
-just build          # orchestrator, worker, wh-web, and wh-router
 just build-orch     # orchestrator only
 just build-worker   # worker only
 just build-web      # wh-web only
-just build-router   # stateless Pi routing classifier only
 
-just push           # build and push all four images
 just push-orch      # build and push the orchestrator only
 just push-worker    # build and push the worker only
 just push-web       # build and push wh-web only
-just push-router    # build and push the router only
 ```
 
 Every Docker build receives three tags automatically:
@@ -228,47 +120,6 @@ docker compose -f docker-compose.web.example.yml restart wh-web
 Do not change or share the orchestrator's SQLite or Tailscale state mounts as
 part of this web cutover, and never run two orchestrators against the same
 Tailscale state directory.
-
-## Run the global semantic router
-
-The global UI routes operator messages only to active interactive Pi sessions.
-Explicit recipients bypass classification; Auto uses the private `wh-router`
-sidecar and includes the previous successful route only while it is less than
-three minutes old. Every dispatch uses Pi steering, which starts an ordinary
-turn when the recipient is idle. The UI records and displays the latest
-classification latency.
-
-`wh-router` has no published port or Tailnet identity. It joins `wh-internal`
-and uses a dedicated copy of the operator's Pi auth/model configuration. The
-directory is writable because OAuth refresh and credential-store locking need
-to update it; do not mount the live interactive-agent directory into two
-writers:
-
-```bash
-install -d -m 0700 "$HOME/.pi/wh-router-agent"
-cp -a "$HOME/.pi/agent/." "$HOME/.pi/wh-router-agent/"
-export WH_PI_ROUTER_AGENT_DIR="$HOME/.pi/wh-router-agent"
-export WH_DOCKER_NETWORK=wh-internal
-docker compose -f docker-compose.router.example.yml up -d --build
-```
-
-The `wh-orch` container must join the same network and use:
-
-```text
-WH_PI_ROUTER_URL=http://wh-router:12900
-```
-
-The router model and thinking level are selected from the Global web view and
-persist in orchestrator SQLite. Initial intended comparisons are
-`openai-codex/gpt-5.3-codex-spark` and `openai-codex/gpt-5.6-luna`; all models
-reported as available by the mounted Pi configuration are selectable. The
-sidecar receives no filesystem or Worker Harness tools and starts every
-classification from a fresh one-message context.
-
-Global **Interrupt** matches Pi's normal Escape behavior through the bridge's
-`ctx.abort()`: queued messages are restored into the target Pi editor and the
-current operation is aborted. It does not terminate Pi or undo completed tool
-side effects.
 
 ## Start containers with Docker or Podman (ephemeral runtime)
 

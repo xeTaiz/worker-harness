@@ -1,0 +1,49 @@
+services:
+  wh-orch:
+    image: ${WH_ORCHESTRATOR_IMAGE:?set WH_ORCHESTRATOR_IMAGE to an immutable release tag or digest}
+    container_name: wh-orch
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    env_file:
+      - ${WH_TAILNET_ENV_FILE:?set WH_TAILNET_ENV_FILE to the existing private Tailnet environment file}
+    environment:
+      WH_OPERATOR_TOKEN_FILE: /run/secrets/wh_operator_token
+      WH_MACHINES_PATH: /etc/worker-harness/machines.toml
+      WH_PROJECTS_PATH: /opt/agent-orchestrator/projects.toml
+      WH_ORCHESTRATOR_REPO: /opt/agent-orchestrator
+      WH_ORCHESTRATOR_CWD: ${WH_ORCHESTRATOR_CWD:-/home/dome/Work/agent-orchestrator}
+      WH_ORCHESTRATOR_MACHINE: ${WH_ORCHESTRATOR_MACHINE:-desktop}
+      WH_FLEET_BASE_URL: ${WH_FLEET_BASE_URL:?set WH_FLEET_BASE_URL to the Tailnet control URL}
+      WH_HERDR_KEY: /root/.ssh/wh_herdr
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - registry:/root/.config/worker-harness
+      - ${WH_MACHINES_FILE:?set WH_MACHINES_FILE}:/etc/worker-harness/machines.toml:ro
+      - ${WH_AGENT_ORCHESTRATOR_DIR:?set WH_AGENT_ORCHESTRATOR_DIR}:/opt/agent-orchestrator:ro
+      - ${WH_HERDR_SSH_DIR:?set WH_HERDR_SSH_DIR}:/root/.ssh:ro
+    secrets:
+      - wh_operator_token
+    networks:
+      wh-internal:
+        aliases:
+          - wh-orch
+
+volumes:
+  tailscale-state:
+    external: true
+    name: ${WH_TAILSCALE_VOLUME:?set WH_TAILSCALE_VOLUME to the existing volume name}
+  registry:
+    external: true
+    name: ${WH_REGISTRY_VOLUME:?set WH_REGISTRY_VOLUME to the existing volume name}
+
+networks:
+  wh-internal:
+    external: true
+    name: ${WH_DOCKER_NETWORK:-wh-internal}
+
+secrets:
+  wh_operator_token:
+    file: ${WH_OPERATOR_TOKEN_FILE:?set WH_OPERATOR_TOKEN_FILE to the private server token file}
