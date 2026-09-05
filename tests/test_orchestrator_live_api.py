@@ -7,9 +7,11 @@ from urllib.parse import urlparse
 
 import httpx
 
+from worker_harness.cli.pi import _headers
+
 
 # 12888 is the worker-only registration service; the privileged control API
-# (workers, jobs, Pi delegation) intentionally listens on 12889.
+# (workers, jobs, and fleet sessions) intentionally listens on 12889.
 ORCH_URL = os.getenv("ORCHESTRATOR_URL", "http://orchestrator.hs.d0me.xyz:12889")
 PREFERRED_WORKER_HINT = os.getenv("ORCHESTRATOR_WORKER_HINT", "userspace").strip().lower()
 TIMEOUT = 20.0
@@ -18,7 +20,9 @@ TIMEOUT = 20.0
 class OrchestratorLiveApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.client = httpx.Client(base_url=ORCH_URL, timeout=TIMEOUT, trust_env=False)
+        cls.client = httpx.Client(
+            base_url=ORCH_URL, timeout=TIMEOUT, trust_env=False, headers=_headers(),
+        )
         deadline = time.time() + 30
         last_err = None
         while time.time() < deadline:

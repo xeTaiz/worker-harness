@@ -17,11 +17,11 @@ worker_image := worker_repo + ":latest"
 web_image := web_repo + ":latest"
 router_image := router_repo + ":latest"
 
-build: build-orch build-worker build-web build-router
-    @echo "[just build] Built orchestrator, worker, web, and router images"
+build: build-orch build-worker build-web
+    @echo "[just build] Built orchestrator, worker, and web images"
 
-push: push-orch push-worker push-web push-router
-    @echo "[just push] Built and pushed orchestrator, worker, web, and router images"
+push: push-orch push-worker push-web
+    @echo "[just push] Built and pushed orchestrator, worker, and web images"
 
 # Build everything (docker containers + singularity .sif) then produce dist bundle.
 all: build build-singularity dist
@@ -54,14 +54,6 @@ build-web:
         -t {{web_repo}}:{{release_tag}} \
         -f web_container/Dockerfile .
 
-build-router:
-    @echo "[just build-router] Building {{router_repo}} with tags latest, {{git_branch}}, and {{release_tag}}"
-    @docker build \
-        --network {{docker_build_network}} \
-        -t {{router_repo}}:latest \
-        -t {{router_repo}}:{{git_branch}} \
-        -t {{router_repo}}:{{release_tag}} \
-        -f router_service/Dockerfile .
 
 push-orch: build-orch
     @echo "[just push-orch] Pushing {{orchestrator_repo}} tags latest, {{git_branch}}, and {{release_tag}}"
@@ -81,11 +73,6 @@ push-web: build-web
     @docker push {{web_repo}}:{{git_branch}}
     @docker push {{web_repo}}:{{release_tag}}
 
-push-router: build-router
-    @echo "[just push-router] Pushing {{router_repo}} tags latest, {{git_branch}}, and {{release_tag}}"
-    @docker push {{router_repo}}:latest
-    @docker push {{router_repo}}:{{git_branch}}
-    @docker push {{router_repo}}:{{release_tag}}
 
 build-singularity output="worker-harness-worker.sif":
     @echo "[just build-singularity] Building Singularity image: {{output}}"

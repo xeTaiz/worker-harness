@@ -80,11 +80,7 @@ def main(
 def main_entry():
     """Entry point installed as the `worker-harness` console script."""
     # Register subcommands lazily to avoid circular imports
-    from worker_harness.cli import workers, jobs, tunnels, pi, launch, host, agent as agent_mod
-    app.command(
-        name="launch",
-        context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
-    )(launch.launch)
+    from worker_harness.cli import workers, jobs, tunnels, pi, host, agent as agent_mod
     app.add_typer(workers.app, name="workers")
     app.add_typer(jobs.app, name="job")
     app.add_typer(tunnels.app, name="tunnel")
@@ -92,18 +88,9 @@ def main_entry():
     app.add_typer(host.app, name="host")
     app.command(name="sessions")(pi.sessions)
     app.command(name="attach")(pi.attach)
-    app.command(
-        name="start",
-        context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
-    )(pi.start)
-    app.command(
-        name="resume",
-        context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
-    )(pi.resume)
-    app.command(name="cycle", hidden=True)(pi.cycle)
     app.command(name="events")(pi.events)
     app.command(name="prompt")(pi.prompt)
-    app.command(name="history-list", hidden=True)(pi.history_list)
+    app.add_typer(pi.orchestrator_app, name="orchestrator")
 
     @app.command(name="tui", hidden=True)
     def tui_cmd():

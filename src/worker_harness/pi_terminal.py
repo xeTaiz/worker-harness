@@ -159,16 +159,32 @@ async def _send_input(websocket: Any, stdin_fd: int) -> str | None:
     return None
 
 
-async def _send_resizes(websocket: Any, stdout_fd: int, changed: asyncio.Event) -> None:
+async def _send_resizes(
+    websocket: Any,
+    stdout_fd: int,
+    changed: asyncio.Event,
+    backend_ready: asyncio.Event | None = None,
+) -> None:
     last_size: tuple[int, int] | None = None
     while True:
         size = terminal_size(stdout_fd)
-        if size != last_size:
+        refresh = backend_ready is not None and backend_ready.is_set()
+        if refresh:
+            backend_ready.clear()
+        if refresh and size == last_size:
+            rows, cols = size
+            nudge_cols = cols - 1 if cols > 1 else cols + 1
+            await websocket.send(
+                json.dumps({"type": "resize", "rows": rows, "cols": nudge_cols})
+            )
+        if refresh or size != last_size:
             rows, cols = size
             await websocket.send(json.dumps({"type": "resize", "rows": rows, "cols": cols}))
             last_size = size
-        # SIGWINCH is the fast path. Polling closes gaps in nested tmux and on
-        # platforms that update the PTY dimensions without delivering it.
+        # SIGWINCH is the fast path. Polling closes gaps in nested multiplexers
+        # and on platforms that update the PTY dimensions without delivering it.
+        # A backend-ready signal wakes this loop and forces a one-column resize
+        # round trip so an initially correct PTY size still reaches the source.
         try:
             await asyncio.wait_for(changed.wait(), timeout=0.5)
         except asyncio.TimeoutError:
@@ -187,7 +203,12 @@ def _write_all(fd: int, data: bytes) -> None:
         remaining = remaining[written:]
 
 
-async def _receive_output(websocket: Any, stdout_fd: int) -> str | None:
+async def _receive_output(
+    websocket: Any,
+    stdout_fd: int,
+    backend_ready: asyncio.Event | None = None,
+    resize_changed: asyncio.Event | None = None,
+) -> str | None:
     try:
         async for message in websocket:
             if isinstance(message, bytes):
@@ -203,7 +224,15 @@ async def _receive_output(websocket: Any, stdout_fd: int) -> str | None:
                 raise RuntimeError(str(detail))
             if frame.get("type") == "status" and frame.get("state") == "replaced":
                 return "select"
-            # Other status frames are protocol metadata; tmux's binary redraw is the UI.
+            if (
+                backend_ready is not None
+                and frame.get("type") == "status"
+                and frame.get("state") == "connected"
+            ):
+                backend_ready.set()
+                if resize_changed is not None:
+                    resize_changed.set()
+            # Other status frames are protocol metadata; the binary redraw is the UI.
     except ConnectionClosed as exc:
         if exc.rcvd is not None and exc.rcvd.code == 4410:
             return "select"
@@ -224,6 +253,7 @@ async def attach_terminal(
     websocket_url: str,
     *,
     fallback_websocket_url: str | None = None,
+    fallback_headers: dict[str, str] | None = None,
     stdin_fd: int | None = None,
     stdout_fd: int | None = None,
     cycle_requests: asyncio.Queue[str] | None = None,
@@ -242,6 +272,7 @@ async def attach_terminal(
     websocket_urls = [terminal_url(url, initial_rows, initial_cols) for url in websocket_urls]
 
     resize_changed = asyncio.Event()
+    backend_ready = asyncio.Event()
     loop = asyncio.get_running_loop()
     signal_installed = False
     try:
@@ -259,6 +290,8 @@ async def attach_terminal(
             try:
                 async with connect(
                     candidate_url,
+                    # Never send the operator bearer to a machine's direct relay.
+                    extra_headers=fallback_headers if index > 0 else None,
                     max_size=None,
                     ping_interval=20,
                     ping_timeout=20,
@@ -269,10 +302,22 @@ async def attach_terminal(
                             _send_input(websocket, stdin_fd), name="pi-attach-input"
                         )
                         output_task = asyncio.create_task(
-                            _receive_output(websocket, stdout_fd), name="pi-attach-output"
+                            _receive_output(
+                                websocket,
+                                stdout_fd,
+                                backend_ready,
+                                resize_changed,
+                            ),
+                            name="pi-attach-output",
                         )
                         resize_task = asyncio.create_task(
-                            _send_resizes(websocket, stdout_fd, resize_changed), name="pi-attach-resize"
+                            _send_resizes(
+                                websocket,
+                                stdout_fd,
+                                resize_changed,
+                                backend_ready,
+                            ),
+                            name="pi-attach-resize",
                         )
                         tasks = {input_task, output_task, resize_task}
                         cycle_task: asyncio.Task[str] | None = None

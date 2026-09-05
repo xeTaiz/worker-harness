@@ -3,23 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import secrets
 from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import AsyncIterator, Awaitable, Callable, Literal, TypeVar
+from pathlib import Path, PurePosixPath
+from typing import AsyncIterator, Awaitable, Callable, Literal, Self, TypeVar
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
-import httpx
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
+from starlette.requests import HTTPConnection
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
@@ -36,6 +38,10 @@ from .data import (
 )
 from .db import Database
 from .job import JobManager
+from .machines import load_machines
+from .orchestration import Orchestrator, WorktreeError
+from .pr import PrRejected, open_pr
+from .projects import load_projects
 from .lanes import LaneTimeout, WorkerLanes
 from .metrics import Metrics, set_global_metrics
 from .marimo import (
@@ -50,31 +56,15 @@ from .models import (
     JobStatus,
     PiBridgeEventBatch,
     PiBridgeRegister,
-    PiDelegation,
-    PiIngestPayload,
-    PiRouterConfig,
-    PiRouterRequest,
     PiSession,
     PiSessionCommand,
     PiSessionEvent,
     PiSessionState,
-    PiSessionType,
     PortForward,
     MarimoSession,
     WorkerJobReportBatch,
     WorkerRegistration,
     WorkerStatus,
-)
-from .pi_router import (
-    ROUTER_MESSAGE_LIMIT,
-    ROUTER_RECENT_SECONDS,
-    ROUTER_THINKING_LEVELS,
-    HttpPiRouterClient,
-    RouterUnavailable,
-    build_candidates,
-    build_classifier_prompt,
-    parse_router_output,
-    summarize_session_events,
 )
 from .ratelimit import AgentRateLimiter, RateLimited, resolve_agent_name
 from .reaper import reap_loop
@@ -131,99 +121,43 @@ class DataCopyRequest(BaseModel):
     ttl_seconds: int = 6 * 60 * 60
 
 
-class PiDelegationCreateRequest(BaseModel):
-    task: str
-    worker_id: str | None = None
-    parent_session_id: str | None = None
-    cwd: str = ""
-    # 0 disables the timeout gate (spec §8.1: duration is the only session-level
-    # policy knob; unacknowledged expiry becomes termination_unknown).
-    timeout_seconds: int = 0
-    # sync=true blocks until the child reaches a settled/terminal state or the
-    # wait cap elapses; it never fabricates completion (spec §8.1).
-    sync: bool = False
+class PiMessageRequest(BaseModel):
+    message: str = Field(min_length=1)
 
 
-class PiPromptRequest(BaseModel):
-    message: str
-    deliver_as: Literal["steer", "followUp"] = "followUp"
+class PiQuestionRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+
+
+class PiNoteRequest(BaseModel):
+    note: str = Field(min_length=1)
+
+
+class PiTaskLaunchRequest(BaseModel):
+    branch: str = Field(min_length=1)
+    briefing: str = Field(min_length=1)
 
 
 class PiConfigureRequest(BaseModel):
     provider: str | None = None
     model: str | None = None
-    thinking_level: Literal["off", "minimal", "low", "medium", "high", "xhigh", "max"] | None = None
+    thinking_level: Literal[
+        "off", "minimal", "low", "medium", "high", "xhigh", "max"
+    ] | None = None
+
+
+class PiTeardownRequest(BaseModel):
+    force: bool = False
+
+
+class PiSubmitPrRequest(BaseModel):
+    summary: str = Field(min_length=1)
 
 
 class PiCommandAck(BaseModel):
     incarnation: str
 
 
-class PiRouterConfigureRequest(BaseModel):
-    provider: str
-    model: str
-    thinking_level: Literal["off", "minimal", "low", "medium", "high", "xhigh", "max"] = "off"
-
-
-class PiRouterDispatchRequest(BaseModel):
-    message: str
-    target_session_id: str | None = None
-    reply_session_id: str | None = None
-    request_id: str | None = None
-
-
-# Timeout gate (spec §8.1): an expired delegation is cancelled through the
-# worker relay; without an acknowledgement the terminal state is unknown,
-# never a fabricated cancellation.
-PI_DELEGATION_TERMINAL_STATES = {
-    PiSessionState.STOPPED,
-    PiSessionState.FAILED,
-    PiSessionState.TERMINATION_UNKNOWN,
-}
-
-
-async def sweep_expired_pi_delegations(db: Database, relay_request_fn, now: int | None = None) -> None:
-    """Expire delegations past their timeout gate.
-
-    ``relay_request_fn`` matches the orchestrator's worker relay client
-    signature ``(worker, method, path, payload=None) -> dict``.
-    """
-    now = now if now is not None else int(datetime.now(timezone.utc).timestamp())
-    for delegation in await db.list_pi_delegations():
-        if (
-            delegation.timeout_seconds <= 0
-            or delegation.state in PI_DELEGATION_TERMINAL_STATES
-            or now - delegation.created_at < delegation.timeout_seconds
-        ):
-            continue
-        session = await db.get_pi_session(delegation.child_session_id)
-        if not session:
-            continue
-        worker = await db.get_worker(delegation.worker_id)
-        ack = False
-        if worker:
-            try:
-                await relay_request_fn(worker, "POST", f"/v1/sessions/{session.id}:cancel")
-                ack = True
-            except Exception as exc:
-                log.warning("Pi delegation %s timeout cancel was not acknowledged: %s", delegation.id, exc)
-        if ack:
-            session.state = PiSessionState.STOPPED
-            session.detail = "delegation timed out"
-            event_type = "timeout"
-            delegation.state = PiSessionState.STOPPED
-        else:
-            session.state = PiSessionState.TERMINATION_UNKNOWN
-            session.detail = "delegation timed out; worker unreachable"
-            event_type = "timeout_unknown"
-            delegation.state = PiSessionState.TERMINATION_UNKNOWN
-        session.updated_at = now
-        delegation.completed_at = now
-        await db.update_pi_session(session)
-        await db.update_pi_delegation(delegation)
-        await db.insert_pi_session_event(PiSessionEvent(
-            session_id=session.id, event_type=event_type, payload={"delegation_id": delegation.id}, created_at=now
-        ))
 
 
 async def reconcile_active_ssh_jobs(
@@ -270,14 +204,19 @@ async def lifespan(app: FastAPI):
     """
     app.state.reaper_task = asyncio.create_task(reap_loop(app))
     background_tasks = [app.state.reaper_task]
-    sweeper = getattr(app.state, "pi_delegation_sweeper", None)
-    if sweeper is not None:
-        app.state.pi_sweeper_task = asyncio.create_task(sweeper())
-        background_tasks.append(app.state.pi_sweeper_task)
     reconciler = getattr(app.state, "job_reconciler", None)
     if reconciler is not None:
         app.state.job_reconciler_task = asyncio.create_task(reconciler())
         background_tasks.append(app.state.job_reconciler_task)
+    if app.state.machines:
+        async def poll_fleet() -> None:
+            while True:
+                await asyncio.sleep(5)
+                try:
+                    await app.state.orchestrator.poll()
+                except Exception:
+                    log.exception("Fleet projection failed")
+        background_tasks.append(asyncio.create_task(poll_fleet(), name="pi-fleet-poll"))
     try:
         yield
     finally:
@@ -312,33 +251,6 @@ def create_registration_app(db: Database) -> FastAPI:
     async def health():
         return {"status": "healthy", "ts": datetime.now(timezone.utc).isoformat()}
 
-    @app.post("/pi/worker/{worker_id}/sessions/{session_id}/events")
-    async def worker_pi_session_events(worker_id: str, session_id: str, payload: PiIngestPayload):
-        # Workers may only upload events for sessions they own. The orchestrator's
-        # session table is the single writer of the durable projection; the
-        # reported state is layered on top so the projection stays truthful even
-        # when nothing else is happening on the wire.
-        if payload.session_id != session_id:
-            raise HTTPException(status_code=422, detail="session_id mismatch between path and payload")
-        worker = await db.get_worker(worker_id)
-        if not worker:
-            raise HTTPException(status_code=404, detail="worker not found")
-        session = await db.get_pi_session(session_id)
-        if not session:
-            raise HTTPException(status_code=410, detail="session projection is gone")
-        if session.worker_id != worker_id:
-            raise HTTPException(status_code=404, detail="session not found for worker")
-        try:
-            persisted = await db.apply_pi_ingest(worker_id, payload)
-        except KeyError as exc:
-            # The row can disappear between the ownership check and the
-            # transaction. Tell the durable worker outbox not to retry forever.
-            raise HTTPException(status_code=410, detail="session projection is gone") from exc
-        return {
-            "session_id": session_id,
-            "events_persisted": len(persisted),
-            "state": payload.state.value if payload.state else None,
-        }
 
     @app.post("/pi/worker/{worker_id}/jobs")
     async def worker_pi_jobs(worker_id: str, payload: WorkerJobReportBatch):
@@ -522,10 +434,84 @@ async def _pump_terminal_gateway(
     return "replaced" if eviction_task in done else "completed"
 
 
-def create_app(db: Database, router_client=None) -> FastAPI:
+def _operator_token() -> str:
+    token = os.environ.get("WH_OPERATOR_TOKEN", "").strip()
+    token_file = os.environ.get("WH_OPERATOR_TOKEN_FILE", "").strip()
+    if not token and token_file:
+        token = Path(token_file).expanduser().read_text(encoding="utf8").strip()
+    if token or token_file:
+        if len(token) < 43 or any(
+            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+            for character in token
+        ):
+            raise ValueError("operator token must be at least 43 base64url characters")
+    return token
+
+
+def require_role(*allowed: str):
+    """Resolve an optional fleet bearer token and enforce the caller role."""
+
+    async def resolve(
+        request: HTTPConnection,
+        authorization: str | None = Header(default=None),
+    ) -> PiSession | None:
+        operator_token = request.app.state.operator_token
+        if authorization is None:
+            if operator_token or request.app.state.machines:
+                raise HTTPException(status_code=401, detail="operator or session bearer token required")
+            if "operator" in allowed:
+                return None
+            raise HTTPException(status_code=403, detail="operator is not allowed")
+        scheme, separator, token = authorization.partition(" ")
+        if separator != " " or scheme.lower() != "bearer" or not token.strip() or not token.isascii():
+            raise HTTPException(status_code=401, detail="invalid bearer token")
+        if operator_token and secrets.compare_digest(token.strip(), operator_token):
+            if "operator" in allowed:
+                return None
+            raise HTTPException(status_code=403, detail="operator is not allowed")
+        caller = await request.app.state.db.get_pi_session_by_token_hash(
+            hashlib.sha256(token.strip().encode()).hexdigest()
+        )
+        if caller is None:
+            raise HTTPException(status_code=401, detail="invalid bearer token")
+        if caller.state in {
+            PiSessionState.STOPPED, PiSessionState.FAILED, PiSessionState.TERMINATION_UNKNOWN,
+        }:
+            raise HTTPException(status_code=401, detail="session token is no longer active")
+        if caller.role not in allowed:
+            raise HTTPException(status_code=403, detail="caller role is not allowed")
+        return caller
+
+    return resolve
+
+
+async def require_api_caller(request: HTTPConnection) -> None:
+    if request.url.path == "/health":
+        return
+    if request.scope["type"] == "websocket":
+        return
+    allowed = ("operator", "pm", "task")
+    if request.url.path.startswith("/api/v1/pi/"):
+        allowed += ("orchestrator",)
+    await require_role(*allowed)(request, request.headers.get("authorization"))
+
+
+def create_app(db: Database) -> FastAPI:
     """Create the privileged control API (kept as the public test factory)."""
-    app = FastAPI(title="Worker Harness Control API", lifespan=lifespan)
+    app = FastAPI(
+        title="Worker Harness Control API", lifespan=lifespan,
+        dependencies=[Depends(require_api_caller)],
+    )
     jm = JobManager(db)
+    app.state.db = db
+    app.state.operator_token = _operator_token()
+    app.state.machines = load_machines()
+    app.state.projects = load_projects()
+    app.state.orchestrator = Orchestrator(
+        db,
+        app.state.machines,
+        app.state.projects,
+    )
 
     # Shared reliability services. They are attached before lifespan starts so
     # handlers, reaper, and /api/v1/_stats all see one coherent state.
@@ -542,11 +528,6 @@ def create_app(db: Database, router_client=None) -> FastAPI:
     app.state.pi_gateway_max_per_session = _positive_int_env(
         "WH_PI_MAX_ATTACHMENTS", 8
     )
-    app.state.pi_router = router_client or HttpPiRouterClient(
-        os.environ.get("WH_PI_ROUTER_URL", "http://wh-router:12900"),
-        timeout_seconds=float(os.environ.get("WH_PI_ROUTER_TIMEOUT_SECONDS", "30")),
-    )
-    app.state.pi_router_lock = asyncio.Lock()
     set_global_metrics(app.state.metrics)
     set_lanes(app.state.lanes)
 
@@ -643,22 +624,6 @@ def create_app(db: Database, router_client=None) -> FastAPI:
             None,
         )
 
-    async def worker_relay_request(worker, method: str, path: str, payload: dict | None = None) -> dict:
-        if worker.status != WorkerStatus.ONLINE:
-            raise HTTPException(status_code=409, detail=f"worker is {worker.status.value}")
-        if not worker.pi_relay_available or not worker.pi_relay_port:
-            raise HTTPException(status_code=409, detail="worker does not advertise a Pi relay")
-        # Userspace Tailscale Serve exposes the worker's Tailnet IP; prefer it
-        # over MagicDNS because an operator's resolver may not have MagicDNS.
-        url = f"http://{worker.worker_ip}:{worker.pi_relay_port}{path}"
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.request(method, url, json=payload)
-        except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"worker Pi relay unavailable: {exc}") from exc
-        if response.status_code >= 400:
-            raise HTTPException(status_code=response.status_code, detail=response.text)
-        return response.json()
 
     # ── Privileged orchestration API (/api/v1) ───────────────────────────────
 
@@ -683,7 +648,10 @@ def create_app(db: Database, router_client=None) -> FastAPI:
         return await cached("workers:summary", 2.0, load)
 
     @app.delete("/api/v1/workers/prune")
-    async def workers_prune(minutes: int = Query(5, ge=0)):
+    async def workers_prune(
+        minutes: int = Query(5, ge=0),
+        _caller: PiSession | None = Depends(require_role("operator")),
+    ):
         import time as _time
 
         cutoff = int(_time.time()) - (minutes * 60)
@@ -692,7 +660,22 @@ def create_app(db: Database, router_client=None) -> FastAPI:
         return {"removed": removed, "minutes": minutes}
 
     @app.post("/api/v1/pi/bridge/register")
-    async def pi_bridge_register(payload: PiBridgeRegister):
+    async def pi_bridge_register(
+        payload: PiBridgeRegister,
+        caller: PiSession | None = Depends(
+            require_role("operator", "orchestrator", "pm", "task")
+        ),
+    ):
+        if caller and caller.id != payload.session_id:
+            raise HTTPException(status_code=403, detail="session token does not match bridge session")
+        if payload.resume_path and caller:
+            machine = app.state.machines.get(caller.meta.get("machine") or caller.host)
+            path = PurePosixPath(payload.resume_path)
+            if (
+                machine is None or ".." in path.parts or path.suffix != ".jsonl"
+                or not path.is_relative_to(PurePosixPath(machine.home) / ".omp/agent/sessions")
+            ):
+                raise HTTPException(status_code=403, detail="transcript path is outside the agent session directory")
         now = int(datetime.now(timezone.utc).timestamp())
         try:
             session = await db.register_interactive_pi_session(payload, now=now)
@@ -707,7 +690,15 @@ def create_app(db: Database, router_client=None) -> FastAPI:
         return session.model_dump(mode="json")
 
     @app.post("/api/v1/pi/bridge/{session_id}/events")
-    async def pi_bridge_events(session_id: str, payload: PiBridgeEventBatch):
+    async def pi_bridge_events(
+        session_id: str,
+        payload: PiBridgeEventBatch,
+        caller: PiSession | None = Depends(
+            require_role("operator", "orchestrator", "pm", "task")
+        ),
+    ):
+        if caller and caller.id != session_id:
+            raise HTTPException(status_code=403, detail="session token does not match bridge session")
         try:
             session, persisted = await db.apply_interactive_pi_events(session_id, payload)
         except KeyError as exc:
@@ -725,7 +716,12 @@ def create_app(db: Database, router_client=None) -> FastAPI:
         session_id: str,
         incarnation: str,
         wait_seconds: float = Query(20.0, ge=0.0, le=30.0),
+        caller: PiSession | None = Depends(
+            require_role("operator", "orchestrator", "pm", "task")
+        ),
     ):
+        if caller and caller.id != session_id:
+            raise HTTPException(status_code=403, detail="session token does not match bridge session")
         deadline = asyncio.get_running_loop().time() + wait_seconds
         while True:
             try:
@@ -739,7 +735,16 @@ def create_app(db: Database, router_client=None) -> FastAPI:
             await asyncio.sleep(min(0.5, max(0.01, deadline - asyncio.get_running_loop().time())))
 
     @app.post("/api/v1/pi/bridge/{session_id}/commands/{command_id}:ack")
-    async def pi_bridge_command_ack(session_id: str, command_id: str, payload: PiCommandAck):
+    async def pi_bridge_command_ack(
+        session_id: str,
+        command_id: str,
+        payload: PiCommandAck,
+        caller: PiSession | None = Depends(
+            require_role("operator", "orchestrator", "pm", "task")
+        ),
+    ):
+        if caller and caller.id != session_id:
+            raise HTTPException(status_code=403, detail="session token does not match bridge session")
         try:
             acknowledged = await db.ack_pi_session_command(session_id, command_id, payload.incarnation)
         except KeyError as exc:
@@ -750,315 +755,466 @@ def create_app(db: Database, router_client=None) -> FastAPI:
             raise HTTPException(status_code=404, detail="pending command not found")
         return {"acknowledged": True, "command_id": command_id}
 
+    async def enqueue_prompt(
+        target: PiSession,
+        message: str,
+        *,
+        deliver_as: str,
+        caller: PiSession | None,
+    ) -> PiSessionCommand:
+        message = message.strip()
+        if not message:
+            raise HTTPException(status_code=422, detail="message must not be empty")
+        now = int(datetime.now(timezone.utc).timestamp())
+        command = PiSessionCommand(
+            session_id=target.id,
+            kind="prompt",
+            message=message,
+            deliver_as=deliver_as,
+            payload={"sender_session_id": caller.id if caller else ""},
+            created_at=now,
+        )
+        await db.enqueue_pi_session_command(command)
+        await db.insert_pi_session_event(PiSessionEvent(
+            session_id=target.id,
+            event_type="prompt-queued",
+            payload={
+                "command_id": command.id,
+                "deliver_as": deliver_as,
+                "sender_session_id": caller.id if caller else "",
+            },
+            created_at=now,
+        ))
+        return command
+
+    @app.get("/api/v1/pi/orchestrator")
+    async def pi_orchestrator_get(
+        _caller: PiSession | None = Depends(require_role("operator", "orchestrator", "pm")),
+    ):
+        sessions = await db.list_pi_sessions_by_role("orchestrator")
+        for session in sessions:
+            if session.state not in {PiSessionState.STOPPED, PiSessionState.FAILED}:
+                return session.model_dump(mode="json")
+        raise HTTPException(status_code=404, detail="no live orchestrator session")
+
+    @app.post("/api/v1/pi/orchestrator:send")
+    async def pi_orchestrator_send(
+        payload: PiMessageRequest,
+        caller: PiSession | None = Depends(require_role("operator", "pm")),
+    ):
+        try:
+            session = await app.state.orchestrator.ensure_orchestrator()
+        except Exception as exc:
+            log.error("Could not launch orchestrator session: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail=f"could not launch orchestrator session: {exc}",
+            ) from exc
+        command = await enqueue_prompt(
+            session,
+            payload.message,
+            deliver_as="steer",
+            caller=caller,
+        )
+        return {
+            "session": session.model_dump(mode="json"),
+            "command_id": command.id,
+        }
+
     @app.get("/api/v1/pi/sessions")
     async def pi_sessions_list(
         request: Request,
         worker_id: str | None = None,
         include_attach_info: bool = False,
+        caller: PiSession | None = Depends(require_role("operator", "orchestrator", "pm")),
     ):
+        if include_attach_info and caller:
+            raise HTTPException(status_code=403, detail="terminal attachment is operator-only")
         sessions = await db.list_pi_sessions(worker_id)
+        if caller and caller.role == "pm":
+            sessions = [
+                session
+                for session in sessions
+                if (
+                    session.id == caller.id
+                    or (
+                        session.role == "task"
+                        and session.parent_session_id == caller.id
+                        and bool(caller.meta.get("project"))
+                        and session.meta.get("project") == caller.meta.get("project")
+                    )
+                    or session.role == "orchestrator"
+                )
+            ]
         if not include_attach_info:
             return [session.model_dump(mode="json") for session in sessions]
-        workers = {
-            worker.id: worker
-            for worker in await db.list_workers()
-        }
         return [
             {
                 **session.model_dump(mode="json"),
-                "attach_info": attach_info_with_gateway(
-                    session,
-                    workers.get(session.worker_id or ""),
-                    request,
-                ),
+                "attach_info": attach_info_with_gateway(session, request),
             }
             for session in sessions
         ]
 
-    async def router_config() -> PiRouterConfig:
-        stored = await db.get_pi_router_config()
-        if stored:
-            return stored
-        return PiRouterConfig(
-            provider=os.environ.get("WH_PI_ROUTER_PROVIDER", "openai-codex"),
-            model=os.environ.get("WH_PI_ROUTER_MODEL", "gpt-5.3-codex-spark"),
-            thinking_level=os.environ.get("WH_PI_ROUTER_THINKING", "off"),
-        )
-
-    async def router_summaries(sessions: list[PiSession]) -> dict[str, dict[str, Any]]:
-        summaries: dict[str, dict[str, Any]] = {}
-        for session in sessions:
-            if (
-                session.session_type == PiSessionType.INTERACTIVE
-                and session.state in {PiSessionState.WORKING, PiSessionState.IDLE}
-                and session.bridge_incarnation
-                and not session.name.startswith("subagent-")
-            ):
-                events = await db.list_recent_pi_session_events(session.id, limit=500)
-                latest_user = await db.get_latest_pi_message_event(session.id, "user")
-                if latest_user and all(event.id != latest_user.id for event in events):
-                    events = sorted([latest_user, *events], key=lambda event: event.sequence)
-                summaries[session.id] = summarize_session_events(events)
-        return summaries
-
-    @app.get("/api/v1/pi/router/config")
-    async def pi_router_config_get():
-        return (await router_config()).model_dump(mode="json")
-
-    @app.put("/api/v1/pi/router/config")
-    async def pi_router_config_put(payload: PiRouterConfigureRequest):
-        provider = payload.provider.strip()
-        model = payload.model.strip()
-        if not provider or not model or len(provider) > 256 or len(model) > 256:
-            raise HTTPException(status_code=422, detail="provider and model are required")
-        if payload.thinking_level not in ROUTER_THINKING_LEVELS:
-            raise HTTPException(status_code=422, detail="invalid thinking level")
-        config = PiRouterConfig(
-            provider=provider,
-            model=model,
-            thinking_level=payload.thinking_level,
-            updated_at=int(datetime.now(timezone.utc).timestamp()),
-        )
-        return (await db.set_pi_router_config(config)).model_dump(mode="json")
-
-    @app.get("/api/v1/pi/router/models")
-    async def pi_router_models():
-        try:
-            models = await app.state.pi_router.list_models()
-        except RouterUnavailable as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        return {"models": models}
-
-    @app.get("/api/v1/pi/router/snapshot")
-    async def pi_router_snapshot():
-        sessions = await db.list_pi_sessions()
-        summaries = await router_summaries(sessions)
-        candidates = build_candidates(sessions, summaries)
-        latest = await db.get_latest_pi_router_request(classified_only=True)
-        return {
-            "sessions": [
-                {
-                    **session.model_dump(mode="json"),
-                    **summaries.get(session.id, {}),
-                }
-                for session in sessions
-                if session.id in summaries
-            ],
-            "candidates": [candidate.as_dict() for candidate in candidates],
-            "config": (await router_config()).model_dump(mode="json"),
-            "latest_route": latest.model_dump(mode="json") if latest else None,
-        }
-
-    @app.post("/api/v1/pi/router:dispatch")
-    async def pi_router_dispatch(payload: PiRouterDispatchRequest):
-        message = payload.message.strip()
-        if not message:
-            raise HTTPException(status_code=422, detail="message must not be empty")
-        if len(message) > ROUTER_MESSAGE_LIMIT:
-            raise HTTPException(status_code=422, detail=f"message exceeds {ROUTER_MESSAGE_LIMIT} characters")
-        if payload.target_session_id and payload.reply_session_id:
-            raise HTTPException(status_code=422, detail="choose target_session_id or reply_session_id, not both")
-        request_id = payload.request_id or str(uuid4())
-        existing = await db.get_pi_router_request(request_id)
-        if existing:
-            return existing.model_dump(mode="json")
-
-        now = int(datetime.now(timezone.utc).timestamp())
-        config = await router_config()
-        sessions = await db.list_pi_sessions()
-        summaries = await router_summaries(sessions)
-        candidates = build_candidates(sessions, summaries)
-        candidate_snapshot = [candidate.as_dict() for candidate in candidates]
-        explicit_target = payload.target_session_id or payload.reply_session_id
-        selection_mode = "reply" if payload.reply_session_id else "explicit" if payload.target_session_id else "auto"
-        route_request = PiRouterRequest(
-            id=request_id,
-            message=message,
-            selection_mode=selection_mode,
-            candidate_snapshot=candidate_snapshot,
-            provider=config.provider,
-            model=config.model,
-            thinking_level=config.thinking_level,
-            created_at=now,
-        )
-        if not await db.insert_pi_router_request(route_request):
-            existing = await db.get_pi_router_request(request_id)
-            assert existing is not None
-            return existing.model_dump(mode="json")
-
-        target_id = explicit_target
-        if explicit_target:
-            if explicit_target not in {candidate.session_id for candidate in candidates}:
-                route_request.status = "needs_target"
-                route_request.error = "explicit target is not an active interactive session"
-        elif not candidates:
-            route_request.status = "needs_target"
-            route_request.error = "no active interactive sessions"
-        else:
-            recent = await db.get_latest_pi_router_request(dispatched_only=True)
-            recent_id = None
-            recent_message = ""
-            if recent and now - recent.completed_at < ROUTER_RECENT_SECONDS:
-                recent_id = recent.selected_session_id
-                recent_message = recent.message
-            classifier_prompt = build_classifier_prompt(
-                message,
-                candidates,
-                recent_session_id=recent_id,
-                recent_message=recent_message,
-            )
-            try:
-                async with app.state.pi_router_lock:
-                    classified = await app.state.pi_router.classify(classifier_prompt, config)
-                route_request.router_output = classified.output
-                route_request.latency_ms = classified.latency_ms
-                route_request.provider = classified.provider
-                route_request.model = classified.model
-                route_request.thinking_level = classified.thinking_level
-                selected_index = parse_router_output(classified.output, len(candidates))
-                if selected_index:
-                    target_id = candidates[selected_index - 1].session_id
-                else:
-                    route_request.status = "needs_target"
-                    route_request.error = "router did not select one recipient"
-            except RouterUnavailable as exc:
-                route_request.status = "needs_target"
-                route_request.error = str(exc)
-
-        if target_id and route_request.status == "routing":
-            target = await db.get_pi_session(target_id)
-            if (
-                not target
-                or target.session_type != PiSessionType.INTERACTIVE
-                or target.state not in {PiSessionState.WORKING, PiSessionState.IDLE}
-                or not target.bridge_incarnation
-            ):
-                route_request.status = "needs_target"
-                route_request.error = "selected recipient is no longer active"
-            else:
-                command = PiSessionCommand(
-                    session_id=target.id,
-                    kind="prompt",
-                    message=message,
-                    deliver_as="steer",
-                    payload={"router_request_id": route_request.id},
-                    created_at=now,
+    @app.post("/api/v1/pi/sessions/{session_id}:send")
+    async def pi_session_send(
+        session_id: str,
+        payload: PiMessageRequest,
+        caller: PiSession | None = Depends(require_role("operator", "orchestrator", "pm")),
+    ):
+        target = await db.get_pi_session(session_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        if caller and caller.role == "orchestrator":
+            if target.role != "pm":
+                raise HTTPException(status_code=403, detail="orchestrator may only message project managers")
+        elif caller and caller.role == "pm":
+            is_own_task = target.role == "task" and target.parent_session_id == caller.id
+            is_orchestrator = target.role == "orchestrator"
+            if not is_own_task and not is_orchestrator:
+                raise HTTPException(
+                    status_code=403,
+                    detail="project manager may only message its own tasks or the orchestrator",
                 )
-                await db.enqueue_pi_session_command(command)
-                await db.insert_pi_session_event(PiSessionEvent(
-                    session_id=target.id,
-                    event_type="prompt-queued",
-                    payload={
-                        "command_id": command.id,
-                        "deliver_as": "steer",
-                        "router_request_id": route_request.id,
-                    },
-                    created_at=now,
-                ))
-                route_request.selected_session_id = target.id
-                route_request.command_id = command.id
-                route_request.status = "dispatched"
-
-        route_request.completed_at = int(datetime.now(timezone.utc).timestamp())
-        await db.update_pi_router_request(route_request)
-        return route_request.model_dump(mode="json")
-
-    @app.get("/api/v1/pi/router/requests/{request_id}")
-    async def pi_router_request_get(request_id: str):
-        request = await db.get_pi_router_request(request_id)
-        if not request:
-            raise HTTPException(status_code=404, detail="router request not found")
-        return request.model_dump(mode="json")
+            if is_own_task and (
+                not caller.meta.get("project")
+                or target.meta.get("project") != caller.meta.get("project")
+            ):
+                raise HTTPException(status_code=403, detail="cross-project target")
+        if target.role == "pm":
+            async with app.state.orchestrator.pm_session(target.meta["project"]) as manager:
+                command = await enqueue_prompt(
+                    manager, payload.message, deliver_as="steer", caller=caller,
+                )
+        else:
+            command = await enqueue_prompt(
+                target, payload.message, deliver_as="steer", caller=caller,
+            )
+        return {"command_id": command.id, "queued": True}
 
     @app.post("/api/v1/pi/sessions/{session_id}:interrupt")
-    async def pi_session_interrupt(session_id: str):
-        session = await db.get_pi_session(session_id)
+    async def pi_session_interrupt(
+        session_id: str,
+        caller: PiSession | None = Depends(require_role("operator", "orchestrator", "pm")),
+    ):
+        target = await db.get_pi_session(session_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        if caller and caller.role == "orchestrator" and target.role != "pm":
+            raise HTTPException(
+                status_code=403,
+                detail="orchestrator may only interrupt project managers",
+            )
+        if caller and caller.role == "pm":
+            if target.role != "task" or target.parent_session_id != caller.id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="project manager may only interrupt its own tasks",
+                )
+            if not caller.meta.get("project") or target.meta.get("project") != caller.meta.get("project"):
+                raise HTTPException(status_code=403, detail="cross-project target")
         if (
-            not session
-            or session.session_type != PiSessionType.INTERACTIVE
-            or not session.bridge_incarnation
-            or session.state not in {PiSessionState.WORKING, PiSessionState.IDLE}
+            not target.session_type.bridge_backed
+            or not target.bridge_incarnation
+            or target.state not in {PiSessionState.WORKING, PiSessionState.IDLE, PiSessionState.BLOCKED}
         ):
             raise HTTPException(status_code=409, detail="interactive Pi bridge is not active")
         now = int(datetime.now(timezone.utc).timestamp())
-        command = PiSessionCommand(session_id=session.id, kind="interrupt", created_at=now)
+        command = PiSessionCommand(
+            session_id=target.id,
+            kind="interrupt",
+            created_at=now,
+        )
         await db.enqueue_pi_session_command(command)
         await db.insert_pi_session_event(PiSessionEvent(
-            session_id=session.id,
+            session_id=target.id,
             event_type="interrupt-queued",
-            payload={"command_id": command.id},
+            payload={
+                "command_id": command.id,
+                "sender_session_id": caller.id if caller else "",
+            },
             created_at=now,
         ))
         return {"command_id": command.id, "queued": True}
 
-    @app.get("/api/v1/pi/sessions/{session_id}")
-    async def pi_session_get(session_id: str):
-        session = await db.get_pi_session(session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Pi session not found")
+    @app.post("/api/v1/pi/sessions/{session_id}:configure")
+    async def pi_session_configure(
+        session_id: str,
+        payload: PiConfigureRequest,
+        _caller: PiSession | None = Depends(require_role("operator")),
+    ):
+        target = await db.get_pi_session(session_id)
+        if (
+            target is None
+            or not target.session_type.bridge_backed
+            or not target.bridge_incarnation
+            or target.state not in {PiSessionState.WORKING, PiSessionState.IDLE, PiSessionState.BLOCKED}
+        ):
+            raise HTTPException(status_code=409, detail="interactive Pi bridge is not active")
+        if bool(payload.provider) != bool(payload.model):
+            raise HTTPException(status_code=422, detail="provider and model must be set together")
+        if not payload.provider and not payload.thinking_level:
+            raise HTTPException(status_code=422, detail="model or thinking_level is required")
+        for value, label in ((payload.provider, "provider"), (payload.model, "model")):
+            if value and (len(value) > 256 or not value.strip()):
+                raise HTTPException(status_code=422, detail=f"invalid {label}")
+        command_payload = {
+            **(
+                {
+                    "provider": payload.provider.strip(),
+                    "model": payload.model.strip(),
+                }
+                if payload.provider and payload.model
+                else {}
+            ),
+            **(
+                {"thinking_level": payload.thinking_level}
+                if payload.thinking_level
+                else {}
+            ),
+        }
+        now = int(datetime.now(timezone.utc).timestamp())
+        command = PiSessionCommand(
+            session_id=target.id,
+            kind="configure",
+            payload=command_payload,
+            created_at=now,
+        )
+        await db.enqueue_pi_session_command(command)
+        await db.insert_pi_session_event(PiSessionEvent(
+            session_id=target.id,
+            event_type="configure-queued",
+            payload={"command_id": command.id, **command_payload},
+            created_at=now,
+        ))
+        return {"command_id": command.id, "queued": True}
+
+    @app.post("/api/v1/pi/sessions/{session_id}:ask-pm")
+    async def pi_session_ask_pm(
+        session_id: str,
+        payload: PiQuestionRequest,
+        caller: PiSession = Depends(require_role("task")),
+    ):
+        if caller.id != session_id:
+            raise HTTPException(status_code=403, detail="task may only block its own session")
+        parent = await db.get_pi_session(caller.parent_session_id or "")
+        if parent is None or parent.role != "pm":
+            raise HTTPException(status_code=403, detail="task has no project manager")
+        if not caller.meta.get("project") or parent.meta.get("project") != caller.meta.get("project"):
+            raise HTTPException(status_code=403, detail="cross-project parent")
+        question = payload.question.strip()
+        if not question:
+            raise HTTPException(status_code=422, detail="question must not be empty")
+        try:
+            await db.set_pi_session_blocked(caller.id, question)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        command = await enqueue_prompt(
+            parent,
+            f"Task {caller.id} asks: {question}",
+            deliver_as="followUp",
+            caller=caller,
+        )
+        return {"command_id": command.id, "state": PiSessionState.BLOCKED.value}
+
+    @app.post("/api/v1/pi/sessions/{session_id}:notify-pm")
+    async def pi_session_notify_pm(
+        session_id: str,
+        payload: PiNoteRequest,
+        caller: PiSession = Depends(require_role("task")),
+    ):
+        if caller.id != session_id:
+            raise HTTPException(status_code=403, detail="task may only notify from its own session")
+        parent = await db.get_pi_session(caller.parent_session_id or "")
+        if parent is None or parent.role != "pm":
+            raise HTTPException(status_code=403, detail="task has no project manager")
+        if not caller.meta.get("project") or parent.meta.get("project") != caller.meta.get("project"):
+            raise HTTPException(status_code=403, detail="cross-project parent")
+        note = payload.note.strip()
+        if not note:
+            raise HTTPException(status_code=422, detail="note must not be empty")
+        command = await enqueue_prompt(
+            parent,
+            f"Task {caller.id} reports: {note}",
+            deliver_as="followUp",
+            caller=caller,
+        )
+        return {"command_id": command.id, "queued": True}
+
+    @app.get("/api/v1/pi/projects")
+    async def pi_projects_list(
+        _caller: PiSession | None = Depends(require_role("operator", "orchestrator")),
+    ):
+        return [
+            {
+                "name": project.name,
+                "machine": project.machine,
+                "repo": project.repo,
+                "remote": project.remote,
+                "base_branch": project.base_branch,
+            }
+            for project in app.state.projects.values()
+        ]
+
+    @app.post("/api/v1/pi/projects/{project}:send")
+    async def pi_project_send(
+        project: str,
+        payload: PiMessageRequest,
+        caller: PiSession | None = Depends(require_role("operator", "orchestrator")),
+    ):
+        if project not in app.state.projects:
+            raise HTTPException(status_code=404, detail="project not found")
+        try:
+            async with app.state.orchestrator.pm_session(project) as manager:
+                command = await enqueue_prompt(
+                    manager, payload.message, deliver_as="steer", caller=caller,
+                )
+        except Exception as exc:
+            log.error("Could not launch project manager for %s: %s", project, exc)
+            raise HTTPException(
+                status_code=503,
+                detail=f"could not launch project manager for {project}: {exc}",
+            ) from exc
+        return {
+            "session": manager.model_dump(mode="json"),
+            "command_id": command.id,
+            "queued": True,
+        }
+
+    @app.post("/api/v1/pi/projects/{project}/tasks", status_code=201)
+    async def pi_project_task_create(
+        project: str,
+        payload: PiTaskLaunchRequest,
+        caller: PiSession = Depends(require_role("pm")),
+    ):
+        if caller.meta.get("project") != project:
+            raise HTTPException(status_code=403, detail="cross-project task launch")
+        project_config = app.state.projects.get(project)
+        if project_config is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        branch = payload.branch.strip()
+        briefing = payload.briefing.strip()
+        if not branch or not briefing:
+            raise HTTPException(status_code=422, detail="branch and briefing must not be empty")
+        session = await app.state.orchestrator.launch_task(
+            project_config,
+            branch=branch,
+            briefing=briefing,
+            parent_session_id=caller.id,
+        )
         return session.model_dump(mode="json")
 
-    def build_pi_attach_info(session: PiSession, worker=None) -> dict[str, Any]:
-        if session.state not in {PiSessionState.WORKING, PiSessionState.IDLE}:
+    def own_task(caller: PiSession, task: PiSession) -> None:
+        if task.role != "task" or task.parent_session_id != caller.id:
+            raise HTTPException(status_code=403, detail="project manager does not own task")
+        if not caller.meta.get("project") or task.meta.get("project") != caller.meta.get("project"):
+            raise HTTPException(status_code=403, detail="cross-project task")
+
+    @app.post("/api/v1/pi/sessions/{session_id}:teardown")
+    async def pi_session_teardown(
+        session_id: str,
+        payload: PiTeardownRequest,
+        caller: PiSession = Depends(require_role("pm")),
+    ):
+        task = await db.get_pi_session(session_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        own_task(caller, task)
+        try:
+            await app.state.orchestrator.teardown_task(task, force=payload.force)
+        except WorktreeError as exc:
+            # A refusal is a policy answer the PM must read, not a server fault:
+            # tearing down a worktree with unpushed commits destroys the work.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"session_id": task.id, "torn_down": True}
+
+    @app.post("/api/v1/pi/sessions/{session_id}:submit-pr")
+    async def pi_session_submit_pr(
+        session_id: str,
+        payload: PiSubmitPrRequest,
+        caller: PiSession = Depends(require_role("pm")),
+    ):
+        task = await db.get_pi_session(session_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        own_task(caller, task)
+        project_name = str(task.meta.get("project") or "")
+        project = app.state.projects.get(project_name)
+        machine_name = str(task.meta.get("machine") or (project.machine if project else ""))
+        machine = app.state.machines.get(machine_name)
+        if project is None or machine is None:
+            raise HTTPException(status_code=409, detail="task launch metadata is incomplete")
+        try:
+            url = await open_pr(
+                machine,
+                project,
+                branch=str(task.meta.get("branch") or ""),
+                worktree=str(task.meta.get("worktree") or ""),
+                summary=payload.summary,
+                session_id=task.id,
+            )
+        except PrRejected as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": str(exc), "missing": exc.missing},
+            ) from exc
+        await db.update_pi_session_meta(task.id, {"pr_url": url})
+        return {"session_id": task.id, "pr_url": url}
+
+    async def readable_session(
+        session_id: str,
+        caller: PiSession | None = Depends(require_role("operator", "orchestrator", "pm", "task")),
+    ) -> PiSession:
+        session = await db.get_pi_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Pi session not found")
+        if caller and caller.role == "task" and session.id != caller.id:
+            raise HTTPException(status_code=403, detail="task may only read its own session")
+        if caller and caller.role == "pm" and session.id != caller.id and session.role != "orchestrator":
+            own_task(caller, session)
+        return session
+
+    @app.get("/api/v1/pi/sessions/{session_id}")
+    async def pi_session_get(session: PiSession = Depends(readable_session)):
+        return session.model_dump(mode="json")
+
+    def build_pi_attach_info(session: PiSession) -> dict[str, Any]:
+        if session.state not in {PiSessionState.WORKING, PiSessionState.IDLE, PiSessionState.BLOCKED}:
             return {
                 "session_id": session.id,
                 "attachable": False,
                 "reason": f"Session is {session.state.value}",
             }
-        if session.session_type == PiSessionType.INTERACTIVE:
-            if not session.terminal_attachable or not session.terminal_host or not session.terminal_port:
-                return {
-                    "session_id": session.id,
-                    "attachable": False,
-                    "reason": "Interactive session is not running inside tmux or its host relay is unavailable",
-                }
-            direct_url = (
-                f"ws://{session.terminal_host}:{session.terminal_port}"
-                f"/v1/sessions/{quote(session.id, safe='')}/attach"
-            )
-            return {
-                "session_id": session.id,
-                "attachable": True,
-                "transport": "direct-interactive-websocket",
-                "protocol_version": session.terminal_protocol_version,
-                "websocket_url": direct_url,
-                "direct_websocket_url": direct_url,
-            }
-        if session.session_type != PiSessionType.DELEGATED or not session.worker_id:
-            return {"session_id": session.id, "attachable": False, "reason": "Session has no terminal transport"}
-        if not worker:
-            return {"session_id": session.id, "attachable": False, "reason": "Worker not found"}
-        if worker.status != WorkerStatus.ONLINE:
+        if not session.session_type.bridge_backed:
             return {
                 "session_id": session.id,
                 "attachable": False,
-                "reason": f"Worker is {worker.status.value}",
+                "reason": "Session has no terminal transport",
             }
-        if not worker.pi_relay_available or not worker.pi_relay_port:
+        if not session.terminal_attachable or not session.terminal_host or not session.terminal_port:
             return {
                 "session_id": session.id,
                 "attachable": False,
-                "reason": "Worker does not advertise a Pi relay",
+                "reason": "Interactive session host relay is unavailable",
             }
         direct_url = (
-            f"ws://{worker.worker_ip}:{worker.pi_relay_port}"
+            f"ws://{session.terminal_host}:{session.terminal_port}"
             f"/v1/sessions/{quote(session.id, safe='')}/attach"
         )
         return {
             "session_id": session.id,
             "attachable": True,
-            "transport": "direct-worker-websocket",
-            "protocol_version": worker.pi_relay_protocol_version,
+            "transport": "direct-interactive-websocket",
+            "protocol_version": session.terminal_protocol_version,
             "websocket_url": direct_url,
             "direct_websocket_url": direct_url,
         }
 
     def attach_info_with_gateway(
         session: PiSession,
-        worker,
         request: Request,
     ) -> dict[str, Any]:
-        info = build_pi_attach_info(session, worker)
+        info = build_pi_attach_info(session)
         if info.get("attachable"):
             forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
             scheme = "wss" if (forwarded_proto or request.url.scheme) == "https" else "ws"
@@ -1072,20 +1228,24 @@ def create_app(db: Database, router_client=None) -> FastAPI:
         session = await db.get_pi_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Pi session not found")
-        worker = await db.get_worker(session.worker_id) if session.worker_id else None
-        return build_pi_attach_info(session, worker)
+        return build_pi_attach_info(session)
 
     @app.get("/api/v1/pi/sessions/{session_id}/attach-info")
-    async def pi_session_attach_info(session_id: str, request: Request):
-        session = await db.get_pi_session(session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Pi session not found")
-        worker = await db.get_worker(session.worker_id) if session.worker_id else None
-        return attach_info_with_gateway(session, worker, request)
+    async def pi_session_attach_info(
+        session_id: str, request: Request,
+        _caller: PiSession | None = Depends(require_role("operator")),
+        session: PiSession = Depends(readable_session),
+    ):
+        return attach_info_with_gateway(session, request)
 
     @app.websocket("/api/v1/pi/sessions/{session_id}/attach-gateway")
     async def pi_session_attach_gateway(websocket: WebSocket, session_id: str) -> None:
         await websocket.accept()
+        try:
+            await require_role("operator")(websocket, websocket.headers.get("authorization"))
+        except HTTPException as exc:
+            await websocket.close(code=4400 + exc.status_code % 100, reason=str(exc.detail))
+            return
         try:
             info = await resolve_pi_attach_info(session_id)
         except HTTPException as exc:
@@ -1176,9 +1336,9 @@ def create_app(db: Database, router_client=None) -> FastAPI:
         session_id: str,
         after: int = Query(0, ge=0),
         limit: int = Query(500, ge=1, le=1000),
+        _session: PiSession = Depends(readable_session),
     ):
-        if not await db.get_pi_session(session_id):
-            raise HTTPException(status_code=404, detail="Pi session not found")
+        # Session ownership is checked before exposing the transcript.
         events = await db.list_pi_session_events(session_id, after=after, limit=limit)
         return [event.model_dump(mode="json") for event in events]
 
@@ -1187,9 +1347,9 @@ def create_app(db: Database, router_client=None) -> FastAPI:
         request: Request,
         session_id: str,
         after: int = Query(0, ge=0),
+        _session: PiSession = Depends(readable_session),
     ):
-        if not await db.get_pi_session(session_id):
-            raise HTTPException(status_code=404, detail="Pi session not found")
+        # Authorize before opening an indefinitely streaming response.
         last_event_id = request.headers.get("last-event-id", "")
         if last_event_id.isdigit():
             after = max(after, int(last_event_id))
@@ -1203,247 +1363,6 @@ def create_app(db: Database, router_client=None) -> FastAPI:
             },
         )
 
-    @app.post("/api/v1/pi/delegations", status_code=201)
-    async def pi_delegations_create(payload: PiDelegationCreateRequest):
-        if not payload.task.strip():
-            raise HTTPException(status_code=422, detail="task must not be empty")
-        if payload.worker_id:
-            worker = await resolve_worker(payload.worker_id)
-        else:
-            workers = await db.list_workers()
-            worker = next(
-                (item for item in workers if item.status == WorkerStatus.ONLINE and item.pi_relay_available),
-                None,
-            )
-        if not worker:
-            raise HTTPException(status_code=404, detail="no Pi-capable online worker found")
-
-        now = int(datetime.now(timezone.utc).timestamp())
-        session = PiSession(
-            worker_id=worker.id,
-            parent_session_id=payload.parent_session_id,
-            session_type=PiSessionType.DELEGATED,
-            state=PiSessionState.STARTING,
-            task=payload.task,
-            cwd=payload.cwd,
-            created_at=now,
-            updated_at=now,
-        )
-        delegation = PiDelegation(
-            worker_id=worker.id,
-            parent_session_id=payload.parent_session_id,
-            child_session_id=session.id,
-            task=payload.task,
-            state=PiSessionState.STARTING,
-            timeout_seconds=max(0, payload.timeout_seconds),
-            created_at=now,
-        )
-        await db.insert_pi_session(session)
-        await db.insert_pi_delegation(delegation)
-        await db.insert_pi_session_event(PiSessionEvent(
-            session_id=session.id, event_type="starting", payload={"worker_id": worker.id}, created_at=now
-        ))
-        try:
-            remote = await worker_relay_request(
-                worker,
-                "POST",
-                "/v1/sessions",
-                {"session_id": session.id, "parent_session_id": payload.parent_session_id, "task": payload.task,
-                 "cwd": payload.cwd or None},
-            )
-        except HTTPException as exc:
-            session.state = PiSessionState.FAILED
-            session.detail = str(exc.detail)
-            session.updated_at = int(datetime.now(timezone.utc).timestamp())
-            delegation.state = PiSessionState.FAILED
-            delegation.completed_at = session.updated_at
-            await db.update_pi_session(session)
-            await db.update_pi_delegation(delegation)
-            await db.insert_pi_session_event(PiSessionEvent(
-                session_id=session.id, event_type="failed", payload={"detail": session.detail}, created_at=session.updated_at
-            ))
-            raise
-        session.state = PiSessionState(remote["state"])
-        session.tmux_session = remote.get("tmux_session", "")
-        session.detail = remote.get("detail", "")
-        session.updated_at = remote.get("updated_at", int(datetime.now(timezone.utc).timestamp()))
-        delegation.state = session.state
-        await db.update_pi_session(session)
-        await db.update_pi_delegation(delegation)
-        await db.insert_pi_session_event(PiSessionEvent(
-            session_id=session.id, event_type=session.state.value, payload=remote, created_at=session.updated_at
-        ))
-        if payload.sync:
-            # A zero duration disables the desired-state timeout, but a sync
-            # HTTP request still needs a bounded wait.  Its 10-minute cap is
-            # reported as unsettled rather than inventing a child result.
-            wait_cap = payload.timeout_seconds if payload.timeout_seconds > 0 else 600
-            settled = await _wait_for_pi_session(session.id, wait_cap)
-            # The periodic sweeper has a deliberately coarse cadence.  A sync
-            # request owns an exact duration promise, so apply the same timeout
-            # gate before returning when its requested deadline elapsed.
-            if not settled.settled and payload.timeout_seconds > 0:
-                await sweep_expired_pi_delegations(db, worker_relay_request)
-                settled = await _read_pi_wait_result(session.id)
-            delegation = await db.get_pi_delegation(delegation.id)
-            return {
-                "delegation_id": delegation.id,
-                "child_session_id": session.id,
-                "state": settled.session.state.value if settled.session else "unknown",
-                "settled": settled.settled,
-                "session": settled.session.model_dump(mode="json") if settled.session else None,
-                "delegation": delegation.model_dump(mode="json") if delegation else None,
-                "events": [event.model_dump(mode="json") for event in settled.events],
-                "status_url": f"/api/v1/pi/delegations/{delegation.id}",
-            }
-        return {"delegation_id": delegation.id, "child_session_id": session.id, "state": session.state.value,
-                "status_url": f"/api/v1/pi/delegations/{delegation.id}"}
-
-    class _PiWaitResult:
-        def __init__(self, session, events, settled: bool):
-            self.session = session
-            self.events = events
-            self.settled = settled
-
-    async def _read_pi_wait_result(session_id: str) -> "_PiWaitResult":
-        session = await db.get_pi_session(session_id)
-        events = await db.list_pi_session_events(session_id)
-        # termination_unknown is a terminal projection but not a known child
-        # completion: surface it immediately without claiming a result.
-        settled = bool(session and session.state in {
-            PiSessionState.IDLE,
-            PiSessionState.STOPPED,
-            PiSessionState.FAILED,
-        })
-        return _PiWaitResult(session, events, settled=settled)
-
-    async def _wait_for_pi_session(session_id: str, wait_cap_seconds: int) -> "_PiWaitResult":
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + max(1, wait_cap_seconds)
-        while loop.time() < deadline:
-            result = await _read_pi_wait_result(session_id)
-            if result.settled or (
-                result.session and result.session.state == PiSessionState.TERMINATION_UNKNOWN
-            ):
-                return result
-            await asyncio.sleep(min(2, max(0.01, deadline - loop.time())))
-        return await _read_pi_wait_result(session_id)
-
-    async def _pi_delegation_sweeper() -> None:
-        while True:
-            try:
-                await sweep_expired_pi_delegations(db, worker_relay_request)
-                now = int(datetime.now(timezone.utc).timestamp())
-                await db.sweep_stale_interactive_pi_sessions(now - 90, now=now)
-            except Exception:
-                log.exception("Pi session sweeper iteration failed")
-            await asyncio.sleep(30)
-
-    app.state.pi_delegation_sweeper = _pi_delegation_sweeper
-
-    @app.get("/api/v1/pi/delegations/{delegation_id}")
-    async def pi_delegation_get(delegation_id: str):
-        delegation = await db.get_pi_delegation(delegation_id)
-        if not delegation:
-            raise HTTPException(status_code=404, detail="Pi delegation not found")
-        return delegation.model_dump(mode="json")
-
-    @app.post("/api/v1/pi/sessions/{session_id}:prompt")
-    async def pi_session_prompt(session_id: str, payload: PiPromptRequest):
-        session = await db.get_pi_session(session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Pi session not found")
-        now = int(datetime.now(timezone.utc).timestamp())
-        if session.session_type == PiSessionType.INTERACTIVE:
-            if not session.bridge_incarnation or session.state in {PiSessionState.STOPPED, PiSessionState.FAILED}:
-                raise HTTPException(status_code=409, detail="interactive Pi bridge is not active")
-            command = PiSessionCommand(
-                session_id=session.id,
-                message=payload.message,
-                deliver_as=payload.deliver_as,
-                created_at=now,
-            )
-            await db.enqueue_pi_session_command(command)
-            await db.insert_pi_session_event(PiSessionEvent(
-                session_id=session.id,
-                event_type="prompt-queued",
-                payload={"command_id": command.id, "deliver_as": payload.deliver_as},
-                created_at=now,
-            ))
-            return {**session.model_dump(mode="json"), "command_id": command.id}
-        if not session.worker_id:
-            raise HTTPException(status_code=404, detail="Pi session not found")
-        worker = await db.get_worker(session.worker_id)
-        if not worker:
-            raise HTTPException(status_code=404, detail="worker not found")
-        remote = await worker_relay_request(worker, "POST", f"/v1/sessions/{session_id}:prompt", {"message": payload.message})
-        session.state = PiSessionState(remote["state"])
-        session.detail = remote.get("detail", "")
-        session.updated_at = remote.get("updated_at", int(datetime.now(timezone.utc).timestamp()))
-        await db.update_pi_session(session)
-        await db.update_pi_delegation_state_for_session(session.id, session.state, now=session.updated_at)
-        await db.insert_pi_session_event(PiSessionEvent(
-            session_id=session.id, event_type="prompt", payload={"message": payload.message}, created_at=session.updated_at
-        ))
-        return session.model_dump(mode="json")
-
-    @app.post("/api/v1/pi/sessions/{session_id}:configure")
-    async def pi_session_configure(session_id: str, payload: PiConfigureRequest):
-        session = await db.get_pi_session(session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Pi session not found")
-        if session.session_type != PiSessionType.INTERACTIVE:
-            raise HTTPException(status_code=409, detail="model controls require an interactive Pi bridge")
-        if not session.bridge_incarnation or session.state in {PiSessionState.STOPPED, PiSessionState.FAILED}:
-            raise HTTPException(status_code=409, detail="interactive Pi bridge is not active")
-        if bool(payload.provider) != bool(payload.model):
-            raise HTTPException(status_code=422, detail="provider and model must be set together")
-        if not payload.provider and not payload.thinking_level:
-            raise HTTPException(status_code=422, detail="model or thinking_level is required")
-        for value, label in ((payload.provider, "provider"), (payload.model, "model")):
-            if value and (len(value) > 256 or not value.strip()):
-                raise HTTPException(status_code=422, detail=f"invalid {label}")
-        now = int(datetime.now(timezone.utc).timestamp())
-        command_payload = {
-            **(
-                {"provider": payload.provider.strip(), "model": payload.model.strip()}
-                if payload.provider and payload.model else {}
-            ),
-            **({"thinking_level": payload.thinking_level} if payload.thinking_level else {}),
-        }
-        command = PiSessionCommand(
-            session_id=session.id,
-            kind="configure",
-            payload=command_payload,
-            created_at=now,
-        )
-        await db.enqueue_pi_session_command(command)
-        await db.insert_pi_session_event(PiSessionEvent(
-            session_id=session.id,
-            event_type="configure-queued",
-            payload={"command_id": command.id, **command_payload},
-            created_at=now,
-        ))
-        return {"command_id": command.id, "queued": True}
-
-    @app.post("/api/v1/pi/sessions/{session_id}:cancel")
-    async def pi_session_cancel(session_id: str):
-        session = await db.get_pi_session(session_id)
-        if not session or not session.worker_id:
-            raise HTTPException(status_code=404, detail="Pi session not found")
-        worker = await db.get_worker(session.worker_id)
-        if not worker:
-            raise HTTPException(status_code=404, detail="worker not found")
-        remote = await worker_relay_request(worker, "POST", f"/v1/sessions/{session_id}:cancel")
-        session.state = PiSessionState(remote["state"])
-        session.detail = remote.get("detail", "")
-        session.updated_at = remote.get("updated_at", int(datetime.now(timezone.utc).timestamp()))
-        await db.update_pi_session(session)
-        await db.update_pi_delegation_state_for_session(session.id, session.state, now=session.updated_at)
-        await db.insert_pi_session_event(PiSessionEvent(
-            session_id=session.id, event_type="cancelled", payload=remote, created_at=session.updated_at
-        ))
-        return session.model_dump(mode="json")
 
     @app.get("/api/v1/data")
     async def data_list(include_offline: bool = False):
@@ -2110,7 +2029,3 @@ async def run_control_server(db: Database, host: str = "0.0.0.0", port: int = 12
     """Run the privileged operator/control server."""
     await _run_server(create_app(db), host, port)
 
-
-# Compatibility alias for callers that previously started the combined server.
-# It now intentionally starts registration only.
-run_heartbeat_server = run_registration_server

@@ -406,9 +406,6 @@ class MainScreen(Screen[None]):
                     worker = await self.db.get_worker(job.worker_id)
                     if worker:
                         await self.jm.stop_job(worker, job_id)
-                        # stop_job persists the terminal projection.  For a
-                        # delegated job that worker report is authoritative;
-                        # do not immediately overwrite it through SSH polling.
                         updated = await self.db.get_job(job_id) or job
                         updated = await self.jm.refresh_job_status(worker, updated)
                         ec_msg = f" (exit {updated.exit_code})" if updated.exit_code is not None else ""

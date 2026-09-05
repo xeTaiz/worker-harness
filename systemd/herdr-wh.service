@@ -1,0 +1,9 @@
+[Unit]
+Description=Herdr headless server (wh fleet)
+
+[Service]
+ExecStart=/usr/bin/herdr --session wh server
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

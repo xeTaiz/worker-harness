@@ -122,9 +122,11 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
         direct = "ws://direct/attach"
         gateway = "ws://gateway/attach"
         connections = []
+        authorization = []
 
         def fake_connect(url, **_kwargs):
             connections.append(url)
+            authorization.append(_kwargs.get("extra_headers"))
             if url.startswith(direct):
                 return FakeConnection(error=OSError("direct unavailable"))
             return FakeConnection(FakeWebSocket([
@@ -137,6 +139,7 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
                 result = await pi_terminal.attach_terminal(
                     direct,
                     fallback_websocket_url=gateway,
+                    fallback_headers={"Authorization": "Bearer operator-secret"},
                     stdin_fd=slave_fd,
                     stdout_fd=slave_fd,
                 )
@@ -144,6 +147,7 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(connections), 2)
             self.assertTrue(connections[0].startswith(direct))
             self.assertTrue(connections[1].startswith(gateway))
+            self.assertEqual(authorization, [None, {"Authorization": "Bearer operator-secret"}])
         finally:
             os.close(master_fd)
             os.close(slave_fd)
@@ -165,6 +169,35 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
             {"type": "resize", "rows": 40, "cols": 120},
         ])
 
+    async def test_backend_ready_reapplies_unchanged_terminal_size(self):
+        websocket = FakeWebSocket()
+        changed = asyncio.Event()
+        backend_ready = asyncio.Event()
+        with patch.object(pi_terminal, "terminal_size", return_value=(40, 120)):
+            task = asyncio.create_task(
+                pi_terminal._send_resizes(websocket, 1, changed, backend_ready)
+            )
+            for _ in range(20):
+                if websocket.sent:
+                    break
+                await asyncio.sleep(0.01)
+            backend_ready.set()
+            changed.set()
+            for _ in range(20):
+                if len(websocket.sent) >= 3:
+                    break
+                await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(
+            [json.loads(message) for message in websocket.sent],
+            [
+                {"type": "resize", "rows": 40, "cols": 120},
+                {"type": "resize", "rows": 40, "cols": 119},
+                {"type": "resize", "rows": 40, "cols": 120},
+            ],
+        )
+
     async def test_receive_output_writes_binary_and_ignores_status(self):
         read_fd, write_fd = os.pipe()
         try:
@@ -180,6 +213,16 @@ class PiTerminalAsyncTests(unittest.IsolatedAsyncioTestCase):
             os.close(read_fd)
             if write_fd >= 0:
                 os.close(write_fd)
+
+    async def test_connected_status_requests_backend_resize_refresh(self):
+        backend_ready = asyncio.Event()
+        resize_changed = asyncio.Event()
+        websocket = FakeWebSocket([
+            '{"type":"status","state":"connected","terminal":"ready"}',
+        ])
+        await pi_terminal._receive_output(websocket, 1, backend_ready, resize_changed)
+        self.assertTrue(backend_ready.is_set())
+        self.assertTrue(resize_changed.is_set())
 
     async def test_receive_output_returns_to_selector_when_replaced_at_capacity(self):
         websocket = FakeWebSocket([

@@ -1,0 +1,182 @@
+#!/bin/bash
+# Forced-command allowlist for the worker-harness service key.
+#
+# Installed on every herdr machine as ~/.local/bin/wh-remote-shim and pinned in
+# authorized_keys:
+#
+#   command="/home/<user>/.local/bin/wh-remote-shim",no-agent-forwarding,\
+#   no-port-forwarding,no-pty,no-X11-forwarding ssh-ed25519 AAAA... wh-service
+#
+# The requested command arrives in $SSH_ORIGINAL_COMMAND and is split on
+# whitespace -- never eval'd, so no command substitution, redirection, or
+# chaining can reach a shell. Arguments that must contain whitespace (herdr
+# pane payloads, display names) are passed as a single `b64:<base64>` token.
+#
+# Anything not in the verb table below exits 2 without executing.
+set -euf -o pipefail
+umask 077
+
+readonly cache_root="$HOME/.cache/worker-harness"
+readonly herdr_session="wh"
+
+# A forced command runs without a login shell, so ~/.local/bin is absent on
+# machines that install herdr or gh there.
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+
+refuse() {
+    printf 'wh-remote-shim: refused%s%s\n' "${1:+: }" "${1:-}" >&2
+    exit 2
+}
+
+require_argc() {
+    local want="$1" got="$2"
+    (( want == got )) || refuse "expected $want argument(s), got $got"
+}
+
+# Check both the operand and its resolved destination. Prefix-only checks allow
+# cache/./ to name the entire cache and symlinks to escape the allowed tree.
+require_beneath() {
+    local path="$1" root="$2" resolved
+    [[ "$path" != *..* ]] || refuse "path traversal in argument"
+    case "$path" in
+        "$root"/*) ;;
+        *) refuse "path outside $root: $path" ;;
+    esac
+    resolved="$(realpath -m -- "$path")" || refuse "cannot resolve path: $path"
+    case "$resolved" in
+        "$root"/*) ;;
+        *) refuse "resolved path outside $root: $path" ;;
+    esac
+}
+
+require_home_path() {
+    require_beneath "$1" "$home_root"
+}
+
+require_cache_path() {
+    require_beneath "$1" "$cache_root"
+}
+
+require_pattern() {
+    local value="$1" pattern="$2" label="$3"
+    [[ "$value" =~ $pattern ]] || refuse "invalid $label: $value"
+}
+
+require_ref() {
+    require_pattern "$1" '^[A-Za-z0-9_][A-Za-z0-9._/-]*$' "$2"
+    [[ "$1" != *..* ]] || refuse "invalid $2: $1"
+}
+
+# `b64:<payload>` decodes to exactly one argument; every other token is literal.
+decode_args() {
+    local token value
+    decoded=()
+    for token in "$@"; do
+        case "$token" in
+            b64:*)
+                # The sentinel prevents command substitution stripping trailing
+                # newlines. Round-trip validation also rejects NUL (which Bash
+                # cannot represent) and malformed/noncanonical base64.
+                value="$(printf '%s' "${token#b64:}" | base64 -d && printf '.')" \
+                    || refuse "invalid base64 argument"
+                value="${value%.}"
+                [[ "$(printf '%s' "$value" | base64 -w0)" == "${token#b64:}" ]] \
+                    || refuse "invalid base64 argument"
+                decoded+=( "$value" )
+                ;;
+            *) decoded+=( "$token" ) ;;
+        esac
+    done
+}
+
+original="${SSH_ORIGINAL_COMMAND-}"
+[[ -n "$original" ]] || refuse "no command"
+[[ "$original" != *$'\n'* && "$original" != *$'\r'* ]] || refuse "multiline command"
+home_root="$(realpath -e -- "$HOME")" || refuse "cannot resolve HOME"
+readonly home_root
+
+# Word-split without globbing (set -f above) and without evaluation.
+read -r -a argv <<< "$original"
+(( ${#argv[@]} > 0 )) || refuse "empty command"
+
+verb="${argv[0]}"
+decode_args "${argv[@]:1}"
+set -- "${decoded[@]}"
+
+case "$verb" in
+herdr)
+    (( $# > 0 )) || refuse "herdr needs a subcommand"
+    exec herdr --session "$herdr_session" "$@"
+    ;;
+
+herdr-up)
+    require_argc 0 $#
+    exec systemctl --user start herdr-wh
+    ;;
+
+worktree-add)
+    require_argc 4 $#
+    require_home_path "$1"
+    require_cache_path "$4"
+    require_ref "$2" 'branch'
+    require_ref "$3" 'base ref'
+    mkdir -p -- "$(dirname -- "$4")"
+    exec git -C "$1" worktree add -b "$2" -- "$4" "$3"
+    ;;
+
+worktree-remove)
+    require_argc 2 $#
+    require_home_path "$1"
+    require_cache_path "$2"
+    exec git -C "$1" worktree remove --force -- "$2"
+    ;;
+
+branch-delete)
+    require_argc 2 $#
+    require_home_path "$1"
+    require_ref "$2" 'branch'
+    exec git -C "$1" branch -D -- "$2"
+    ;;
+
+push)
+    require_argc 2 $#
+    require_home_path "$1"
+    require_ref "$2" 'branch'
+    exec git -C "$1" push -u -- origin "$2"
+    ;;
+
+pr-create)
+    require_argc 5 $#
+    require_pattern "$1" '^[A-Za-z0-9_][A-Za-z0-9._-]*/[A-Za-z0-9_][A-Za-z0-9._-]*$' 'repo slug'
+    require_ref "$2" 'branch'
+    require_ref "$3" 'base ref'
+    require_cache_path "$4"
+    require_cache_path "$5"
+    exec gh pr create --repo "$1" --head "$2" --base "$3" \
+        --title "$(cat -- "$4")" --body-file "$5"
+    ;;
+
+tail)
+    require_argc 2 $#
+    require_home_path "$1"
+    require_pattern "$2" '^[0-9]+$' 'offset'
+    exec tail -c "+$2" -- "$1"
+    ;;
+
+write-file)
+    require_argc 1 $#
+    require_cache_path "$1"
+    mkdir -p -- "$(dirname -- "$1")"
+    exec cat > "$1"
+    ;;
+
+rm-file)
+    require_argc 1 $#
+    require_cache_path "$1"
+    exec rm -rf -- "$1"
+    ;;
+
+*)
+    refuse "unknown verb: $verb"
+    ;;
+esac

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from .machines import Machine
 from .models import Worker
 
 log = logging.getLogger("ssh-client")
@@ -189,21 +190,19 @@ def _tmux_env(worker: Worker) -> str:
 # ── Core executor: lane + kill-on-exit + metrics ───────────────────────
 
 
-async def _exec_ssh(
-    worker: Worker,
+async def _exec_ssh_bytes(
+    lane_key: str,
     args: Sequence[str],
     *,
     lane_timeout: float = 10.0,
     cmd_timeout: float = 30.0,
     op_name: str = "ssh",
     input_data: bytes | None = None,
-) -> SSHResult:
-    """Run an ssh subprocess inside the per-worker lane with hard kill
-    on cancel / timeout / exception.
+) -> tuple[bytes, SSHResult]:
+    """Run an SSH subprocess without decoding stdout.
 
-    Returns SSHResult. Never raises TimeoutError — returns SSHResult with
-    returncode=-1 and a stderr message instead, so callers don't have to
-    distinguish "subprocess timed out" from "subprocess exited with code X".
+    Returns raw stdout and result metadata (whose stdout is empty). Command
+    timeouts return code -1; lane admission failures retain their own exception.
 
     Propagates CancelledError to the caller (the FastAPI handler will turn
     that into 499 / 503 as appropriate).
@@ -212,7 +211,7 @@ async def _exec_ssh(
     metrics = get_metrics()
 
     started = time.monotonic()
-    async with _lanes_or_default().acquire(worker.id, timeout=lane_timeout):
+    async with _lanes_or_default().acquire(lane_key, timeout=lane_timeout):
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
@@ -223,7 +222,7 @@ async def _exec_ssh(
             )
         except FileNotFoundError:
             metrics.observe_ssh(op_name, (time.monotonic() - started) * 1000)
-            return SSHResult(stdout="", stderr="ssh command not found", returncode=127)
+            return b"", SSHResult(stdout="", stderr="ssh command not found", returncode=127)
 
         try:
             try:
@@ -235,7 +234,7 @@ async def _exec_ssh(
                 # Kill the complete process group, including wrapper children.
                 await _terminate_async_process(proc)
                 metrics.observe_ssh(op_name, (time.monotonic() - started) * 1000)
-                return SSHResult(
+                return b"", SSHResult(
                     stdout="",
                     stderr=f"Command timed out after {cmd_timeout}s",
                     returncode=-1,
@@ -247,8 +246,8 @@ async def _exec_ssh(
                 raise
             else:
                 metrics.observe_ssh(op_name, (time.monotonic() - started) * 1000)
-                return SSHResult(
-                    stdout=(stdout_b or b"").decode(errors="replace"),
+                return stdout_b or b"", SSHResult(
+                    stdout="",
                     stderr=(stderr_b or b"").decode(errors="replace"),
                     returncode=proc.returncode or 0,
                 )
@@ -260,6 +259,24 @@ async def _exec_ssh(
                 await _terminate_async_process(proc)
 
 
+async def _exec_ssh(
+    lane_key: str,
+    args: Sequence[str],
+    *,
+    lane_timeout: float = 10.0,
+    cmd_timeout: float = 30.0,
+    op_name: str = "ssh",
+    input_data: bytes | None = None,
+) -> SSHResult:
+    """Text adapter retaining replacement decoding for existing SSH callers."""
+    stdout, result = await _exec_ssh_bytes(
+        lane_key, args, lane_timeout=lane_timeout, cmd_timeout=cmd_timeout,
+        op_name=op_name, input_data=input_data,
+    )
+    result.stdout = stdout.decode(errors="replace")
+    return result
+
+
 # ── Public SSH calls ───────────────────────────────────────────────────
 
 
@@ -267,7 +284,7 @@ async def async_ssh_run(worker: Worker, command: str, *, timeout: int = 30) -> S
     """Run `command` over ssh on the worker, return result."""
     args = _ssh_base_args(worker) + [command]
     return await _exec_ssh(
-        worker, args,
+        worker.id, args,
         lane_timeout=min(10.0, max(1.0, timeout / 3)),
         cmd_timeout=float(timeout),
         op_name="async_ssh_run",
@@ -278,10 +295,70 @@ async def async_ssh_run_pty(worker: Worker, command: str, *, timeout: int = 60) 
     """Run `command` over ssh with a pseudo-tty."""
     args = _ssh_base_args(worker) + ["-tt", command]
     return await _exec_ssh(
-        worker, args,
+        worker.id, args,
         lane_timeout=min(10.0, max(1.0, timeout / 3)),
         cmd_timeout=float(timeout),
         op_name="async_ssh_run_pty",
+    )
+
+
+# ── Herdr machines (forced-command shim over plain OpenSSH) ────────────
+
+
+def _machine_base_args(machine: Machine) -> list[str]:
+    # Plain OpenSSH with the dedicated service key: the shim is bound to that
+    # key's authorized_keys entry, so `tailscale ssh` (which authenticates by
+    # tailnet identity, not key) would bypass the allowlist entirely.
+    return [
+        "ssh",
+        "-i", machine.key_path,
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "RequestTTY=no",
+        machine.ssh_target,
+    ]
+
+
+async def async_machine_run(
+    machine: Machine,
+    command: str,
+    *,
+    timeout: float = 30.0,
+    input_data: bytes | None = None,
+) -> SSHResult:
+    """Run one allowlisted shim verb on a herdr machine.
+
+    ``command`` becomes $SSH_ORIGINAL_COMMAND verbatim; the shim word-splits it
+    and never evaluates it, so quoting here buys nothing — arguments containing
+    whitespace travel as ``b64:`` tokens instead.
+    """
+    return await _exec_ssh(
+        f"machine:{machine.name}",
+        _machine_base_args(machine) + [command],
+        lane_timeout=min(10.0, max(1.0, timeout / 3)),
+        cmd_timeout=float(timeout),
+        op_name="async_machine_run",
+        input_data=input_data,
+    )
+
+
+async def async_machine_run_bytes(
+    machine: Machine,
+    command: str,
+    *,
+    timeout: float = 30.0,
+    input_data: bytes | None = None,
+) -> tuple[bytes, SSHResult]:
+    """Run a shim verb preserving stdout bytes; metadata stdout remains empty."""
+    return await _exec_ssh_bytes(
+        f"machine:{machine.name}",
+        _machine_base_args(machine) + [command],
+        lane_timeout=min(10.0, max(1.0, timeout / 3)),
+        cmd_timeout=float(timeout),
+        op_name="async_machine_run_bytes",
+        input_data=input_data,
     )
 
 
@@ -316,7 +393,7 @@ async def ssh_tmux_new(worker: Worker, job_id: str, command: str, pty_enabled: b
     full_cmd = _build_job_command(worker, job_id, command)
     args = _ssh_base_args(worker) + [full_cmd]
     # Note: pty_enabled is informational here (jobs always run via tmux).
-    return await _exec_ssh(worker, args, lane_timeout=10.0, cmd_timeout=30.0, op_name="ssh_tmux_new")
+    return await _exec_ssh(worker.id, args, lane_timeout=10.0, cmd_timeout=30.0, op_name="ssh_tmux_new")
 
 
 async def ssh_tmux_kill(worker: Worker, job_id: str) -> SSHResult:
@@ -400,7 +477,7 @@ async def ssh_upload_bytes(worker: Worker, content: bytes, remote_path: str, *, 
     # complete shell invocation so remote paths and stdin redirection survive.
     args = _ssh_base_args(worker) + [f"sh -lc {shlex.quote(cmd)}"]
     return await _exec_ssh(
-        worker, args,
+        worker.id, args,
         lane_timeout=10.0,
         cmd_timeout=float(timeout),
         op_name="ssh_upload_bytes",

@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from worker_harness.db import Database
 from worker_harness.heartbeat import create_app, reconcile_active_ssh_jobs
 from worker_harness.job import JobManager
-from worker_harness.models import GPUInfo, Job, JobKind, JobStatus, WorkerRegistration
+from worker_harness.models import GPUInfo, Job, JobStatus, WorkerRegistration
 from worker_harness.ssh import SSHResult
 
 
@@ -53,19 +53,6 @@ class SyncJobsApiTests(unittest.TestCase):
         asyncio.run(self.db.close())
         Path(self.tmp.name).unlink(missing_ok=True)
 
-    def test_delegated_job_refresh_never_probes_ssh(self):
-        worker = asyncio.run(self.db.get_worker("w-test"))
-        job = Job(
-            id="delegated-job",
-            worker_id="w-test",
-            kind=JobKind.DELEGATED,
-            origin_session_id="child",
-            status=JobStatus.RUNNING,
-        )
-        with patch("worker_harness.job.ssh_tmux_running", new=AsyncMock(side_effect=AssertionError("must not SSH"))):
-            refreshed = asyncio.run(JobManager(self.db).refresh_job_status(worker, job))
-        self.assertIs(refreshed, job)
-        self.assertEqual(refreshed.status, JobStatus.RUNNING)
 
     def test_jobs_list_returns_cached_state_without_ssh(self):
         job = Job(id="cached-job", worker_id="w-test", status=JobStatus.RUNNING)

@@ -1,13 +1,13 @@
-"""Control API regression tests for delegated Pi session lifecycle."""
+"""Role-aware fleet session API regression tests."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import tempfile
-import threading
-import time
 import unittest
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -15,1059 +15,733 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from worker_harness.db import Database
-from worker_harness.heartbeat import (
-    _GatewayAttachment,
-    _pump_terminal_gateway,
-    _release_gateway_attachment,
-    _reserve_gateway_attachment,
-    _terminal_url_with_dimensions,
-    create_app,
-    create_registration_app,
-    stream_pi_session_events,
-    sweep_expired_pi_delegations,
-)
+from worker_harness.heartbeat import create_app
+from worker_harness.machines import Machine
 from worker_harness.models import (
-    PiBridgeRegister,
-    PiDelegation,
-    PiSession,
-    PiSessionState,
-    PiSessionType,
-    WorkerJobReport,
-    WorkerRegistration,
+    PiBridgeEventBatch, PiBridgeRegister, PiSession, PiSessionCommand,
+    PiSessionEvent, PiSessionState, PiSessionType,
 )
-
-
-class _Response:
-    def __init__(self, payload: dict):
-        self.status_code = 200
-        self._payload = payload
-        self.text = ""
-
-    def json(self):
-        return self._payload
-
-
-class _RelayClient:
-    calls: list[tuple[str, str, dict | None]] = []
-
-    def __init__(self, **_kwargs):
-        pass
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return False
-
-    async def request(self, method: str, url: str, json=None):
-        self.calls.append((method, url, json))
-        session_id = (json or {}).get("session_id", "child")
-        if url.endswith(":cancel"):
-            state, detail = "stopped", "cancelled"
-        elif url.endswith(":prompt"):
-            state, detail = "working", "prompt delivered"
-        else:
-            state, detail = "working", "Pi process started"
-        return _Response(
-            {
-                "session_id": session_id,
-                "state": state,
-                "tmux_session": "wh_pi_child",
-                "detail": detail,
-                "updated_at": 123,
-            }
-        )
+from worker_harness.pr import PrRejected
+from worker_harness.projects import Project
 
 
 class PiSessionsApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
-        self.tmp.close()
-        self.db = Database(self.tmp.name)
+        operator_env = patch.dict(os.environ, {"WH_OPERATOR_TOKEN": "o" * 43})
+        operator_env.start()
+        self.addCleanup(operator_env.stop)
+        temporary = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+        temporary.close()
+        self.path = Path(temporary.name)
+        self.db = Database(self.path)
         asyncio.run(self.db.connect())
-        asyncio.run(
-            self.db.upsert_worker(
-                WorkerRegistration(
-                    worker_id="archdome",
-                    name="archdome",
-                    worker_ip="100.64.0.89",
-                    pi_relay_port=27888,
-                    pi_relay_available=True,
-                    pi_relay_protocol_version=2,
-                )
-            )
-        )
+        self.sessions = {
+            "orchestrator": self._insert("orchestrator", "orchestrator", "orch-token"),
+            "pm-one": self._insert("pm-one", "pm", "pm-one-token", project="one"),
+            "pm-two": self._insert("pm-two", "pm", "pm-two-token", project="two"),
+            "task-one": self._insert(
+                "task-one", "task", "task-one-token", project="one", parent="pm-one"
+            ),
+            "task-two": self._insert(
+                "task-two", "task", "task-two-token", project="two", parent="pm-two"
+            ),
+        }
         self.app = create_app(self.db)
+        self.app.state.projects = {
+            "one": Project("one", "desktop", "/home/user/one", "owner/one"),
+            "two": Project("two", "desktop", "/home/user/two", "owner/two"),
+        }
+        self.app.state.machines = {
+            "desktop": Machine("desktop", "user@desktop", "/home/user")
+        }
+        self.app.state.orchestrator = AsyncMock()
+        @asynccontextmanager
+        async def manager_session(project):
+            yield self.sessions[f"pm-{project}"]
+        self.app.state.orchestrator.pm_session = manager_session
+
+    def client(self) -> TestClient:
+        return TestClient(self.app, headers=self.auth("o" * 43))
 
     def tearDown(self) -> None:
         asyncio.run(self.db.close())
-        Path(self.tmp.name).unlink(missing_ok=True)
+        self.path.unlink(missing_ok=True)
 
-    def test_explicit_local_web_dir_is_served_by_control_app(self):
-        web_dir = Path(__file__).resolve().parents[1] / "web"
-        with patch.dict(os.environ, {"WH_WEB_DIR": str(web_dir)}):
-            app = create_app(self.db)
-        with TestClient(app) as client:
-            page = client.get("/")
-            manifest = client.get("/manifest.webmanifest")
-            script = client.get("/app.js")
-            marked = client.get("/vendor/marked/marked.umd.js")
-            katex_css = client.get("/vendor/katex/katex.min.css")
-        self.assertEqual(page.status_code, 200)
-        self.assertIn("Pi sessions", page.text)
-        self.assertIn('id="global-button"', page.text)
-        self.assertIn('id="global-router-view"', page.text)
-        self.assertEqual(manifest.status_code, 200)
-        self.assertEqual(manifest.json()["display"], "standalone")
-        self.assertIn("EventSource", script.text)
-        self.assertNotIn("new WebSocket", script.text)
-        self.assertNotIn("attach-info", script.text)
-        self.assertIn("agentSidebar", script.text)
-        self.assertIn("setSidebarOpen", script.text)
-        self.assertIn("renderWorkGroup", script.text)
-        self.assertIn("isAgentWork", script.text)
-        self.assertIn('/api/v1/pi/router/snapshot', script.text)
-        self.assertIn('/api/v1/pi/router/models', script.text)
-        self.assertIn('/api/v1/pi/router/config', script.text)
-        self.assertIn('/api/v1/pi/router:dispatch', script.text)
-        self.assertIn(':interrupt', script.text)
-        self.assertIn('`${model.provider}::${model.id}`', script.text)
-        self.assertIn('target_session_id: globalTarget.value || null', script.text)
-        self.assertIn('closeGlobalSources()', script.text)
-        self.assertNotIn("idle-timeout", script.text)
-        self.assertIn("DOMPurify", script.text)
-        self.assertIn("renderMathInElement", script.text)
-        self.assertEqual(marked.status_code, 200)
-        self.assertEqual(katex_css.status_code, 200)
-
-    def test_interactive_bridge_register_events_prompt_and_ack(self):
-        session_id = "plain-pi-session"
-        first_incarnation = "incarnation-1"
-        with TestClient(self.app) as client:
-            registered = client.post("/api/v1/pi/bridge/register", json={
-                "session_id": session_id,
-                "incarnation": first_incarnation,
-                "cwd": "/home/dome/project",
-                "name": "project-agent",
-                "host": "archdome",
-                "agent": "omp",
-            })
-            self.assertEqual(registered.status_code, 200, registered.text)
-            self.assertEqual(registered.json()["session_type"], "interactive")
-            self.assertEqual(registered.json()["state"], "idle")
-            self.assertEqual(registered.json()["agent"], "omp")
-
-            event_payload = {
-                "incarnation": first_incarnation,
-                "state": "working",
-                "events": [{"id": "interactive-start", "event_type": "agent-start"}],
-            }
-            first = client.post(f"/api/v1/pi/bridge/{session_id}/events", json=event_payload)
-            replay = client.post(f"/api/v1/pi/bridge/{session_id}/events", json=event_payload)
-            self.assertEqual(first.json()["events_persisted"], 1)
-            self.assertEqual(replay.json()["events_persisted"], 0)
-
-            prompted = client.post(
-                f"/api/v1/pi/sessions/{session_id}:prompt",
-                json={"message": "continue here", "deliver_as": "steer"},
-            )
-            self.assertEqual(prompted.status_code, 200, prompted.text)
-            command_id = prompted.json()["command_id"]
-            commands = client.get(
-                f"/api/v1/pi/bridge/{session_id}/commands",
-                params={"incarnation": first_incarnation, "wait_seconds": 0},
-            )
-            self.assertEqual(commands.status_code, 200, commands.text)
-            self.assertEqual(commands.json()[0]["id"], command_id)
-            self.assertEqual(commands.json()[0]["deliver_as"], "steer")
-            ack = client.post(
-                f"/api/v1/pi/bridge/{session_id}/commands/{command_id}:ack",
-                json={"incarnation": first_incarnation},
-            )
-            self.assertEqual(ack.status_code, 200, ack.text)
-            empty = client.get(
-                f"/api/v1/pi/bridge/{session_id}/commands",
-                params={"incarnation": first_incarnation, "wait_seconds": 0},
-            )
-            self.assertEqual(empty.json(), [])
-
-            replayed = client.get(
-                f"/api/v1/pi/sessions/{session_id}/events",
-                params={"after": 1, "limit": 10},
-            )
-            self.assertEqual([event["sequence"] for event in replayed.json()], [2, 3])
-
-            configured = client.post(
-                f"/api/v1/pi/sessions/{session_id}:configure",
-                json={"provider": "openai-codex", "model": "gpt-5.6-luna", "thinking_level": "high"},
-            )
-            self.assertEqual(configured.status_code, 200, configured.text)
-            control_commands = client.get(
-                f"/api/v1/pi/bridge/{session_id}/commands",
-                params={"incarnation": first_incarnation, "wait_seconds": 0},
-            ).json()
-            self.assertEqual(control_commands[0]["kind"], "configure")
-            self.assertEqual(control_commands[0]["message"], "")
-            self.assertEqual(control_commands[0]["payload"], {
-                "provider": "openai-codex", "model": "gpt-5.6-luna", "thinking_level": "high",
-            })
-
-        session = asyncio.run(self.db.get_pi_session(session_id))
-        self.assertEqual(session.state, PiSessionState.WORKING)
-        events = asyncio.run(self.db.list_pi_session_events(session_id))
-        self.assertEqual(
-            [event.event_type for event in events],
-            ["bridge-registered", "agent-start", "prompt-queued", "configure-queued"],
-        )
-        self.assertEqual([event.sequence for event in events], [1, 2, 3, 4])
-
-    def test_interactive_registration_backfills_latest_exchange_once(self):
-        session_id = "history-session"
-        initial_events = [
-            {
-                "id": "history-user-start",
-                "event_type": "message-start",
-                "payload": {"message_id": "user:100:message", "role": "user", "timestamp": 100},
-                "created_at": 1,
-            },
-            {
-                "id": "history-user-end",
-                "event_type": "message-end",
-                "payload": {
-                    "message_id": "user:100:message",
-                    "message": {"role": "user", "timestamp": 100, "content": [{"type": "text", "text": "question"}]},
-                },
-                "created_at": 1,
-            },
-            {
-                "id": "history-assistant-start",
-                "event_type": "message-start",
-                "payload": {"message_id": "assistant:200:message", "role": "assistant", "timestamp": 200},
-                "created_at": 2,
-            },
-            {
-                "id": "history-assistant-end",
-                "event_type": "message-end",
-                "payload": {
-                    "message_id": "assistant:200:message",
-                    "message": {"role": "assistant", "timestamp": 200, "content": [{"type": "text", "text": "answer"}]},
-                },
-                "created_at": 2,
-            },
-        ]
-        with TestClient(self.app) as client:
-            first = client.post("/api/v1/pi/bridge/register", json={
-                "session_id": session_id,
-                "incarnation": "history-incarnation-1",
-                "initial_events": initial_events,
-            })
-            self.assertEqual(first.status_code, 200, first.text)
-
-            # A replacement incarnation may assign different event IDs, but
-            # stable message IDs still prevent duplicate transcript bubbles.
-            replacement_events = [
-                {**event, "id": f"replacement-{index}"}
-                for index, event in enumerate(initial_events)
-            ]
-            second = client.post("/api/v1/pi/bridge/register", json={
-                "session_id": session_id,
-                "incarnation": "history-incarnation-2",
-                "initial_events": replacement_events,
-            })
-            self.assertEqual(second.status_code, 200, second.text)
-            replayed = client.get(f"/api/v1/pi/sessions/{session_id}/events").json()
-
-        message_events = [event for event in replayed if event["event_type"].startswith("message-")]
-        self.assertEqual([event["event_type"] for event in message_events], [
-            "message-start", "message-end", "message-start", "message-end",
-        ])
-        self.assertEqual(message_events[1]["payload"]["message"]["content"][0]["text"], "question")
-        self.assertEqual(message_events[3]["payload"]["message"]["content"][0]["text"], "answer")
-
-    def test_attach_info_exposes_delegated_and_interactive_relays(self):
-        asyncio.run(self.db.insert_pi_session(PiSession(
-            id="attach-child",
-            worker_id="archdome",
-            session_type=PiSessionType.DELEGATED,
+    def _insert(
+        self,
+        session_id: str,
+        role: str,
+        token: str,
+        *,
+        project: str = "",
+        parent: str | None = None,
+    ) -> PiSession:
+        meta = {"project": project} if project else {}
+        session = PiSession(
+            id=session_id,
+            parent_session_id=parent,
+            session_type=PiSessionType.INTERACTIVE,
             state=PiSessionState.IDLE,
-        )))
-        asyncio.run(self.db.register_interactive_pi_session(PiBridgeRegister(
-            session_id="interactive-terminal",
-            incarnation="interactive-incarnation",
-            terminal_attachable=True,
-            terminal_host="100.64.0.2",
-            terminal_port=27888,
-            terminal_protocol_version=2,
-        )))
-        asyncio.run(self.db.register_interactive_pi_session(PiBridgeRegister(
-            session_id="interactive-no-terminal",
-            incarnation="interactive-no-terminal-incarnation",
-        )))
-        with TestClient(self.app) as client:
-            delegated = client.get("/api/v1/pi/sessions/attach-child/attach-info")
-            interactive = client.get("/api/v1/pi/sessions/interactive-terminal/attach-info")
-            unavailable = client.get("/api/v1/pi/sessions/interactive-no-terminal/attach-info")
-
-        self.assertEqual(delegated.status_code, 200, delegated.text)
-        self.assertEqual(delegated.json(), {
-            "session_id": "attach-child",
-            "attachable": True,
-            "transport": "direct-worker-websocket",
-            "protocol_version": 2,
-            "websocket_url": "ws://100.64.0.89:27888/v1/sessions/attach-child/attach",
-            "direct_websocket_url": "ws://100.64.0.89:27888/v1/sessions/attach-child/attach",
-            "gateway_websocket_url": "ws://testserver/api/v1/pi/sessions/attach-child/attach-gateway",
-        })
-        self.assertEqual(interactive.status_code, 200, interactive.text)
-        self.assertEqual(interactive.json(), {
-            "session_id": "interactive-terminal",
-            "attachable": True,
-            "transport": "direct-interactive-websocket",
-            "protocol_version": 2,
-            "websocket_url": "ws://100.64.0.2:27888/v1/sessions/interactive-terminal/attach",
-            "direct_websocket_url": "ws://100.64.0.2:27888/v1/sessions/interactive-terminal/attach",
-            "gateway_websocket_url": "ws://testserver/api/v1/pi/sessions/interactive-terminal/attach-gateway",
-        })
-        self.assertFalse(unavailable.json()["attachable"])
-        self.assertIn("host relay", unavailable.json()["reason"])
-
-    def test_session_list_can_include_one_batched_attachability_snapshot(self):
-        asyncio.run(self.db.insert_pi_session(PiSession(
-            id="attach-child",
-            worker_id="archdome",
-            session_type=PiSessionType.DELEGATED,
-            state=PiSessionState.IDLE,
-        )))
-        asyncio.run(self.db.register_interactive_pi_session(PiBridgeRegister(
-            session_id="interactive-terminal",
-            incarnation="interactive-incarnation",
-            terminal_attachable=True,
-            terminal_host="100.64.0.2",
-            terminal_port=27888,
-            terminal_protocol_version=2,
-        )))
-        asyncio.run(self.db.register_interactive_pi_session(PiBridgeRegister(
-            session_id="interactive-no-terminal",
-            incarnation="interactive-no-terminal-incarnation",
-        )))
-        with TestClient(self.app) as client:
-            response = client.get(
-                "/api/v1/pi/sessions",
-                params={"include_attach_info": "true"},
-                headers={"x-forwarded-proto": "https"},
-            )
-        self.assertEqual(response.status_code, 200, response.text)
-        rows = {row["id"]: row for row in response.json()}
-        self.assertTrue(rows["attach-child"]["attach_info"]["attachable"])
-        self.assertEqual(
-            rows["attach-child"]["attach_info"]["direct_websocket_url"],
-            "ws://100.64.0.89:27888/v1/sessions/attach-child/attach",
-        )
-        self.assertEqual(
-            rows["attach-child"]["attach_info"]["gateway_websocket_url"],
-            "wss://testserver/api/v1/pi/sessions/attach-child/attach-gateway",
-        )
-        self.assertTrue(rows["interactive-terminal"]["attach_info"]["attachable"])
-        self.assertFalse(rows["interactive-no-terminal"]["attach_info"]["attachable"])
-        self.assertIn(
-            "host relay",
-            rows["interactive-no-terminal"]["attach_info"]["reason"],
-        )
-
-    def test_session_list_default_shape_does_not_include_attach_info(self):
-        asyncio.run(self.db.register_interactive_pi_session(PiBridgeRegister(
-            session_id="plain-list-shape",
-            incarnation="plain-list-incarnation",
-        )))
-        with TestClient(self.app) as client:
-            response = client.get("/api/v1/pi/sessions")
-        self.assertEqual(response.status_code, 200, response.text)
-        row = next(item for item in response.json() if item["id"] == "plain-list-shape")
-        self.assertNotIn("attach_info", row)
-
-    def test_gateway_url_dimensions_preserve_existing_query(self):
-        self.assertEqual(
-            _terminal_url_with_dimensions("ws://relay/attach?token=x", 52, 188),
-            "ws://relay/attach?token=x&rows=52&cols=188",
-        )
-
-    def test_gateway_pump_preserves_binary_and_text_frames(self):
-        class Client:
-            def __init__(self):
-                self.incoming = [
-                    {"type": "websocket.receive", "bytes": b"client-bytes"},
-                    {"type": "websocket.receive", "text": '{"type":"resize"}'},
-                    {"type": "websocket.disconnect"},
-                ]
-                self.sent = []
-
-            async def receive(self):
-                await asyncio.sleep(0)
-                return self.incoming.pop(0)
-
-            async def send_bytes(self, data):
-                self.sent.append(data)
-
-            async def send_text(self, data):
-                self.sent.append(data)
-
-        class Upstream:
-            def __init__(self):
-                self.sent = []
-
-            async def send(self, data):
-                self.sent.append(data)
-
-            def __aiter__(self):
-                async def messages():
-                    yield b"upstream-bytes"
-                    yield '{"type":"status"}'
-                    await asyncio.Event().wait()
-                return messages()
-
-        async def run():
-            client = Client()
-            upstream = Upstream()
-            await _pump_terminal_gateway(client, upstream, send_timeout=1)
-            return client, upstream
-
-        client, upstream = asyncio.run(run())
-        self.assertEqual(upstream.sent, [b"client-bytes", '{"type":"resize"}'])
-        self.assertEqual(client.sent, [b"upstream-bytes", '{"type":"status"}'])
-
-    def test_gateway_reports_unavailable_upstream(self):
-        asyncio.run(self.db.insert_pi_session(PiSession(
-            id="gateway-child",
-            worker_id="archdome",
-            session_type=PiSessionType.DELEGATED,
-            state=PiSessionState.IDLE,
-        )))
-
-        class FailingConnection:
-            async def __aenter__(self):
-                raise OSError("relay offline")
-
-            async def __aexit__(self, *_args):
-                return False
-
-        with patch("worker_harness.heartbeat.websocket_connect", return_value=FailingConnection()):
-            with TestClient(self.app) as client:
-                with client.websocket_connect(
-                    "/api/v1/pi/sessions/gateway-child/attach-gateway?rows=52&cols=188"
-                ) as websocket:
-                    self.assertEqual(
-                        websocket.receive_json(),
-                        {
-                            "type": "error",
-                            "code": "upstream_unavailable",
-                            "detail": "relay offline",
-                        },
-                    )
-                    with self.assertRaises(WebSocketDisconnect) as closed:
-                        websocket.receive_text()
-                    self.assertEqual(getattr(closed.exception, "code", None), 1011)
-
-    def test_gateway_reclaims_longest_idle_stream_at_capacity(self):
-        async def run():
-            self.app.state.pi_gateway_max_per_session = 2
-            first = _GatewayAttachment("first", AsyncMock(), 1.0, 24, 80)
-            second = _GatewayAttachment("second", AsyncMock(), 2.0, 24, 80)
-            replacement = _GatewayAttachment("replacement", AsyncMock(), 3.0, 24, 80)
-            self.assertIsNone(
-                await _reserve_gateway_attachment(self.app, "gateway-bounded", first)
-            )
-            self.assertIsNone(
-                await _reserve_gateway_attachment(self.app, "gateway-bounded", second)
-            )
-            victim = await _reserve_gateway_attachment(
-                self.app, "gateway-bounded", replacement
-            )
-            self.assertIs(victim, first)
-            self.assertTrue(first.evict.is_set())
-            self.assertEqual(
-                set(self.app.state.pi_gateway_attachments["gateway-bounded"]),
-                {"second", "replacement"},
-            )
-            self.assertEqual(self.app.state.pi_gateway_evictions_total, 1)
-            # Delayed cleanup from the victim cannot release a surviving slot.
-            await _release_gateway_attachment(self.app, "gateway-bounded", first)
-            self.assertEqual(
-                set(self.app.state.pi_gateway_attachments["gateway-bounded"]),
-                {"second", "replacement"},
-            )
-            await _release_gateway_attachment(self.app, "gateway-bounded", second)
-            await _release_gateway_attachment(self.app, "gateway-bounded", replacement)
-            self.assertNotIn("gateway-bounded", self.app.state.pi_gateway_attachments)
-
-        asyncio.run(run())
-
-    def test_pi_session_sse_replays_from_durable_cursor(self):
-        session_id = "stream-session"
-        asyncio.run(self.db.register_interactive_pi_session(
-            PiBridgeRegister(session_id=session_id, incarnation="inc"), now=100,
-        ))
-        from worker_harness.models import PiSessionEvent
-        asyncio.run(self.db.insert_pi_session_event(PiSessionEvent(
-            id="first-stream-event", session_id=session_id,
-            event_type="message-start", payload={"message_id": "m1"}, created_at=101,
-        )))
-
-        class ConnectedRequest:
-            async def is_disconnected(self):
-                return False
-
-        async def read_one():
-            stream = stream_pi_session_events(ConnectedRequest(), self.db, session_id)
-            try:
-                return await anext(stream)
-            finally:
-                await stream.aclose()
-
-        frame = asyncio.run(read_one())
-        self.assertIn("id: 1\n", frame)
-        self.assertIn("event: pi-event\n", frame)
-        self.assertIn('"event_type":"message-start"', frame)
-        self.assertIn('"sequence":1', frame)
-
-    def test_interactive_bridge_new_incarnation_rejects_stale_client(self):
-        session_id = "reload-session"
-        with TestClient(self.app) as client:
-            for incarnation in ("old", "new"):
-                response = client.post("/api/v1/pi/bridge/register", json={
-                    "session_id": session_id, "incarnation": incarnation,
-                })
-                self.assertEqual(response.status_code, 200, response.text)
-            stale_event = client.post(f"/api/v1/pi/bridge/{session_id}/events", json={
-                "incarnation": "old", "state": "idle", "events": [],
-            })
-            stale_poll = client.get(
-                f"/api/v1/pi/bridge/{session_id}/commands",
-                params={"incarnation": "old", "wait_seconds": 0},
-            )
-        self.assertEqual(stale_event.status_code, 409, stale_event.text)
-        self.assertEqual(stale_poll.status_code, 409, stale_poll.text)
-
-    def test_stale_interactive_bridge_is_reaped(self):
-        asyncio.run(self.db.register_interactive_pi_session(
-            PiBridgeRegister(session_id="stale-session", incarnation="inc"), now=100,
-        ))
-        reaped = asyncio.run(self.db.sweep_stale_interactive_pi_sessions(101, now=200))
-        self.assertEqual(reaped, ["stale-session"])
-        session = asyncio.run(self.db.get_pi_session("stale-session"))
-        self.assertEqual(session.state, PiSessionState.STOPPED)
-        self.assertEqual(session.detail, "bridge heartbeat expired")
-
-    def test_delegate_prompt_cancel_and_event_history(self):
-        _RelayClient.calls.clear()
-        with patch("worker_harness.heartbeat.httpx.AsyncClient", _RelayClient), TestClient(self.app) as client:
-            created = client.post(
-                "/api/v1/pi/delegations",
-                json={"worker_id": "archdome", "task": "inspect this repository", "parent_session_id": "parent"},
-            )
-            self.assertEqual(created.status_code, 201, created.text)
-            body = created.json()
-            child = body["child_session_id"]
-            delegation_id = body["delegation_id"]
-            self.assertEqual(body["state"], "working")
-            self.assertEqual(_RelayClient.calls[0][1], "http://100.64.0.89:27888/v1/sessions")
-
-            listed = client.get("/api/v1/pi/sessions")
-            self.assertEqual(listed.status_code, 200)
-            self.assertEqual(listed.json()[0]["id"], child)
-
-            prompted = client.post(f"/api/v1/pi/sessions/{child}:prompt", json={"message": "continue"})
-            self.assertEqual(prompted.status_code, 200)
-            self.assertEqual(prompted.json()["state"], "working")
-
-            unsupported = client.post(
-                f"/api/v1/pi/sessions/{child}:configure", json={"thinking_level": "low"},
-            )
-            self.assertEqual(unsupported.status_code, 409, unsupported.text)
-
-            cancelled = client.post(f"/api/v1/pi/sessions/{child}:cancel")
-            self.assertEqual(cancelled.status_code, 200)
-            self.assertEqual(cancelled.json()["state"], "stopped")
-
-            events = client.get(f"/api/v1/pi/sessions/{child}/events")
-            self.assertEqual([event["event_type"] for event in events.json()], ["starting", "working", "prompt", "cancelled"])
-
-        delegation = asyncio.run(self.db.get_pi_delegation(delegation_id))
-        self.assertEqual(delegation.state, PiSessionState.STOPPED)
-        self.assertGreater(delegation.completed_at, 0)
-
-
-class PiWorkerIngestTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
-        self.tmp.close()
-        self.db = Database(self.tmp.name)
-        asyncio.run(self.db.connect())
-        asyncio.run(
-            self.db.upsert_worker(
-                WorkerRegistration(
-                    worker_id="archdome",
-                    name="archdome",
-                    worker_ip="100.64.0.89",
-                    pi_relay_port=27888,
-                    pi_relay_available=True,
-                    pi_relay_protocol_version=2,
-                )
-            )
-        )
-        asyncio.run(self.db.upsert_worker(
-            WorkerRegistration(
-                worker_id="kwworker",
-                name="kwworker",
-                worker_ip="100.64.0.99",
-                pi_relay_port=27888,
-                pi_relay_available=True,
-                pi_relay_protocol_version=2,
-            )
-        ))
-        self.app = create_registration_app(self.db)
-
-    def tearDown(self) -> None:
-        asyncio.run(self.db.close())
-        Path(self.tmp.name).unlink(missing_ok=True)
-
-    def _seed_child(self) -> str:
-        from worker_harness.models import PiSession, PiSessionState, PiSessionType
-        from uuid import uuid4
-        sid = str(uuid4())
-        asyncio.run(self.db.insert_pi_session(PiSession(
-            id=sid,
-            worker_id="archdome",
-            parent_session_id="parent",
-            session_type=PiSessionType.DELEGATED,
-            state=PiSessionState.WORKING,
-            task="t",
-            cwd="/tmp",
-            tmux_session="wh_pi_x",
-            detail="started",
+            role=role,
+            token_hash=hashlib.sha256(token.encode()).hexdigest(),
+            meta=meta,
+            name=session_id,
+            bridge_incarnation=f"{session_id}-inc",
             created_at=1,
             updated_at=1,
-        )))
-        return sid
+        )
+        asyncio.run(self.db.insert_pi_session(session))
+        return session
 
-    def test_worker_can_ingest_state_and_events(self):
-        sid = self._seed_child()
-        asyncio.run(self.db.insert_pi_delegation(PiDelegation(
-            id="ingest-delegation",
-            worker_id="archdome",
-            child_session_id=sid,
-            task="t",
-            state=PiSessionState.WORKING,
-            created_at=1,
-        )))
-        with TestClient(self.app) as client:
-            resp = client.post(
-                f"/pi/worker/archdome/sessions/{sid}/events",
-                json={
-                    "session_id": sid,
-                    "state": "idle",
-                    "detail": "model returned",
-                    "events": [
-                        {"event_type": "idle", "payload": {"reason": "completed"}},
-                        {"event_type": "working", "payload": {"reason": "follow-up"}},
-                    ],
-                },
+    @staticmethod
+    def auth(token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    def commands(self, session_id: str) -> list[dict]:
+        commands = asyncio.run(
+            self.db.claim_pi_session_commands(
+                session_id, f"{session_id}-inc", now=100, lease_seconds=30
             )
-            self.assertEqual(resp.status_code, 200, resp.text)
-            self.assertEqual(resp.json()["events_persisted"], 2)
+        )
+        return [command.model_dump(mode="json") for command in commands]
 
-            session = asyncio.run(self.db.get_pi_session(sid))
-            self.assertEqual(session.state.value, "idle")
-            self.assertEqual(session.detail, "model returned")
-
-            events = asyncio.run(self.db.list_pi_session_events(sid))
-            types = [e.event_type for e in events]
-            self.assertIn("idle", types)
-            self.assertIn("working", types)
-            delegation = asyncio.run(self.db.get_pi_delegation("ingest-delegation"))
-            self.assertEqual(delegation.state, PiSessionState.IDLE)
-            self.assertGreater(delegation.completed_at, 0)
-
-    def test_late_ingest_cannot_resurrect_terminal_projection(self):
-        sid = self._seed_child()
-        session = asyncio.run(self.db.get_pi_session(sid))
-        session.state = PiSessionState.TERMINATION_UNKNOWN
-        session.detail = "timeout unacknowledged"
-        asyncio.run(self.db.update_pi_session(session))
-        with TestClient(self.app) as client:
-            stale = client.post(
-                f"/pi/worker/archdome/sessions/{sid}/events",
-                json={
-                    "session_id": sid,
-                    "state": "working",
-                    "detail": "delayed working report",
-                    "events": [{"id": "late-working", "event_type": "working"}],
-                },
+    def test_session_list_authorization_and_pm_scope(self):
+        with self.client() as client:
+            operator = client.get("/api/v1/pi/sessions")
+            unknown = client.get(
+                "/api/v1/pi/sessions", headers=self.auth("not-a-session-token")
             )
-            self.assertEqual(stale.status_code, 200, stale.text)
-        unchanged = asyncio.run(self.db.get_pi_session(sid))
-        self.assertEqual(unchanged.state, PiSessionState.TERMINATION_UNKNOWN)
-        self.assertEqual(unchanged.detail, "timeout unacknowledged")
+            task = client.get(
+                "/api/v1/pi/sessions", headers=self.auth("task-one-token")
+            )
+            manager = client.get(
+                "/api/v1/pi/sessions", headers=self.auth("pm-one-token")
+            )
+        self.assertEqual(operator.status_code, 200, operator.text)
+        self.assertEqual(unknown.status_code, 401, unknown.text)
+        self.assertEqual(task.status_code, 403, task.text)
         self.assertEqual(
-            [event.id for event in asyncio.run(self.db.list_pi_session_events(sid))],
-            ["late-working"],
+            {row["id"] for row in manager.json()},
+            {"orchestrator", "pm-one", "task-one"},
         )
 
-    def test_ingest_deduplicates_retried_event_ids(self):
-        sid = self._seed_child()
-        payload = {
-            "session_id": sid,
-            "state": "working",
-            "events": [{"id": "stable-event", "event_type": "working", "payload": {}}],
-        }
-        with TestClient(self.app) as client:
-            first = client.post(f"/pi/worker/archdome/sessions/{sid}/events", json=payload)
-            retry = client.post(f"/pi/worker/archdome/sessions/{sid}/events", json=payload)
-            self.assertEqual(first.status_code, 200, first.text)
-            self.assertEqual(first.json()["events_persisted"], 1)
-            self.assertEqual(retry.status_code, 200, retry.text)
-            self.assertEqual(retry.json()["events_persisted"], 0)
-        self.assertEqual(len(asyncio.run(self.db.list_pi_session_events(sid))), 1)
+    def test_send_delivery_and_relationship_checks_are_server_owned(self):
+        with self.client() as client:
+            operator = client.post(
+                "/api/v1/pi/sessions/task-one:send",
+                json={"message": "operator message", "deliver_as": "followUp"},
+            )
+            orchestrator = client.post(
+                "/api/v1/pi/sessions/pm-one:send",
+                headers=self.auth("orch-token"),
+                json={"message": "orchestrator message"},
+            )
+            wrong_role = client.post(
+                "/api/v1/pi/sessions/task-one:send",
+                headers=self.auth("orch-token"),
+                json={"message": "not allowed"},
+            )
+            manager = client.post(
+                "/api/v1/pi/sessions/task-one:send",
+                headers=self.auth("pm-one-token"),
+                json={"message": "manager answer"},
+            )
+            escalated = client.post(
+                "/api/v1/pi/sessions/orchestrator:send",
+                headers=self.auth("pm-one-token"),
+                json={"message": "Need operator input"},
+            )
+            cross_project = client.post(
+                "/api/v1/pi/sessions/task-two:send",
+                headers=self.auth("pm-one-token"),
+                json={"message": "not mine"},
+            )
+        self.assertEqual(operator.status_code, 200, operator.text)
+        self.assertEqual(orchestrator.status_code, 200, orchestrator.text)
+        self.assertEqual(manager.status_code, 200, manager.text)
+        self.assertEqual(escalated.status_code, 200, escalated.text)
+        self.assertEqual(wrong_role.status_code, 403, wrong_role.text)
+        self.assertEqual(cross_project.status_code, 403, cross_project.text)
+        self.assertEqual(
+            [command["deliver_as"] for command in self.commands("task-one")],
+            ["steer", "steer"],
+        )
+        self.assertEqual(self.commands("pm-one")[0]["deliver_as"], "steer")
+        self.assertEqual(self.commands("orchestrator")[0]["deliver_as"], "steer")
 
-    def test_worker_job_reports_link_to_origin_session_and_ignore_replay(self):
-        sid = self._seed_child()
-        report = {
-            "id": "delegated-job-1",
-            "origin_session_id": sid,
-            "tmux_session": "wh_delegated_job_1",
-            "command": "printf hello",
-            "status": "running",
-            "pty_enabled": True,
-            "started_at": 10,
-            "finished_at": 0,
-            "report_revision": 1,
-        }
-        with TestClient(self.app) as client:
-            first = client.post("/pi/worker/archdome/jobs", json={"jobs": [report]})
-            replay = client.post("/pi/worker/archdome/jobs", json={"jobs": [report]})
-            self.assertEqual(first.status_code, 200, first.text)
-            self.assertEqual(first.json()["jobs_applied"], 1)
-            self.assertEqual(replay.status_code, 200, replay.text)
-            self.assertEqual(replay.json()["jobs_applied"], 0)
+    def test_interrupt_relationships_and_operator_only_configuration(self):
+        with self.client() as client:
+            orchestrator_interrupt = client.post(
+                "/api/v1/pi/sessions/pm-one:interrupt",
+                headers=self.auth("orch-token"),
+            )
+            manager_interrupt = client.post(
+                "/api/v1/pi/sessions/task-one:interrupt",
+                headers=self.auth("pm-one-token"),
+            )
+            manager_cannot_interrupt_orchestrator = client.post(
+                "/api/v1/pi/sessions/orchestrator:interrupt",
+                headers=self.auth("pm-one-token"),
+            )
+            configured = client.post(
+                "/api/v1/pi/sessions/task-one:configure",
+                json={
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6",
+                    "thinking_level": "high",
+                },
+            )
+            manager_cannot_configure = client.post(
+                "/api/v1/pi/sessions/task-one:configure",
+                headers=self.auth("pm-one-token"),
+                json={"thinking_level": "low"},
+            )
+            incomplete_model = client.post(
+                "/api/v1/pi/sessions/task-one:configure",
+                json={"provider": "openai-codex"},
+            )
+        self.assertEqual(orchestrator_interrupt.status_code, 200, orchestrator_interrupt.text)
+        self.assertEqual(manager_interrupt.status_code, 200, manager_interrupt.text)
+        self.assertEqual(
+            manager_cannot_interrupt_orchestrator.status_code,
+            403,
+            manager_cannot_interrupt_orchestrator.text,
+        )
+        self.assertEqual(configured.status_code, 200, configured.text)
+        self.assertEqual(manager_cannot_configure.status_code, 403, manager_cannot_configure.text)
+        self.assertEqual(incomplete_model.status_code, 422, incomplete_model.text)
+        task_commands = self.commands("task-one")
+        self.assertEqual([command["kind"] for command in task_commands], ["interrupt", "configure"])
+        self.assertEqual(task_commands[1]["payload"], {
+            "provider": "openai-codex",
+            "model": "gpt-5.6",
+            "thinking_level": "high",
+        })
+        self.assertEqual(self.commands("pm-one")[0]["kind"], "interrupt")
 
-            report.update({"status": "done", "exit_code": 0, "finished_at": 12, "report_revision": 2})
-            completed = client.post("/pi/worker/archdome/jobs", json={"jobs": [report]})
-            self.assertEqual(completed.status_code, 200, completed.text)
-            self.assertEqual(completed.json()["jobs_applied"], 1)
+    def test_ask_pm_blocks_task_and_answer_ack_clears_question(self):
+        with self.client() as client:
+            asked = client.post(
+                "/api/v1/pi/sessions/task-one:ask-pm",
+                headers=self.auth("task-one-token"),
+                json={"question": "Which database?"},
+            )
+            heartbeat = client.post(
+                "/api/v1/pi/bridge/task-one/events",
+                headers=self.auth("task-one-token"),
+                json={"incarnation": "task-one-inc", "state": "idle", "events": []},
+            )
+            spoofed = client.post(
+                "/api/v1/pi/sessions/task-two:ask-pm",
+                headers=self.auth("task-one-token"),
+                json={"question": "May I spoof?"},
+            )
+            answered = client.post(
+                "/api/v1/pi/sessions/task-one:send",
+                headers=self.auth("pm-one-token"),
+                json={"message": "Use SQLite"},
+            )
+            command_id = answered.json()["command_id"]
+            polled = client.get(
+                "/api/v1/pi/bridge/task-one/commands",
+                params={"incarnation": "task-one-inc", "wait_seconds": 0},
+            )
+            acknowledged = client.post(
+                f"/api/v1/pi/bridge/task-one/commands/{command_id}:ack",
+                json={"incarnation": "task-one-inc"},
+            )
+        self.assertEqual(asked.status_code, 200, asked.text)
+        self.assertEqual(heartbeat.json()["state"], "blocked")
+        self.assertEqual(spoofed.status_code, 403, spoofed.text)
+        self.assertEqual(polled.status_code, 200, polled.text)
+        self.assertEqual(acknowledged.status_code, 200, acknowledged.text)
+        blocked = asyncio.run(self.db.get_pi_session("task-one"))
+        self.assertEqual(blocked.state, PiSessionState.WORKING)
+        self.assertEqual(blocked.question, "")
+        events = asyncio.run(self.db.list_pi_session_events("task-one"))
+        self.assertIn("blocked", [event.event_type for event in events])
+        pm_commands = self.commands("pm-one")
+        self.assertEqual(pm_commands[0]["deliver_as"], "followUp")
+        self.assertIn("Which database?", pm_commands[0]["message"])
 
-        job = asyncio.run(self.db.get_job("delegated-job-1"))
-        self.assertEqual(job.origin_session_id, sid)
-        self.assertEqual(job.kind.value, "delegated")
-        self.assertEqual(job.status.value, "done")
-        self.assertEqual(job.report_revision, 2)
-
-        with TestClient(create_app(self.db)) as client:
-            listed = client.get("/api/v1/jobs", params={"origin_session_id": sid})
-            self.assertEqual(listed.status_code, 200, listed.text)
-            self.assertEqual([item["id"] for item in listed.json()], ["delegated-job-1"])
-            self.assertEqual(listed.json()[0]["origin_session_id"], sid)
-
-    def test_delegated_job_listing_skips_generic_ssh_refresh(self):
-        sid = self._seed_child()
-        asyncio.run(self.db.upsert_reported_worker_job(
-            "archdome",
-            WorkerJobReport(
-                id="reported-running-job",
-                origin_session_id=sid,
-                tmux_session="wh_reported_running_job",
-                command="sleep 60",
-                status="running",
-                started_at=10,
-                report_revision=1,
-            ),
-        ))
-        refresh = AsyncMock()
-        with patch("worker_harness.heartbeat.JobManager.refresh_job_status", new=refresh), TestClient(create_app(self.db)) as client:
-            response = client.get("/api/v1/jobs", params={"origin_session_id": sid})
+    def test_notify_pm_is_non_interrupting_without_blocking(self):
+        with self.client() as client:
+            response = client.post(
+                "/api/v1/pi/sessions/task-one:notify-pm",
+                headers=self.auth("task-one-token"),
+                json={"note": "Ready for review"},
+            )
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()[0]["status"], "running")
-        refresh.assert_not_awaited()
+        task = asyncio.run(self.db.get_pi_session("task-one"))
+        self.assertEqual(task.state, PiSessionState.IDLE)
+        command = self.commands("pm-one")[0]
+        self.assertEqual(command["deliver_as"], "followUp")
+        self.assertIn("Ready for review", command["message"])
 
-    def test_concurrent_worker_job_reports_preserve_highest_revision(self):
-        sid = self._seed_child()
+    def test_projects_and_lazy_pm_send(self):
+        with self.client() as client:
+            projects = client.get(
+                "/api/v1/pi/projects", headers=self.auth("orch-token")
+            )
+            forbidden = client.get(
+                "/api/v1/pi/projects", headers=self.auth("pm-one-token")
+            )
+            sent = client.post(
+                "/api/v1/pi/projects/one:send",
+                headers=self.auth("orch-token"),
+                json={"message": "Please investigate"},
+            )
+            missing = client.post(
+                "/api/v1/pi/projects/missing:send",
+                json={"message": "No such project"},
+            )
+        self.assertEqual({project["name"] for project in projects.json()}, {"one", "two"})
+        self.assertEqual(forbidden.status_code, 403, forbidden.text)
+        self.assertEqual(sent.status_code, 200, sent.text)
+        self.assertEqual(missing.status_code, 404, missing.text)
+        self.assertEqual(self.commands("pm-one")[0]["message"], "Please investigate")
 
-        async def report(revision: int, status: str, finished_at: int = 0):
-            return await self.db.upsert_reported_worker_job(
-                "archdome",
-                WorkerJobReport(
-                    id="concurrent-job",
-                    origin_session_id=sid,
-                    tmux_session="wh_concurrent_job",
-                    command="true",
-                    status=status,
-                    exit_code=0 if status == "done" else None,
-                    started_at=10,
-                    finished_at=finished_at,
-                    report_revision=revision,
+    def test_task_launch_and_teardown_enforce_pm_project_and_parent(self):
+        launched = PiSession(
+            id="new-task",
+            role="task",
+            parent_session_id="pm-one",
+            meta={"project": "one"},
+        )
+        self.app.state.orchestrator.launch_task.return_value = launched
+        with self.client() as client:
+            created = client.post(
+                "/api/v1/pi/projects/one/tasks",
+                headers=self.auth("pm-one-token"),
+                json={"branch": "feature/test", "briefing": "Implement it"},
+            )
+            cross_project = client.post(
+                "/api/v1/pi/projects/two/tasks",
+                headers=self.auth("pm-one-token"),
+                json={"branch": "feature/bad", "briefing": "Wrong project"},
+            )
+            torn_down = client.post(
+                "/api/v1/pi/sessions/task-one:teardown",
+                headers=self.auth("pm-one-token"),
+                json={"force": True},
+            )
+            foreign = client.post(
+                "/api/v1/pi/sessions/task-two:teardown",
+                headers=self.auth("pm-one-token"),
+                json={"force": True},
+            )
+        self.assertEqual(created.status_code, 201, created.text)
+        self.assertEqual(cross_project.status_code, 403, cross_project.text)
+        self.assertEqual(torn_down.status_code, 200, torn_down.text)
+        self.assertEqual(foreign.status_code, 403, foreign.text)
+        self.app.state.orchestrator.launch_task.assert_awaited_once()
+        self.app.state.orchestrator.teardown_task.assert_awaited_once_with(
+            self.sessions["task-one"], force=True
+        )
+
+    def test_submit_pr_validates_ownership_and_persists_url(self):
+        task = asyncio.run(self.db.get_pi_session("task-one"))
+        task.meta.update(
+            machine="desktop", branch="feature/test", worktree="/home/user/worktree"
+        )
+        asyncio.run(self.db.update_pi_session(task))
+        with patch(
+            "worker_harness.heartbeat.open_pr",
+            new=AsyncMock(return_value="https://github.com/owner/one/pull/1"),
+        ) as open_pr:
+            with self.client() as client:
+                response = client.post(
+                    "/api/v1/pi/sessions/task-one:submit-pr",
+                    headers=self.auth("pm-one-token"),
+                    json={"summary": "complete summary"},
+                )
+        self.assertEqual(response.status_code, 200, response.text)
+        open_pr.assert_awaited_once()
+        persisted = asyncio.run(self.db.get_pi_session("task-one"))
+        self.assertEqual(persisted.meta["pr_url"], "https://github.com/owner/one/pull/1")
+
+        with patch(
+            "worker_harness.heartbeat.open_pr",
+            new=AsyncMock(side_effect=PrRejected(["## Outcome"])),
+        ):
+            with self.client() as client:
+                rejected = client.post(
+                    "/api/v1/pi/sessions/task-one:submit-pr",
+                    headers=self.auth("pm-one-token"),
+                    json={"summary": "incomplete"},
+                )
+        self.assertEqual(rejected.status_code, 422, rejected.text)
+        self.assertEqual(rejected.json()["detail"]["missing"], ["## Outcome"])
+
+    def test_bridge_registration_preserves_fleet_identity_and_metadata(self):
+        before = asyncio.run(self.db.get_pi_session("task-one"))
+        with self.client() as client:
+            registered = client.post(
+                "/api/v1/pi/bridge/register",
+                json={
+                    "session_id": "task-one",
+                    "incarnation": "replacement",
+                    "cwd": "/home/user/worktree",
+                    "name": "task-one",
+                    "agent": "omp",
+                },
+            )
+        self.assertEqual(registered.status_code, 200, registered.text)
+        after = asyncio.run(self.db.get_pi_session("task-one"))
+        self.assertEqual(after.role, "task")
+        self.assertEqual(after.token_hash, before.token_hash)
+        self.assertEqual(after.parent_session_id, "pm-one")
+        self.assertEqual(after.meta, {"project": "one"})
+        self.assertEqual(after.bridge_incarnation, "replacement")
+
+    def test_bridge_registration_keeps_harness_identity_when_bridge_values_are_empty(self):
+        fleet_session = PiSession(
+            id="fleet-pm",
+            session_type=PiSessionType.INTERACTIVE,
+            state=PiSessionState.STARTING,
+            role="pm",
+            name="pm-worker-harness",
+            host="desktop",
+            created_at=1,
+            updated_at=1,
+        )
+        asyncio.run(self.db.insert_pi_session(fleet_session))
+
+        with self.client() as client:
+            registered = client.post(
+                "/api/v1/pi/bridge/register",
+                json={
+                    "session_id": "fleet-pm",
+                    "incarnation": "fleet-incarnation",
+                    "cwd": "/home/user/worker-harness",
+                    "name": "",
+                    "host": "",
+                    "agent": "omp",
+                },
+            )
+
+        self.assertEqual(registered.status_code, 200, registered.text)
+        persisted = asyncio.run(self.db.get_pi_session("fleet-pm"))
+        self.assertEqual(persisted.name, "pm-worker-harness")
+        self.assertEqual(persisted.host, "desktop")
+
+    def test_global_router_registration_preserves_type_and_claims_commands(self):
+        token = "global-router-token"
+        global_session = PiSession(
+            id="global-router",
+            session_type=PiSessionType.GLOBAL_ROUTER,
+            state=PiSessionState.STARTING,
+            role="orchestrator",
+            token_hash=hashlib.sha256(token.encode()).hexdigest(),
+            name="orchestrator",
+            host="desktop",
+            created_at=1,
+            updated_at=1,
+        )
+        asyncio.run(self.db.insert_pi_session(global_session))
+
+        with self.client() as client:
+            registered = client.post(
+                "/api/v1/pi/bridge/register",
+                headers=self.auth(token),
+                json={
+                    "session_id": "global-router",
+                    "incarnation": "global-incarnation",
+                    "cwd": "/home/user/agent-orchestrator",
+                    "name": "",
+                    "host": "",
+                    "agent": "omp",
+                },
+            )
+            queued = client.post(
+                "/api/v1/pi/sessions/global-router:send",
+                json={"message": "route this task"},
+            )
+            claimed = client.get(
+                "/api/v1/pi/bridge/global-router/commands",
+                headers=self.auth(token),
+                params={"incarnation": "global-incarnation", "wait_seconds": 0},
+            )
+
+        self.assertEqual(registered.status_code, 200, registered.text)
+        self.assertEqual(registered.json()["session_type"], "global-router")
+        self.assertEqual(queued.status_code, 200, queued.text)
+        self.assertEqual(claimed.status_code, 200, claimed.text)
+        self.assertEqual([command["message"] for command in claimed.json()], ["route this task"])
+        persisted = asyncio.run(self.db.get_pi_session("global-router"))
+        self.assertEqual(persisted.session_type, PiSessionType.GLOBAL_ROUTER)
+
+        swept = asyncio.run(
+            self.db.sweep_stale_interactive_pi_sessions(cutoff_ts=10**12, now=200)
+        )
+        self.assertIn("global-router", swept)
+        persisted = asyncio.run(self.db.get_pi_session("global-router"))
+        self.assertEqual(persisted.state, PiSessionState.STOPPED)
+
+    def test_operator_auth_cannot_be_bypassed_by_omitting_bearer(self):
+        with TestClient(self.app) as client:
+            for method, path, payload in (
+                ("GET", "/api/v1/pi/sessions", None),
+                ("GET", "/api/v1/workers", None),
+                ("POST", "/api/v1/jobs", {"worker_id": "desktop", "command": "id"}),
+                ("POST", "/api/v1/pi/bridge/register", {
+                    "session_id": "pm-one", "incarnation": "hijack",
+                }),
+            ):
+                with self.subTest(path=path):
+                    response = client.request(method, path, json=payload)
+                    self.assertEqual(response.status_code, 401, response.text)
+            self.assertEqual(client.get("/health").status_code, 200)
+        self.app.state.operator_token = ""
+        with TestClient(self.app) as client:
+            self.assertEqual(client.get("/api/v1/workers").status_code, 401)
+
+    def test_orchestrator_cannot_access_worker_compute_or_admin_routes(self):
+        with self.client() as client:
+            for method, path, payload in (
+                ("GET", "/api/v1/workers", None),
+                ("POST", "/api/v1/jobs", {"worker_id": "desktop", "command": "id"}),
+                ("GET", "/api/v1/marimo", None),
+                ("POST", "/api/v1/tunnels", {}),
+                ("GET", "/api/v1/workers/desktop/files?path=/etc/passwd", None),
+            ):
+                with self.subTest(path=path):
+                    response = client.request(
+                        method, path, json=payload, headers=self.auth("orch-token")
+                    )
+                    self.assertEqual(response.status_code, 403, response.text)
+            self.assertEqual(client.get(
+                "/api/v1/workers", headers=self.auth("task-one-token")
+            ).status_code, 200)
+            self.assertEqual(client.delete(
+                "/api/v1/workers/prune", headers=self.auth("pm-one-token")
+            ).status_code, 403)
+
+    def test_private_session_reads_enforce_parent_and_project(self):
+        self._insert("wrong-project", "task", "wrong-token", project="two", parent="pm-one")
+        with self.client() as client:
+            for suffix in ("", "/events", "/stream"):
+                for target, token in (
+                    ("task-two", "pm-one-token"),
+                    ("wrong-project", "pm-one-token"),
+                    ("pm-one", "task-one-token"),
+                ):
+                    with self.subTest(suffix=suffix, target=target, token=token):
+                        response = client.get(
+                            f"/api/v1/pi/sessions/{target}{suffix}",
+                            headers=self.auth(token),
+                        )
+                        self.assertEqual(response.status_code, 403, response.text)
+            roster = client.get("/api/v1/pi/sessions", headers=self.auth("pm-one-token"))
+            self.assertNotIn("wrong-project", {row["id"] for row in roster.json()})
+            own = client.get(
+                "/api/v1/pi/sessions/task-one", headers=self.auth("task-one-token")
+            )
+            self.assertEqual(own.status_code, 200, own.text)
+
+    def test_session_hashes_never_leave_api_but_still_authenticate(self):
+        self.app.state.orchestrator.ensure_orchestrator.return_value = self.sessions["orchestrator"]
+        self.app.state.orchestrator.ensure_pm.return_value = self.sessions["pm-one"]
+        self.app.state.orchestrator.launch_task.return_value = self.sessions["task-one"]
+        with self.client() as client:
+            responses = [
+                client.get("/api/v1/pi/sessions"),
+                client.get("/api/v1/pi/sessions?include_attach_info=true"),
+                client.get("/api/v1/pi/sessions/task-one"),
+                client.get("/api/v1/pi/orchestrator"),
+                client.post("/api/v1/pi/orchestrator:send", json={"message": "hello"}),
+                client.post("/api/v1/pi/projects/one:send", json={"message": "hello"}),
+                client.post(
+                    "/api/v1/pi/projects/one/tasks", headers=self.auth("pm-one-token"),
+                    json={"branch": "task/secret", "briefing": "work"},
                 ),
+                client.post(
+                    "/api/v1/pi/bridge/register", headers=self.auth("task-one-token"),
+                    json={"session_id": "task-one", "incarnation": "new"},
+                ),
+            ]
+        for response in responses:
+            self.assertIn(response.status_code, {200, 201}, response.text)
+            self.assertNotIn("token_hash", response.text)
+            for session in self.sessions.values():
+                self.assertNotIn(session.token_hash, response.text)
+        persisted = asyncio.run(self.db.get_pi_session_by_token_hash(
+            hashlib.sha256(b"task-one-token").hexdigest()
+        ))
+        self.assertEqual(persisted.id, "task-one")
+
+    def test_agent_terminal_gateway_is_operator_only(self):
+        with self.client() as client:
+            response = client.get(
+                "/api/v1/pi/sessions/task-one/attach-info",
+                headers=self.auth("task-one-token"),
             )
+            self.assertEqual(response.status_code, 403)
+            with client.websocket_connect(
+                "/api/v1/pi/sessions/task-one/attach-gateway",
+                headers=self.auth("task-one-token"),
+            ) as socket:
+                with self.assertRaises(WebSocketDisconnect) as caught:
+                    socket.receive_json()
+            self.assertEqual(caught.exception.code, 4403)
 
-        async def submit_both():
-            await asyncio.gather(report(1, "running"), report(2, "done", 12))
-
-        asyncio.run(submit_both())
-        job = asyncio.run(self.db.get_job("concurrent-job"))
-        self.assertEqual(job.report_revision, 2)
-        self.assertEqual(job.status.value, "done")
-
-    def test_worker_job_report_rejects_foreign_origin_session(self):
-        sid = self._seed_child()
-        report = {
-            "id": "foreign-job",
-            "origin_session_id": sid,
-            "tmux_session": "wh_foreign_job",
-            "command": "true",
-            "status": "running",
-            "started_at": 10,
-            "report_revision": 1,
-        }
-        with TestClient(self.app) as client:
-            response = client.post("/pi/worker/kwworker/jobs", json={"jobs": [report]})
-            self.assertEqual(response.status_code, 404, response.text)
-
-    def test_ingest_rejects_wrong_worker(self):
-        sid = self._seed_child()
-        with TestClient(self.app) as client:
-            resp = client.post(
-                f"/pi/worker/kwworker/sessions/{sid}/events",
-                json={"session_id": sid, "state": "idle", "events": []},
+    def test_bridge_token_cannot_impersonate_another_session_or_revive_stopped_agent(self):
+        with self.client() as client:
+            spoofed = client.post(
+                "/api/v1/pi/bridge/register", headers=self.auth("task-one-token"),
+                json={"session_id": "task-two", "incarnation": "hijack"},
             )
-            self.assertEqual(resp.status_code, 404, resp.text)
-
-    def test_ingest_rejects_session_id_mismatch(self):
-        sid = self._seed_child()
-        with TestClient(self.app) as client:
-            resp = client.post(
-                f"/pi/worker/archdome/sessions/{sid}/events",
-                json={"session_id": "wrong", "state": "idle", "events": []},
+            self.assertEqual(spoofed.status_code, 403, spoofed.text)
+            stopped = client.post(
+                "/api/v1/pi/bridge/task-one/events", headers=self.auth("task-one-token"),
+                json={"incarnation": "task-one-inc", "state": "stopped"},
             )
-            self.assertEqual(resp.status_code, 422, resp.text)
-
-    def test_ingest_marks_missing_session_projection_gone(self):
-        with TestClient(self.app) as client:
-            event_response = client.post(
-                "/pi/worker/archdome/sessions/missing/events",
-                json={"session_id": "missing", "state": "idle", "events": []},
+            self.assertEqual(stopped.status_code, 200, stopped.text)
+            revived = client.post(
+                "/api/v1/pi/bridge/register", headers=self.auth("task-one-token"),
+                json={"session_id": "task-one", "incarnation": "revived"},
             )
-            job_response = client.post(
-                "/pi/worker/archdome/jobs",
-                json={"jobs": [{
-                    "id": "missing-origin-job",
-                    "origin_session_id": "missing",
-                    "tmux_session": "wh_missing_origin_job",
-                    "command": "true",
-                    "status": "running",
-                    "started_at": 10,
-                    "report_revision": 1,
-                }]},
+            self.assertEqual(revived.status_code, 401, revived.text)
+
+    def test_blocked_task_can_exit_and_clears_question(self):
+        with self.client() as client:
+            client.post(
+                "/api/v1/pi/sessions/task-one:ask-pm", headers=self.auth("task-one-token"),
+                json={"question": "Need advice"},
             )
-        self.assertEqual(event_response.status_code, 410, event_response.text)
-        self.assertEqual(job_response.status_code, 410, job_response.text)
-
-
-class PiSyncDelegationTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
-        self.tmp.close()
-        self.db = Database(self.tmp.name)
-        asyncio.run(self.db.connect())
-        asyncio.run(
-            self.db.upsert_worker(
-                WorkerRegistration(
-                    worker_id="archdome",
-                    name="archdome",
-                    worker_ip="100.64.0.89",
-                    pi_relay_port=27888,
-                    pi_relay_available=True,
-                    pi_relay_protocol_version=2,
-                )
+            stopped = client.post(
+                "/api/v1/pi/bridge/task-one/events", headers=self.auth("task-one-token"),
+                json={"incarnation": "task-one-inc", "state": "stopped"},
             )
-        )
-        self.app = create_app(self.db)
+        self.assertEqual(stopped.json()["state"], "stopped")
+        persisted = asyncio.run(self.db.get_pi_session("task-one"))
+        self.assertEqual(persisted.question, "")
 
-    def tearDown(self) -> None:
-        asyncio.run(self.db.close())
-        Path(self.tmp.name).unlink(missing_ok=True)
+    def test_terminal_task_cannot_be_reblocked_by_an_inflight_question(self):
+        async def exercise():
+            await self.db.finish_pi_session("task-one", PiSessionState.STOPPED, "finished")
+            with self.assertRaises(ValueError):
+                await self.db.set_pi_session_blocked("task-one", "late question")
+            session = await self.db.get_pi_session("task-one")
+            self.assertEqual(session.state, PiSessionState.STOPPED)
+            self.assertEqual(session.question, "")
+            self.assertEqual(await self.db.list_pi_session_events("task-one"), [])
+        asyncio.run(exercise())
 
-    def test_sync_waits_for_settled_state(self):
-        _RelayClient.calls.clear()
-        holder: dict = {}
+    def test_duplicate_prompt_ack_does_not_clear_a_later_question(self):
+        async def exercise():
+            command = PiSessionCommand(session_id="task-one", message="initial answer")
+            await self.db.enqueue_pi_session_command(command)
+            await self.db.claim_pi_session_commands("task-one", "task-one-inc")
+            await self.db.set_pi_session_blocked("task-one", "first question")
+            self.assertTrue(await self.db.ack_pi_session_command(
+                "task-one", command.id, "task-one-inc",
+            ))
+            await self.db.set_pi_session_blocked("task-one", "second question")
+            self.assertFalse(await self.db.ack_pi_session_command(
+                "task-one", command.id, "task-one-inc",
+            ))
+            session = await self.db.get_pi_session("task-one")
+            self.assertEqual(session.state, PiSessionState.BLOCKED)
+            self.assertEqual(session.question, "second question")
+        asyncio.run(exercise())
 
-        def run_client() -> None:
-            with patch("worker_harness.heartbeat.httpx.AsyncClient", _RelayClient), TestClient(self.app) as client:
-                holder["resp"] = client.post(
-                    "/api/v1/pi/delegations",
-                    json={"worker_id": "archdome", "task": "do x", "sync": True, "timeout_seconds": 30},
-                )
-
-        thread = threading.Thread(target=run_client)
-        thread.start()
-        time.sleep(1.5)
-
-        async def settle() -> None:
-            other = Database(self.tmp.name)
-            await other.connect()
-            sessions = await other.list_pi_sessions()
-            session = sessions[0]
-            session.state = PiSessionState.IDLE
-            await other.update_pi_session(session)
-            await other.close()
-
-        asyncio.run(settle())
-        thread.join(timeout=30)
-        resp = holder["resp"]
-        self.assertEqual(resp.status_code, 201, resp.text)
-        body = resp.json()
-        self.assertTrue(body["settled"])
-        self.assertEqual(body["state"], "idle")
-        self.assertEqual(body["session"]["id"], body["child_session_id"])
-        self.assertTrue(body["delegation"]["id"])
-
-    def test_sync_applies_timeout_gate_before_returning(self):
-        _RelayClient.calls.clear()
-        with patch("worker_harness.heartbeat.httpx.AsyncClient", _RelayClient), TestClient(self.app) as client:
-            started = time.time()
-            resp = client.post(
-                "/api/v1/pi/delegations",
-                json={"worker_id": "archdome", "task": "long task", "sync": True, "timeout_seconds": 2},
+    def test_delegated_database_cutover_removes_dependents_and_is_idempotent(self):
+        async def migrate():
+            legacy = PiSession(id="legacy", state=PiSessionState.WORKING)
+            await self.db.insert_pi_session(legacy)
+            await self.db.insert_pi_session_event(PiSessionEvent(
+                id="legacy-event", session_id="legacy", event_type="message-end",
+            ))
+            await self.db.enqueue_pi_session_command(PiSessionCommand(
+                id="legacy-command", session_id="legacy", message="old work",
+            ))
+            await self.db.insert_pi_session_event(PiSessionEvent(
+                id="kept-event", session_id="task-one", event_type="message-end",
+            ))
+            await self.db._db.execute(
+                "UPDATE pi_sessions SET session_type='delegated' WHERE id='legacy'"
             )
-            self.assertLess(time.time() - started, 15)
-            self.assertEqual(resp.status_code, 201, resp.text)
-            body = resp.json()
-            self.assertTrue(body["settled"])
-            self.assertEqual(body["state"], "stopped")
-            self.assertEqual(body["session"]["detail"], "delegation timed out")
-            self.assertTrue(any(url.endswith(":cancel") for _, url, _ in _RelayClient.calls))
-
-    def test_sync_reports_unknown_when_timeout_cancel_is_unacknowledged(self):
-        class _UnreachableCancelClient(_RelayClient):
-            async def request(self, method: str, url: str, json=None):
-                if url.endswith(":cancel"):
-                    raise RuntimeError("worker unreachable")
-                return await super().request(method, url, json)
-
-        _UnreachableCancelClient.calls.clear()
-        with patch("worker_harness.heartbeat.httpx.AsyncClient", _UnreachableCancelClient), TestClient(self.app) as client:
-            resp = client.post(
-                "/api/v1/pi/delegations",
-                json={"worker_id": "archdome", "task": "long task", "sync": True, "timeout_seconds": 2},
+            await self.db._db.execute(
+                "UPDATE pi_sessions SET parent_session_id='legacy' WHERE id='task-one'"
             )
-            self.assertEqual(resp.status_code, 201, resp.text)
-            body = resp.json()
-            self.assertFalse(body["settled"])
-            self.assertEqual(body["state"], "termination_unknown")
-            self.assertEqual(body["session"]["detail"], "delegation timed out; worker unreachable")
-
-
-class PiDelegationTimeoutTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
-        self.tmp.close()
-        self.db = Database(self.tmp.name)
-        asyncio.run(self.db.connect())
-        asyncio.run(
-            self.db.upsert_worker(
-                WorkerRegistration(
-                    worker_id="archdome",
-                    name="archdome",
-                    worker_ip="100.64.0.89",
-                    pi_relay_port=27888,
-                    pi_relay_available=True,
-                    pi_relay_protocol_version=2,
-                )
+            await self.db._db.commit()
+            await self.db._db.execute("PRAGMA foreign_keys=ON")
+            await self.db._init_schema()
+            await self.db._init_schema()
+            self.assertIsNone(await self.db.get_pi_session("legacy"))
+            self.assertEqual(await self.db.list_pi_session_events("legacy"), [])
+            commands = await self.db._db.execute_fetchall(
+                "SELECT id FROM pi_session_commands WHERE session_id='legacy'"
             )
-        )
-        self.session_id = "child-1"
-        asyncio.run(self.db.insert_pi_session(PiSession(
-            id=self.session_id,
-            worker_id="archdome",
-            session_type=PiSessionType.DELEGATED,
-            state=PiSessionState.WORKING,
-            task="t",
-            created_at=100,
-            updated_at=100,
-        )))
-        self.delegation = PiDelegation(
-            id="del-1",
-            worker_id="archdome",
-            child_session_id=self.session_id,
-            task="t",
-            state=PiSessionState.WORKING,
-            timeout_seconds=60,
-            created_at=100,
-        )
-        asyncio.run(self.db.insert_pi_delegation(self.delegation))
+            self.assertEqual(commands, [])
+            task = await self.db.get_pi_session("task-one")
+            self.assertIsNone(task.parent_session_id)
+            self.assertEqual(
+                [event.id for event in await self.db.list_pi_session_events("task-one")],
+                ["kept-event"],
+            )
+            self.assertEqual(len(await self.db.list_pi_sessions()), 5)
 
-    def tearDown(self) -> None:
-        asyncio.run(self.db.close())
-        Path(self.tmp.name).unlink(missing_ok=True)
+        asyncio.run(migrate())
 
-    def test_unexpired_delegation_is_untouched(self):
-        async def relay(_worker, _method, _path, _payload=None):
-            raise AssertionError("relay must not be called")
+    def test_transcript_path_survives_projection_and_cannot_escape_session_directory(self):
+        asyncio.run(self.db.update_pi_session_meta("task-one", {"machine": "desktop"}))
+        resume_path = "/home/user/.omp/agent/sessions/project/session.jsonl"
+        with self.client() as client:
+            accepted = client.post(
+                "/api/v1/pi/bridge/register", headers=self.auth("task-one-token"),
+                json={"session_id": "task-one", "incarnation": "new", "resume_path": resume_path},
+            )
+            self.assertEqual(accepted.status_code, 200, accepted.text)
+            denied = client.post(
+                "/api/v1/pi/bridge/register", headers=self.auth("task-one-token"),
+                json={"session_id": "task-one", "incarnation": "bad", "resume_path": "/etc/passwd"},
+            )
+            self.assertEqual(denied.status_code, 403, denied.text)
+        asyncio.run(self.db.next_pi_session_pane_sequence("task-one"))
+        asyncio.run(self.db.update_pi_session_meta("task-one", {"pr_url": "https://github.com/o/r/pull/1"}))
+        persisted = asyncio.run(self.db.get_pi_session("task-one"))
+        self.assertEqual(persisted.meta["resume_path"], resume_path)
+        self.assertEqual(persisted.bridge_incarnation, "new")
 
-        asyncio.run(sweep_expired_pi_delegations(self.db, relay, now=120))
-        session = asyncio.run(self.db.get_pi_session(self.session_id))
-        self.assertEqual(session.state, PiSessionState.WORKING)
+    def test_heartbeat_does_not_reset_idle_clock_but_mailbox_activity_does(self):
+        async def exercise():
+            session, _ = await self.db.apply_interactive_pi_events(
+                "pm-one", PiBridgeEventBatch(incarnation="pm-one-inc", state=PiSessionState.IDLE),
+                now=100,
+            )
+            self.assertEqual(session.updated_at, 1)
+            self.assertEqual(session.last_seen, 100)
+            await self.db.enqueue_pi_session_command(PiSessionCommand(
+                session_id="pm-one", message="review", created_at=101,
+            ))
+            session, _ = await self.db.apply_interactive_pi_events(
+                "pm-one", PiBridgeEventBatch(
+                    incarnation="pm-one-inc", state=PiSessionState.IDLE,
+                    has_pending_messages=False,
+                ), now=200,
+            )
+            self.assertEqual(session.updated_at, 101)
+            self.assertTrue(session.has_pending_messages)
+        asyncio.run(exercise())
 
-    def test_acknowledged_timeout_stops_session(self):
-        calls = []
-
-        async def relay(_worker, method, path, _payload=None):
-            calls.append((method, path))
-            return {"state": "stopped"}
-
-        asyncio.run(sweep_expired_pi_delegations(self.db, relay, now=200))
-        session = asyncio.run(self.db.get_pi_session(self.session_id))
-        delegation = asyncio.run(self.db.get_pi_delegation("del-1"))
-        self.assertEqual(session.state, PiSessionState.STOPPED)
-        self.assertEqual(session.detail, "delegation timed out")
-        self.assertEqual(delegation.state, PiSessionState.STOPPED)
-        self.assertEqual(calls, [("POST", f"/v1/sessions/{self.session_id}:cancel")])
-        events = asyncio.run(self.db.list_pi_session_events(self.session_id))
-        self.assertEqual(events[-1].event_type, "timeout")
-
-    def test_unacknowledged_timeout_is_termination_unknown(self):
-        async def relay(_worker, _method, _path, _payload=None):
-            raise RuntimeError("worker unreachable")
-
-        asyncio.run(sweep_expired_pi_delegations(self.db, relay, now=200))
-        session = asyncio.run(self.db.get_pi_session(self.session_id))
-        delegation = asyncio.run(self.db.get_pi_delegation("del-1"))
-        self.assertEqual(session.state, PiSessionState.TERMINATION_UNKNOWN)
-        self.assertEqual(delegation.state, PiSessionState.TERMINATION_UNKNOWN)
-        events = asyncio.run(self.db.list_pi_session_events(self.session_id))
-        self.assertEqual(events[-1].event_type, "timeout_unknown")
-
-    def test_timeout_seconds_round_trips_through_delegation(self):
-        delegation = asyncio.run(self.db.get_pi_delegation("del-1"))
-        self.assertEqual(delegation.timeout_seconds, 60)
-
-
-class StandaloneWebGlobalContractTests(unittest.TestCase):
-    def test_router_proxy_is_allowlisted_before_generic_api_denial(self):
-        nginx = (Path(__file__).resolve().parents[1] / "web_container" / "nginx.conf").read_text()
-        router = nginx.index("/api/v1/pi/router")
-        denial = nginx.index("location /api/ {")
-        self.assertLess(router, denial)
-        self.assertIn(":dispatch", nginx)
-        self.assertIn("requests/[^/]+", nginx)
-        self.assertIn("/api/v1/pi/sessions", nginx)
-
-    def test_global_shell_versions_are_consistent(self):
-        root = Path(__file__).resolve().parents[1]
-        page = (root / "web" / "index.html").read_text()
-        worker = (root / "web" / "sw.js").read_text()
-        self.assertIn("/app.css?v=15", page)
-        self.assertIn("/app.js?v=15", page)
-        self.assertIn('wh-pi-shell-v15', worker)
-        self.assertIn('"/app.css?v=15"', worker)
-        self.assertIn('"/app.js?v=15"', worker)
-        self.assertIn('url.pathname.startsWith("/api/")', worker)
+    def test_operator_token_file_and_invalid_configuration(self):
+        secret_file = self.path.with_suffix(".token")
+        self.addCleanup(secret_file.unlink, missing_ok=True)
+        secret_file.write_text("f" * 43 + "\n")
+        with patch.dict(os.environ, {
+            "WH_OPERATOR_TOKEN": "", "WH_OPERATOR_TOKEN_FILE": str(secret_file),
+        }):
+            app = create_app(self.db)
+            with TestClient(app) as client:
+                self.assertEqual(client.get("/api/v1/workers").status_code, 401)
+                self.assertEqual(client.get(
+                    "/api/v1/workers", headers=self.auth("f" * 43),
+                ).status_code, 200)
+            secret_file.write_text("weak")
+            with self.assertRaises(ValueError):
+                create_app(self.db)
 
 
 if __name__ == "__main__":

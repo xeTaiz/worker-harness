@@ -32,14 +32,18 @@ class JobKind(str, Enum):
 
 class PiSessionType(str, Enum):
     INTERACTIVE = "interactive"
-    DELEGATED = "delegated"
     GLOBAL_ROUTER = "global-router"
+
+    @property
+    def bridge_backed(self) -> bool:
+        return self is PiSessionType.INTERACTIVE or self is PiSessionType.GLOBAL_ROUTER
 
 
 class PiSessionState(str, Enum):
     QUEUED = "queued"
     STARTING = "starting"
     WORKING = "working"
+    BLOCKED = "blocked"
     IDLE = "idle"
     STOPPED = "stopped"
     FAILED = "failed"
@@ -90,12 +94,6 @@ class WorkerRegistration(BaseModel):
     # Immediate non-symlink directory children below effective container bind
     # destinations. This is a shallow discovery hint, not a recursive inventory.
     data_paths: list[str] = Field(default_factory=list)
-    # Worker-local Pi relay published through userspace Tailscale Serve.
-    # `available` is false when bind/publication failed, even though a port is
-    # configured, so clients can avoid a dead direct-attach route.
-    pi_relay_port: int = Field(default=0, ge=0, le=65535)
-    pi_relay_available: bool = False
-    pi_relay_protocol_version: int = Field(default=0, ge=0)
     timestamp: str = ""
 
 
@@ -119,9 +117,6 @@ class Worker(BaseModel):
     total_disk_gb: float = 0.0
     used_disk_gb: float = 0.0
     data_paths: list[str] = Field(default_factory=list)
-    pi_relay_port: int = Field(default=0, ge=0, le=65535)
-    pi_relay_available: bool = False
-    pi_relay_protocol_version: int = Field(default=0, ge=0)
     status: WorkerStatus = WorkerStatus.OFFLINE
     last_heartbeat_ts: int = 0
     created_at: int = 0
@@ -151,9 +146,6 @@ class Worker(BaseModel):
             total_disk_gb=reg.total_disk_gb,
             used_disk_gb=reg.used_disk_gb,
             data_paths=reg.data_paths,
-            pi_relay_port=reg.pi_relay_port,
-            pi_relay_available=reg.pi_relay_available,
-            pi_relay_protocol_version=reg.pi_relay_protocol_version,
             status=WorkerStatus.ONLINE,
             last_heartbeat_ts=now,
             created_at=now,
@@ -176,9 +168,6 @@ class Worker(BaseModel):
         self.total_disk_gb = reg.total_disk_gb
         self.used_disk_gb = reg.used_disk_gb
         self.data_paths = reg.data_paths
-        self.pi_relay_port = reg.pi_relay_port
-        self.pi_relay_available = reg.pi_relay_available
-        self.pi_relay_protocol_version = reg.pi_relay_protocol_version
         self.status = WorkerStatus.ONLINE
         self.last_heartbeat_ts = int(datetime.now(timezone.utc).timestamp())
 
@@ -189,13 +178,17 @@ class PiSession(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     worker_id: str | None = None
     parent_session_id: str | None = None
-    session_type: PiSessionType = PiSessionType.DELEGATED
+    session_type: PiSessionType = PiSessionType.INTERACTIVE
     state: PiSessionState = PiSessionState.QUEUED
     task: str = ""
     cwd: str = ""
     tmux_session: str = ""
     detail: str = ""
-    # Interactive bridge metadata. Delegated sessions leave these empty.
+    role: str = ""
+    token_hash: str = Field(default="", exclude=True, repr=False)
+    question: str = ""
+    meta: dict[str, Any] = Field(default_factory=dict)
+    # Interactive bridge and host-relay metadata.
     name: str = ""
     host: str = ""
     agent: str = "pi"
@@ -221,7 +214,7 @@ class PiSessionEvent(BaseModel):
 
 
 class PiIngestEvent(BaseModel):
-    """Worker-relay reported event for a delegated session (spec §7.2)."""
+    """Event supplied during bridge registration or an event batch."""
 
     id: str | None = Field(default=None, max_length=128)
     event_type: str = Field(min_length=1, max_length=64)
@@ -229,13 +222,6 @@ class PiIngestEvent(BaseModel):
     created_at: int = 0
 
 
-class PiIngestPayload(BaseModel):
-    """Batch envelope for worker-relay uploads."""
-
-    session_id: str = Field(min_length=1, max_length=64)
-    state: PiSessionState | None = None
-    detail: str = ""
-    events: list[PiIngestEvent] = Field(default_factory=list)
 
 
 class PiBridgeRegister(BaseModel):
@@ -244,6 +230,7 @@ class PiBridgeRegister(BaseModel):
     session_id: str = Field(min_length=1, max_length=128)
     incarnation: str = Field(min_length=1, max_length=128)
     cwd: str = Field(default="", max_length=4096)
+    resume_path: str = Field(default="", max_length=4096)
     name: str = Field(default="", max_length=256)
     host: str = Field(default="", max_length=256)
     agent: str = Field(default="pi", max_length=16, pattern=r"^[a-z][a-z0-9_-]*$")
@@ -279,41 +266,6 @@ class PiSessionCommand(BaseModel):
     delivered_at: int = 0
 
 
-class PiRouterConfig(BaseModel):
-    provider: str = "openai-codex"
-    model: str = "gpt-5.3-codex-spark"
-    thinking_level: str = "off"
-    updated_at: int = 0
-
-
-class PiRouterRequest(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid4()))
-    message: str
-    selection_mode: str = "auto"
-    candidate_snapshot: list[dict[str, Any]] = Field(default_factory=list)
-    selected_session_id: str | None = None
-    router_output: str = ""
-    provider: str = ""
-    model: str = ""
-    thinking_level: str = "off"
-    latency_ms: int = 0
-    status: str = "routing"
-    error: str = ""
-    command_id: str | None = None
-    created_at: int = 0
-    completed_at: int = 0
-
-
-class PiDelegation(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid4()))
-    parent_session_id: str | None = None
-    worker_id: str
-    child_session_id: str
-    task: str
-    state: PiSessionState = PiSessionState.QUEUED
-    timeout_seconds: int = 0
-    created_at: int = 0
-    completed_at: int = 0
 
 
 # ── Job ────────────────────────────────────────────────────────────────
@@ -415,9 +367,6 @@ class WorkerSummary(BaseModel):
     status: WorkerStatus
     last_heartbeat_ts: int
     running_job_count: int = 0
-    pi_relay_port: int = 0
-    pi_relay_available: bool = False
-    pi_relay_protocol_version: int = 0
 
     @property
     def ssh_host(self) -> str:
