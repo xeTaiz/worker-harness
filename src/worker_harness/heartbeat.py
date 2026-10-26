@@ -69,6 +69,8 @@ from .models import (
 from .ratelimit import AgentRateLimiter, RateLimited, resolve_agent_name
 from .reaper import reap_loop
 from .ssh import async_ssh_run, set_lanes, ssh_download_bytes, ssh_port_forward, ssh_upload_bytes
+from .ssh import ssh_stage_job_runner
+from .slurm import mount_slurm_routes, slurm_http_error
 from .tunnel_registry import TunnelProcess, TunnelRegistry
 
 log = logging.getLogger("heartbeat-server")
@@ -83,14 +85,17 @@ class JobCreateRequest(BaseModel):
     no_pty: bool = False
     sync: bool = False       # block until command finishes, return stdout
     sync_timeout: int = 120  # seconds to wait in sync mode
+    notify_recipient_id: str | None = Field(default=None, min_length=1, max_length=256)
 
 class JobEnqueueRequest(BaseModel):
     worker_id: str
     command: str
     name: str = Field(min_length=1)
     expected_seconds: int = Field(ge=1)
-    gpu_count: int = Field(default=1, ge=1)
+    gpu_count: int = Field(default=1, ge=0)
     no_pty: bool = False
+    notify_recipient_id: str | None = Field(default=None, min_length=1, max_length=256)
+    submission_key: str | None = Field(default=None, min_length=1, max_length=256)
 
     @field_validator("name")
     @classmethod
@@ -105,7 +110,7 @@ class QueuedJobUpdateRequest(BaseModel):
     position: int | None = Field(default=None, ge=1)
     name: str | None = None
     expected_seconds: int | None = Field(default=None, ge=1)
-    gpu_count: int | None = Field(default=None, ge=1)
+    gpu_count: int | None = Field(default=None, ge=0)
 
     @field_validator("name")
     @classmethod
@@ -307,21 +312,76 @@ async def lifespan(app: FastAPI):
 def create_registration_app(db: Database) -> FastAPI:
     """Worker-only registration service, intentionally separate from control."""
     app = FastAPI(title="Worker Harness Registration API")
+    jm = JobManager(db)
 
     @app.post("/register")
-    async def register(reg: WorkerRegistration):
+    async def register(
+        reg: WorkerRegistration, authorization: str | None = Header(default=None),
+    ):
         try:
+            existing = await db.get_worker(reg.worker_id)
+            if existing is not None and existing.slurm is not None:
+                scheme, _, token = (authorization or "").partition(" ")
+                if (
+                    scheme.lower() != "bearer"
+                    or not token
+                    or not await db.authenticate_slurm_worker(reg.worker_id, token)
+                ):
+                    raise HTTPException(status_code=401, detail="scoped worker bearer token required")
+                # Validate immutable identity/capacity and apply proven results
+                # before attempting transport. A failed probe leaves work queued.
+                worker = await db.register_slurm_worker(reg, ready=False)
+                if worker.status != WorkerStatus.DRAINING and not (
+                    reg.slurm is not None and reg.slurm.startup_error
+                ):
+                    nonce = secrets.token_hex(24)
+                    try:
+                        probe = await async_ssh_run(worker, f"printf '%s' '{nonce}'", timeout=10)
+                        ready = probe.returncode == 0 and probe.stdout == nonce
+                        if ready and worker.slurm.started_at is None:
+                            staged = await ssh_stage_job_runner(worker)
+                            ready = staged.returncode == 0
+                    except Exception:
+                        log.warning("SSH readiness failed for reserved worker %s", worker.id)
+                        ready = False
+                    if ready:
+                        worker = await db.register_slurm_worker(reg, ready=True)
+                if worker.status == WorkerStatus.ONLINE:
+                    await jm.dispatch_worker(worker)
+                    worker = await db.get_worker(worker.id)
+                queue = await db.list_queued_jobs(worker.id)
+                running = [
+                    job for job in await db.list_jobs(worker_id=worker.id)
+                    if job.status in (JobStatus.STARTING, JobStatus.RUNNING)
+                ]
+                return {
+                    "status": "ok", "worker_id": worker.id,
+                    "worker_status": worker.status.value,
+                    "queued_jobs": [
+                        job.model_dump(mode="json") for job in queue
+                        if job.status == JobStatus.PENDING
+                    ],
+                    "running_jobs": [job.model_dump(mode="json") for job in running],
+                    "draining": worker.status == WorkerStatus.DRAINING,
+                    "failure_deadline": worker.slurm.failure_deadline,
+                }
+            if reg.worker_id.startswith("cluster:"):
+                raise HTTPException(status_code=422, detail="cluster: is reserved for client targets")
             worker = await db.upsert_worker(reg)
             log.info(
                 "Worker registered/updated: %s (id=%s, ip=%s)",
                 worker.name, worker.id, worker.worker_ip,
             )
             return {"status": "ok", "worker_id": worker.id}
-        except ValidationError as exc:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-        except Exception as exc:
-            log.error("Registration failed: %s", exc)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+        except HTTPException:
+            raise
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise slurm_http_error(exc) from exc
+        except Exception:
+            log.exception("Registration failed")
+            raise HTTPException(status_code=500, detail="registration failed")
 
     @app.get("/health")
     async def health():
@@ -333,6 +393,8 @@ def create_registration_app(db: Database) -> FastAPI:
         worker = await db.get_worker(worker_id)
         if not worker:
             raise HTTPException(status_code=404, detail="worker not found")
+        if worker.slurm is not None:
+            raise HTTPException(status_code=403, detail="reserved workers require scoped /register reports")
         applied = 0
         try:
             for report in payload.jobs:
@@ -571,6 +633,14 @@ async def require_api_caller(request: HTTPConnection) -> None:
         allowed += ("orchestrator",)
     await require_role(*allowed)(request, request.headers.get("authorization"))
 
+async def require_slurm_control(request: HTTPConnection) -> PiSession | None:
+    """New controls never inherit anonymous development-mode authority."""
+    authorization = request.headers.get("authorization")
+    if authorization is None:
+        raise HTTPException(status_code=401, detail="operator or session bearer token required")
+    return await require_role("operator", "pm", "task")(request, authorization)
+
+
 
 def create_app(db: Database) -> FastAPI:
     """Create the privileged control API (kept as the public test factory)."""
@@ -606,6 +676,7 @@ def create_app(db: Database) -> FastAPI:
     )
     set_global_metrics(app.state.metrics)
     set_lanes(app.state.lanes)
+    mount_slurm_routes(app, db, require_slurm_control)
 
     @app.get("/health")
     async def health():
@@ -1554,19 +1625,19 @@ def create_app(db: Database) -> FastAPI:
                 status_code=404,
                 detail=f"Worker not found: {payload.worker_id}",
             )
-        if payload.gpu_count > worker.gpu_count:
-            raise HTTPException(
-                status_code=422,
-                detail=f"gpu_count exceeds worker capacity ({worker.gpu_count})",
+        try:
+            job = await jm.enqueue_job(
+                worker,
+                payload.command,
+                payload.name,
+                payload.expected_seconds,
+                gpu_count=payload.gpu_count,
+                pty_enabled=not payload.no_pty,
+                notify_recipient_id=payload.notify_recipient_id,
+                submission_key=payload.submission_key,
             )
-        job = await jm.enqueue_job(
-            worker,
-            payload.command,
-            payload.name,
-            payload.expected_seconds,
-            gpu_count=payload.gpu_count,
-            pty_enabled=not payload.no_pty,
-        )
+        except ValueError as exc:
+            raise slurm_http_error(exc) from exc
         return job.model_dump(mode="json")
 
     @app.get("/api/v1/jobs/queue")
@@ -1616,12 +1687,6 @@ def create_app(db: Database) -> FastAPI:
                 detail=f"Worker not found: {job.worker_id}",
             )
 
-        requested_gpu_count = payload.gpu_count or job.gpu_count
-        if requested_gpu_count > destination_worker.gpu_count:
-            raise HTTPException(
-                status_code=422,
-                detail=f"gpu_count exceeds worker capacity ({destination_worker.gpu_count})",
-            )
         try:
             await db.update_pending_job(
                 job_id,
@@ -1634,7 +1699,9 @@ def create_app(db: Database) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"Job not found: {job_id}") from exc
         except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            if str(exc) == "queued job is not pending":
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise slurm_http_error(exc) from exc
 
         dispatch_workers = {
             worker.id: worker
@@ -1673,12 +1740,16 @@ def create_app(db: Database) -> FastAPI:
                 detail=f"Worker not found: {payload.worker_id}",
             )
 
-        job = await jm.start_job(
-            worker,
-            payload.command,
-            name=payload.name,
-            pty_enabled=not payload.no_pty,
-        )
+        try:
+            job = await jm.start_job(
+                worker,
+                payload.command,
+                name=payload.name,
+                pty_enabled=not payload.no_pty,
+                notify_recipient_id=payload.notify_recipient_id,
+            )
+        except ValueError as exc:
+            raise slurm_http_error(exc) from exc
 
         if not payload.sync:
             return job.model_dump(mode="json")

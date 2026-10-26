@@ -329,39 +329,277 @@ loginctl enable-linger "$USER"
 
 ## Slurm-launched workers
 
-Cluster nodes have no systemd user services and no rclone: a batch job runs
-`bash <install-dir>/start-wh.sh` directly, so only the launcher and the Slurm
-helpers need updating. Point the recipe at the install directory, either on the
-cluster filesystem or through its mount on any worker:
+Cluster targets are local client configuration, not idle workers. Discover them
+through ordinary `list_workers` / `get_worker`, then `enqueue` on
+`cluster:<profile-id>` with a shared `slurm.project_path`, explicit bounded
+`walltime_seconds`, and optional tested `environment_path`. CPU preparation is
+another ordinary queued job on a CPU target; wait for it before submitting GPU
+work. The client validates fresh Slurm capacity, reserves a real OFFLINE worker,
+persists its ordinary initial queued job, and only then submits one finite batch
+allocation through the user's local SSH. No login-node service or container is
+required. SSH uses configured aliases and requires working noninteractive
+authentication and verified host keys.
+
+The allocation uses the standard WH SIF and existing daemon/queue. It starts
+only for attached useful work, preserves logs/results under
+`<shared_root>/.wh-slurm/<worker_id>`, and exits when work finishes (or after the
+configured bounded failure grace). Diagnose with ordinary `exec` and rerun with
+`enqueue` while the allocation remains available; a finished allocation requires
+a fresh enqueue. Checkpoint signals request cooperative workload handling, not
+proof that a checkpoint was saved. Preemption can provide less or no warning.
+The wrapper never submits successors or requeues, and refuses repeated launches.
+It removes only its staged enrollment and worker-token copies on exit, retaining
+shared workload output and runtime evidence.
+
+Use the same existing shared filesystem on the cluster and at least one WH
+worker, exposed at `/data/shared/<storage_id>`. Matching path spelling alone is
+not evidence of shared identity; enqueue checks a random probe through ordinary
+worker exec and local cluster SSH. Prepare source, lockfiles, data, and uv
+environments through ordinary file/exec tools on that storage, not a copied venv
+or an experiment-specific SIF. See the configuration below for shared binds.
+
+After changing root `start-wh.sh` or `slurm/wh-allocation.sh`, run
+`just package-slurm-client` to regenerate the extension's deterministic
+`slurm/runtime-assets.json`. Only these two small root-owned scripts are staged
+per allocation; the configured shared SIF and project/environment stay in place.
+
+### Allocation runtime and enrollment security
+
+Slurm mode is selected only by the reserved `WH_SLURM_WORKER_ID` and the staged
+`WH_SLURM_SETTINGS_FILE`. It uses the same worker image, entrypoint, daemon,
+Tailscale SSH, tmux, and ordinary queue as fleet workers, not a separate
+execution service. Each allocation owns `<host_run_path>/runtime`, visible as
+`<run_path>/runtime` in the container. Its Tailscale hostname is `whc-<worker_id>`;
+its registration name is the exact `worker_name` recorded in the reservation
+settings. The launcher forces one-shot `run --cleanenv`, ignores ambient env
+files, and neither creates nor attaches a writable overlay. Slurm requires a
+modern Apptainer/Singularity supporting `--contain` and
+`--no-mount=cwd,hostfs,bind-paths`; unsupported flags fail visibly rather than
+exposing ambient host mounts. Only configured shared roots and explicit extra
+binds are added, alongside the allocation's isolated home/runtime; the login
+node's code/home collections, CWD, `/mnt`, and administrator-configured host
+binds are not inherited. The private container `/tmp` is shared by its daemon
+and Tailscale SSH children, not by other allocations. Fleet startup keeps its
+existing env-file, automatic bind, overlay, and instance defaults.
+
+`TS_AUTHKEY_FILE` and `WH_WORKER_TOKEN_FILE` name staged secret files, never
+credential values in container arguments or settings. Both have read-only
+explicit binds and private run-directory permissions. Enrollment uses
+`tailscale up --auth-key=file:PATH --advertise-tags=tag:wh-cluster-job`.
+Provision a **non-reusable, ephemeral** enrollment key restricted to that tag
+out of band; do not reuse a fleet/orchestrator enrollment key. Never stage
+operator credentials or forward the submitting user's SSH keys into an
+allocation. The wrapper removes its known credential copies on exit, but
+shared storage and its owner remain trusted; tags are not multi-user isolation.
+
+Each allocation has independent Tailscale state under its runtime directory.
+Private short sockets use container-local `/tmp/wh-ts-<id-hash>` and
+`/tmp/wh-tmux-<id-hash>` (0700) so long shared-storage paths do not exceed Unix
+socket limits. `tailscaled --port=0` avoids fixed UDP ports; its localhost
+SOCKS listener is selected dynamically and startup bind failures retry at most
+five times. The wrapper's 180-second startup deadline includes container startup
+and potentially hanging enrollment. A Tailnet IP alone is not worker readiness:
+authenticated registration, resource mapping, and the orchestrator's actual
+Tailscale SSH probe must succeed before queue dispatch.
+
+GPU mode requires and preserves Slurm's original `CUDA_VISIBLE_DEVICES` across
+`--cleanenv` as `WH_SLURM_CUDA_VISIBLE_DEVICES`; the daemon resolves assigned CUDA
+device UUIDs and rejects missing, ambiguous, or unsupported MIG mappings. CPU
+mode omits `--nv`, skips NVIDIA/CUDA setup and readiness, reports zero GPUs, and
+forces an empty CUDA mask for launches. CPU and memory reports use allocation
+limits, not the whole shared node. Jobs retain structured runner output and
+descendant-exit evidence beneath `runtime/harness/<job_id>`; missing contact or
+a printed `EXIT:` line is not completion proof.
+
+`headscale-policy.example.json` adds a restricted `tag:wh-cluster-job` example:
+cluster jobs can reach only orchestrator registration port **12888**, and the
+orchestrator can reach cluster workers on Tailnet SSH port **22**. They receive
+no permission for privileged control port **12889** and cannot contact one
+another through this tag. Issue ephemeral tagged keys separately from ACL
+configuration. Review existing broader site rules before applying any example;
+the client and runtime never change live Tailnet policy automatically.
+
+
+### Legacy allocation cutover prerequisite
+
+Before enabling finite enqueue on a cluster with legacy self-chaining jobs, the
+operator must identify the **exact owned pending successor job IDs**, verify
+their user/dependency/identity, cancel those IDs explicitly, and disable external
+resubmitters (including any cron/scrontab or other launch automation). Let running
+useful work drain or finish. Do not use broad name-based `scancel`, and do not
+cancel unrelated jobs. Removing old repository scripts does not stop batch
+scripts already submitted to Slurm. Development and local tests never perform
+this live cutover automatically.
+
+### Configured shared storage and local cluster profiles
+
+`start-wh.sh` accepts `WH_SHARED_ROOTS_JSON`, a JSON object mapping a stable
+`storage_id` to an **existing absolute host directory**. Configure it on the
+cluster and on every participating worker, using each host's actual mount path:
 
 ```bash
-just deploy-slurm /data/shared/ibex/worker-harness
-just deploy-slurm /ibex/user/engeld/worker-harness --with-image
+# Cluster host:
+export WH_SHARED_ROOTS_JSON='{"ibex":"/cluster/shared/user"}'
+# A participating worker mounting that same filesystem elsewhere:
+export WH_SHARED_ROOTS_JSON='{"ibex":"/mnt/cluster-user"}'
 ```
 
-Each file is replaced through a temporary name in the same directory, so a job
-starting mid-update reads either the old or the new file. Queued and running
-jobs are untouched: the batch scripts do not change, and every new job in the
-self-chaining sequence picks up the current launcher.
+Both expose that collection as `/data/shared/ibex`. This does not mount a network
+filesystem: the host mount is a prerequisite. Storage IDs match
+`[A-Za-z0-9][A-Za-z0-9_-]*`. Invalid JSON, duplicate IDs, non-directory/missing
+paths, relative paths, control characters, or bind delimiters (`:`, `;`, `,`)
+fail startup; symlinks are resolved and their targets validated. Omit the
+variable, leave it empty, or use `{}` for no explicit mappings.
+Each configured entry joins the existing bind manifest used for data discovery.
+It overrides an automatically detected IBEX bind with the same storage ID, while
+other automatic binds and unrelated `WH_EXTRA_BINDS` entries remain intact.
+Existing managed-source suppression still avoids redundant `WH_EXTRA_BINDS`.
 
-On these nodes the launcher binds the same collections natively:
+Local profile configuration is read from `WH_CLUSTER_CONFIG`, or
+`${XDG_CONFIG_HOME:-$HOME/.config}/worker-harness/clusters.json`. A missing file
+means no configured cluster targets; malformed configuration is an explicit
+error. The format is `{ "version": 1, "clusters": [...] }`, for example:
 
-```text
-/ibex/user/<user>      → /code and /data/shared/ibex
-/ibex/project/c2324    → /data/shared/ibex_c2324
+```json
+{
+  "version": 1,
+  "clusters": [{
+    "id": "ibex-gpu",
+    "description": "Example GPU account; confirm site preemption and utilization limits.",
+    "ssh_host": "ibex",
+    "storage_id": "ibex",
+    "shared_root": "/cluster/shared/user",
+    "sif_path": "/cluster/shared/user/worker-harness/worker-harness-worker.sif",
+    "compute_kind": "gpu",
+    "gpu_type": "a100",
+    "runtime": "apptainer",
+    "runtime_setup": "module load apptainer",
+    "account": "YOUR_ACCOUNT",
+    "partition": "YOUR_GPU_PARTITION",
+    "max_gpus": 1,
+    "max_walltime_seconds": 600,
+    "failure_grace_seconds": 0,
+    "termination_grace_seconds": 20,
+    "tailnet_key_file": "/home/YOU/.config/worker-harness/cluster-tailnet.key",
+    "tailnet_login_server": "https://YOUR_TAILNET_CONTROL",
+    "orchestrator_host": "YOUR_ORCHESTRATOR"
+  }]
+}
 ```
 
-`WH_IBEX_USER_ROOT`, `WH_IBEX_PROJECT_ROOT`, and the semicolon-separated
-`WH_IBEX_PROJECTS` override the detected paths. The user filesystem is
-deliberately bound twice, because it holds both the repositories and the shared
-collection other workers reach through rclone. Hosts without those directories
-are unaffected.
+These are illustrative paths, capacity, account, partition and runtime setup,
+not detected IBEX settings. `ssh_host` is a local SSH alias; credentials stay
+local. `runtime_setup` is a trusted shell prelude, not untrusted workload input.
+`storage_id` defaults to `id`, and
+`WH_SHARED_ROOTS_JSON[storage_id]` on the cluster must match `shared_root`.
+Profiles for different partitions on one filesystem use the same `storage_id`
+and `shared_root`, including a separate CPU preparation profile with
+`compute_kind: "cpu"`, `max_gpus: 0`, no `gpu_type`, and the actual configured
+CPU partition. Optional `qos`, `constraint`, `max_cpus` and `max_memory_mb` describe
+site policy. `warning_seconds`, `orchestrator_registration_port` and
+`poll_seconds` default to 120, 12888 and 15 respectively.
+Set the required `failure_grace_seconds` to 0 when idle allocation holding is
+forbidden; document preemption, utilization and account restrictions in
+`description`.
+
+#### Verify storage identity, not just path spelling
+
+Use `list_data` to find an existing participating worker (a nonempty project
+directory makes the collection discoverable). Matching `/data/shared/ibex`
+paths alone are not proof that it and the cluster see the same files. Run this
+through **ordinary WH exec** on that worker:
+
+```bash
+python3 - <<'PY'
+import json
+import secrets
+from pathlib import Path
+
+probe = Path("/data/shared/ibex") / (".wh-storage-probe-" + secrets.token_hex(16))
+token = secrets.token_hex(32)
+with probe.open("x") as handle:
+    handle.write(token + "\n")
+print(json.dumps({"probe_name": probe.name, "token": token}))
+PY
+```
+
+Copy the returned random name and token into the local client shell, then read
+the exact file through the profile's **local cluster SSH**, not through a worker
+SSH hop. For the example mapping above:
+
+```bash
+probe_name='PASTE_RETURNED_PROBE_NAME'
+expected='PASTE_RETURNED_TOKEN'
+actual=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 \
+  ibex "cat -- '/cluster/shared/user/$probe_name'") &&
+  test "$actual" = "$expected"
+```
+
+Require that exact token comparison to succeed before reusing the storage.
+Regardless of success, remove the specific probe through ordinary WH exec on
+the same worker (`rm -- /data/shared/ibex/RETURNED_PROBE_NAME`). A failed read or
+different token is a mount/identity error, not permission to assume equivalence.
+
+#### Reuse the standard SIF and project-local uv environments
+
+Prepare and test projects through ordinary exec on a participating worker under
+`/data/shared/<storage_id>/projects/...`. The standard WH SIF already includes
+`uv`; ML/CUDA experiment dependencies belong in the project's `pyproject.toml`
+and `uv.lock`, not in a newly rebuilt image for each experiment.
+
+Use the SHA-256 of the **exact SIF used by that worker** (obtain it with
+`sha256sum` on its host image), the lockfile hash, architecture and container
+Python major/minor as the environment key. For example, inside that SIF:
+
+```bash
+set -eu
+cd /data/shared/ibex/projects/my-project
+SIF_SHA256='PASTE_SHA256_OF_THE_EXACT_WORKER_SIF'
+lock_sha256=$(sha256sum uv.lock | cut -d ' ' -f 1)
+architecture=$(/usr/bin/python3 -c 'import platform; print(platform.machine())')
+python_version=$(/usr/bin/python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+export UV_PROJECT_ENVIRONMENT="$PWD/.venvs/$SIF_SHA256-$lock_sha256-$architecture-$python_version"
+export UV_CACHE_DIR=/data/shared/ibex/.cache/uv
+export UV_LINK_MODE=copy
+mkdir -p "$PWD/.venvs" "$UV_CACHE_DIR"
+(
+  flock -x 9
+  # A completed keyed environment is immutable; do not sync it during a run.
+  if [ ! -f "$UV_PROJECT_ENVIRONMENT/.wh-uv-ready" ]; then
+    uv sync --locked --python /usr/bin/python3
+    touch "$UV_PROJECT_ENVIRONMENT/.wh-uv-ready"
+  fi
+) 9>"$UV_PROJECT_ENVIRONMENT.lock"
+"$UV_PROJECT_ENVIRONMENT/bin/python" -c 'import sys; print(sys.executable)'
+```
+
+Keep the lockfile/worktree unchanged throughout preparation; the adjacent
+`flock` serializes creators, and the readiness marker is written only after a
+successful sync. Use the resulting environment directly for runs, without an
+implicit `uv run` resync. Never modify an environment used by a running job:
+changed code/dependencies use a separate shared worktree/output directory and a
+new keyed environment. Keep the SIF, Python, architecture and absolute container
+paths identical wherever the environment is reused; hashes are compatibility
+evidence, not an image or dependency snapshot service.
+
+A test worker need not mount this filesystem. Transfer the relevant source,
+lockfile and data to a participating worker using existing `upload_file` or
+`data_copy`, then prepare there. CPU preparation can also be an ordinary queued
+job on a configured CPU target when cluster enqueue is available; wait for it
+to finish before dependent GPU work. There is no separate preparation API or
+dependency scheduler. **Do not copy a venv** built at another absolute path or
+architecture. Projects without uv supply their own tested environment. This
+Slurm runtime release requires a one-time SIF rebuild from the updated image
+definition: older images contain the old entrypoint and worker daemon and do not
+support this allocation workflow. Thereafter, rebuild for image runtime or base
+dependency changes, not individual experiments. Retain logs/checkpoints in
+separate shared output directories after jobs exit.
 
 ## Worker container env vars
 
 Required:
 
-- `TS_AUTHKEY` - Headscale/Tailscale auth key
+- `TS_AUTHKEY` or `TS_AUTHKEY_FILE` - Headscale/Tailscale auth key, or readable mounted key file (Slurm requires the file form)
 - `ORCHESTRATOR_HOST` - orchestrator tailnet DNS name (or tailnet IP)
 
 Defaults (if unset):
@@ -383,8 +621,17 @@ Defaults (if unset):
 - `WORKER_NAME=<container hostname>`
 - `WH_OVERLAY` - path to a writable ext3 overlay file (default: `$WH_DIR/overlay.ext3`). Created automatically on first start if the runtime supports it. Lets `apt install` persist across container restarts.
 - `WH_OVERLAY_SIZE` - overlay size in MiB (default: `8192` = 8 GB)
-- `WH_EXTRA_BINDS` - semicolon-separated `host:container` bind mount pairs (default: empty). The installer manages rclone mounts here. Entries whose host source is already covered by automatic code or `/mnt` mapping are ignored; other operator entries are retained.
+- `WH_EXTRA_BINDS` - semicolon-separated `host:container` bind mount pairs (default: empty). The installer manages rclone mounts here. Entries whose host source is already covered by automatic code, `/mnt`, or configured shared-root mapping are ignored; other operator entries are retained.
+- `WH_SHARED_ROOTS_JSON` - JSON object mapping `storage_id` to existing absolute host directory, bound at `/data/shared/<storage_id>` and recorded in the bind manifest (default: `{}`). Invalid entries fail startup; see the shared-storage workflow above.
 - `WH_CODE_ROOT` - optional host directory mounted directly at `/code`. By default the launcher chooses `$HOME/Work`, then `$HOME/Dev`; deployment creates `$HOME/Work` only when neither exists.
+
+Slurm launches additionally receive the wrapper-owned `WH_SLURM_WORKER_ID`,
+`WH_SLURM_SETTINGS_FILE`, `WH_WORKER_TOKEN_FILE`, and isolated `WH_DIR`.
+`WH_SLURM_COMPUTE_KIND` and `WH_SLURM_CUDA_VISIBLE_DEVICES` are set by the launcher
+from the settings and original allocation environment; they are not overrides
+for requesting resources. In this mode `WH_OVERLAY`, `WH_LAUNCH_MODE`,
+`TS_SOCKS5_ADDR`, `WH_PROXY`, and `TS_EXTRA_ARGS` cannot override the finite
+launch, dynamic networking, or enrollment tag policy.
 
 Data namespace identity:
 
@@ -413,6 +660,49 @@ Defaults (if unset):
 
 Worker registration uses `worker_ip`, `ssh_user`, and `harness_dir`.
 `zerotier_ip` is still accepted as a backward-compatible input alias for `worker_ip`.
+
+### Reserved Slurm workers and job events
+
+Slurm allocations use ordinary worker rows and the ordinary job queue. The
+control API reserves an `offline` worker with
+`POST /api/v1/workers/reservations`; the client then queues its initial task
+with `submission_key` equal to the reservation's `request_id`. Repeating an
+identical request returns the same worker/job; conflicting key reuse returns
+409. Reservation and scheduler-observation routes require a valid operator or
+compute-session bearer even when ordinary anonymous development access is enabled.
+
+Only the reservation's scoped token can register that worker on port 12888.
+The server stores its SHA-256 hash, checks immutable allocation capacity and
+ordered GPU UUIDs, and requires a successful orchestrator-to-worker SSH probe
+before dispatch. The scoped token cannot authorize control API calls. Ordinary
+worker registration is unchanged. CPU reservations admit zero-GPU queued jobs
+and execute them serially; zero-GPU queue requests remain invalid on ordinary
+workers and GPU allocations. Diagnostic immediate jobs do not extend failure grace.
+Grace is measured from the failed runner's recorded finish time. Only an actual
+start of newer queued work clears it—not admission or a queue claim. Durable
+start/finish evidence prevents delayed results or reconnects from restarting an
+older grace period; same-boot ordering uses monotonic timestamps.
+
+Job-scope cancellation of an empty allocation uses `cancel_requested: true`
+with `cancel_if_empty: true` on the observation route. The server atomically
+declines it if useful queued/running work appeared or startup already occurred;
+the client scancels only when the returned `cancel_requested` is true.
+Explicit allocation-scope cancellation closes admission unconditionally.
+
+`PATCH /api/v1/workers/{id}/slurm` records timestamped scheduler observations
+and validated recovered job results. Terminal accounting cannot be undone by
+an older poll or overwrite an already confirmed job result. Reserved workers
+and their job history survive stale-worker pruning. Draining or finished
+allocations reject new work with `409 SLURM_WORKER_FINISHED`; enqueue a fresh
+allocation rather than assigning work to retained history.
+
+Ordinary job creation accepts `notify_recipient_id`; cluster jobs inherit their
+worker's default when omitted. Authenticated
+`GET /api/v1/job-events?recipient_id=...&after=N` replays and tails persisted SSE
+events with sequence cursors and keepalives. Job transitions and events commit
+together. Recipients are single-user routing identifiers, **not privacy or
+ownership boundaries**. Delivery does not acknowledge agent action, and failure
+deadlines never wait for a client. The separate multi-user design is unchanged.
 
 ## Runtime requirements
 

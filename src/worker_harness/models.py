@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 
 # ── Enums ────────────────────────────────────────────────────────────
@@ -60,6 +60,7 @@ class GPUInfo(BaseModel):
     vram_total_gb: float
     vram_used_gb: float
     busy: bool | None = None
+    uuid: str | None = None
 
 
 # ── Resources ─────────────────────────────────────────────────────────
@@ -70,6 +71,136 @@ class SystemResources(BaseModel):
     used_ram_gb: float
     total_disk_gb: float
     used_disk_gb: float
+
+
+class SlurmLaunchPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cluster_id: str = Field(min_length=1, max_length=128)
+    storage_id: str = Field(min_length=1, max_length=128)
+    compute_kind: Literal["gpu", "cpu"]
+    cpus: int = Field(gt=0)
+    memory_mb: int = Field(gt=0)
+    walltime_seconds: int = Field(gt=0)
+    failure_grace_seconds: int = Field(ge=0)
+    warning_seconds: int = Field(ge=0)
+    termination_grace_seconds: int = Field(ge=0)
+
+
+class SlurmReservationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=256)
+    gpu_count: int = Field(ge=0)
+    recipient_id: str = Field(min_length=1, max_length=256)
+    registration_token_hash: str = Field(pattern=r"^[a-f0-9]{64}$", repr=False)
+    slurm: SlurmLaunchPolicy
+
+    @model_validator(mode="after")
+    def capacity_matches_kind(self):
+        if (self.slurm.compute_kind == "cpu") != (self.gpu_count == 0):
+            raise ValueError("CPU reservations require zero GPUs; GPU reservations require positive GPUs")
+        return self
+
+
+class RunnerResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    exit_code: int = Field(strict=True)
+    descendants_exited: Literal[True]
+    finished_at: float = Field(gt=0, allow_inf_nan=False)
+    finished_monotonic: float = Field(ge=0, allow_inf_nan=False)
+    boot_id: str = Field(min_length=1, max_length=128)
+    termination_reason: str | None = Field(default=None, max_length=1024)
+    started_at: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    started_monotonic: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_start_evidence(self):
+        if (self.started_at is None) != (self.started_monotonic is None):
+            raise ValueError("runner start evidence requires both wall and monotonic timestamps")
+        if self.started_monotonic is not None and self.started_monotonic > self.finished_monotonic:
+            raise ValueError("runner start must not follow its finish")
+        return self
+
+
+class JobResultReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1, max_length=128)
+    result: RunnerResult
+
+class RunnerStartObservation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1, max_length=128)
+    status: Literal["running"]
+    queue_managed: bool = Field(strict=True)
+    started_at: float = Field(gt=0, allow_inf_nan=False)
+    started_monotonic: float = Field(ge=0, allow_inf_nan=False)
+    boot_id: str = Field(min_length=1, max_length=128)
+
+
+
+class SlurmObservation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    slurm_job_id: str | None = Field(default=None, pattern=r"^[0-9]+$")
+    scheduler_state: str | None = Field(default=None, min_length=1, max_length=128)
+    scheduler_reason: str | None = Field(default=None, max_length=2048)
+    observed_at: float = Field(gt=0, allow_inf_nan=False)
+    submission_attempted: bool | None = None
+    submission_failed: bool | None = None
+    cancel_requested: bool | None = None
+    cancel_if_empty: bool = False
+    recovered_results: list[JobResultReport] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def conditional_cancellation_requires_request(self):
+        if self.cancel_if_empty and self.cancel_requested is not True:
+            raise ValueError("cancel_if_empty requires cancel_requested=true")
+        return self
+
+
+class SlurmHeartbeat(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    results: list[JobResultReport] = Field(default_factory=list, max_length=100)
+    startup_error: str | None = Field(default=None, max_length=2048)
+    checkpoint_requested: bool = False
+    draining: bool = False
+    failure_deadline: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+
+
+class SlurmWorkerInfo(SlurmLaunchPolicy):
+    request_id: str
+    initial_job_id: str | None = None
+    recipient_id: str
+    slurm_job_id: str | None = None
+    scheduler_state: str | None = None
+    scheduler_reason: str | None = None
+    observed_at: float | None = None
+    submission_attempted: bool = False
+    submission_failed: bool = False
+    cancel_requested: bool = False
+    submitted_at: float | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    failure_deadline: float | None = None
+    last_useful_started_at: float | None = None
+    last_useful_started_monotonic: float | None = None
+    last_useful_boot_id: str | None = None
+
+
+class JobEvent(BaseModel):
+    sequence: int
+    recipient_id: str
+    worker_id: str
+    job_id: str | None = None
+    event_type: str
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: float
 
 
 # ── Worker ─────────────────────────────────────────────────────────────
@@ -96,6 +227,7 @@ class WorkerRegistration(BaseModel):
     # destinations. This is a shallow discovery hint, not a recursive inventory.
     data_paths: list[str] = Field(default_factory=list)
     timestamp: str = ""
+    slurm: SlurmHeartbeat | None = None
 
 
 class Worker(BaseModel):
@@ -112,6 +244,8 @@ class Worker(BaseModel):
     gpu_vram_gb: list[float] = Field(default_factory=list)
     gpu_used_vram_gb: list[float] = Field(default_factory=list)
     gpu_busy: list[bool | None] = Field(default_factory=list)
+    gpu_device_ids: list[str] = Field(default_factory=list)
+    slurm: SlurmWorkerInfo | None = None
     cpu_cores: int = 0
     total_ram_gb: float = 0.0
     used_ram_gb: float = 0.0
@@ -141,6 +275,7 @@ class Worker(BaseModel):
             gpu_vram_gb=[g.vram_total_gb for g in reg.gpus],
             gpu_used_vram_gb=[g.vram_used_gb for g in reg.gpus],
             gpu_busy=[g.busy for g in reg.gpus],
+            gpu_device_ids=[g.uuid for g in reg.gpus if g.uuid],
             cpu_cores=reg.cpu_cores,
             total_ram_gb=reg.total_ram_gb,
             used_ram_gb=reg.used_ram_gb,
@@ -163,13 +298,15 @@ class Worker(BaseModel):
         self.gpu_vram_gb = [g.vram_total_gb for g in reg.gpus]
         self.gpu_used_vram_gb = [g.vram_used_gb for g in reg.gpus]
         self.gpu_busy = [g.busy for g in reg.gpus]
+        self.gpu_device_ids = [g.uuid for g in reg.gpus if g.uuid]
         self.cpu_cores = reg.cpu_cores
         self.total_ram_gb = reg.total_ram_gb
         self.used_ram_gb = reg.used_ram_gb
         self.total_disk_gb = reg.total_disk_gb
         self.used_disk_gb = reg.used_disk_gb
         self.data_paths = reg.data_paths
-        self.status = WorkerStatus.ONLINE
+        if self.status != WorkerStatus.DRAINING:
+            self.status = WorkerStatus.ONLINE
         self.last_heartbeat_ts = int(datetime.now(timezone.utc).timestamp())
 
 
@@ -291,7 +428,10 @@ class Job(BaseModel):
     gpu_indices: list[int] = Field(default_factory=list)
     queue_order: int = 0
     started_at: int = 0
-    finished_at: int = 0
+    finished_at: float = 0
+    notify_recipient_id: str | None = Field(default=None, min_length=1, max_length=256)
+    submission_key: str | None = Field(default=None, min_length=1, max_length=256)
+    runner_result: RunnerResult | None = None
 
 
 class WorkerJobReport(BaseModel):

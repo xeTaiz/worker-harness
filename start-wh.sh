@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+slurm_mode=0
+if [ -n "${WH_SLURM_WORKER_ID:-}" ]; then
+  slurm_mode=1
+  # Allocation settings, not a login-node .env, define this launch.
+  umask 077
+fi
+
 runtime="${WH_RUNTIME:-}"
 if [ -z "$runtime" ]; then
   if command -v singularity >/dev/null 2>&1; then
@@ -33,10 +40,12 @@ load_env_file() {
   return 1
 }
 
-if ! load_env_file "${WH_ENV_FILE:-}"; then
-  load_env_file "$PWD/.env" || true
-  load_env_file "$PWD/worker-harness.env" || true
-  load_env_file "$HOME/.config/worker-harness/worker-harness.env" || true
+if (( ! slurm_mode )); then
+  if ! load_env_file "${WH_ENV_FILE:-}"; then
+    load_env_file "$PWD/.env" || true
+    load_env_file "$PWD/worker-harness.env" || true
+    load_env_file "$HOME/.config/worker-harness/worker-harness.env" || true
+  fi
 fi
 
 image="${WH_IMAGE:-${1:-worker-harness-worker.sif}}"
@@ -55,6 +64,61 @@ passwd_file="${compat_dir}/passwd"
 group_file="${compat_dir}/group"
 launch_mode="${WH_LAUNCH_MODE:-instance}"
 instance_name="${WH_INSTANCE_NAME:-wh-${ssh_user}}"
+if (( slurm_mode )); then
+  : "${WH_DIR:?Slurm launches require their isolated runtime directory}"
+  : "${WH_SLURM_SETTINGS_FILE:?Slurm launches require allocation settings}"
+  # The wrapper gives container paths for secrets/settings. Read only the
+  # corresponding staged host settings; never source JSON as shell code.
+  slurm_config="$(python3 - "$wh_dir_host" "$WH_SLURM_WORKER_ID" "$WH_SLURM_SETTINGS_FILE" <<'PY'
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+runtime = Path(sys.argv[1]).resolve(strict=True)
+settings = json.loads((runtime.parent / "settings.json").read_text())
+worker_id, container_settings = sys.argv[2:]
+if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", worker_id) or settings["worker_id"] != worker_id:
+    raise ValueError("invalid Slurm worker identity")
+run_path = settings["run_path"]
+if not isinstance(run_path, str) or not run_path.startswith("/") or any(c in run_path for c in "\x00\n\r:;,"):
+    raise ValueError("invalid container run path")
+if runtime != Path(settings["host_run_path"]).resolve(strict=True) / "runtime":
+    raise ValueError("WH_DIR must be the reserved allocation runtime directory")
+if container_settings != run_path + "/settings.json":
+    raise ValueError("settings must use the allocation's container path")
+kind = settings["compute_kind"]
+if kind not in ("cpu", "gpu"):
+    raise ValueError("invalid compute_kind")
+worker_name = settings["worker_name"]
+if not isinstance(worker_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,199}", worker_name):
+    raise ValueError("invalid reserved worker name")
+for name in ("tailnet.key", "worker.token"):
+    path = runtime.parent / name
+    if path.is_symlink() or not path.is_file() or not os.access(path, os.R_OK):
+        raise ValueError("missing staged allocation credential file")
+print(kind)
+print(run_path)
+print(worker_name)
+PY
+)"
+  mapfile -t _slurm_config <<< "$slurm_config"
+  slurm_kind="${_slurm_config[0]}"
+  slurm_run_path="${_slurm_config[1]}"
+  wh_dir_container="$slurm_run_path/runtime"
+  launch_mode=run
+  TS_HOSTNAME="whc-$WH_SLURM_WORKER_ID"
+  WORKER_NAME="${_slurm_config[2]}"
+  TS_AUTHKEY_FILE="$slurm_run_path/tailnet.key"
+  WH_WORKER_TOKEN_FILE="$slurm_run_path/worker.token"
+  if [ "$slurm_kind" = gpu ]; then
+    : "${CUDA_VISIBLE_DEVICES:?Slurm GPU launches require the original assigned CUDA visibility}"
+    slurm_cuda_visible_devices="$CUDA_VISIBLE_DEVICES"
+  else
+    slurm_cuda_visible_devices=""
+  fi
+fi
 # Fakeroot remains opt-in because it changes the container's UID/GID mapping.
 # It is required on rootless Apptainer installations where inner tailscaled
 # otherwise lacks CAP_SETGID for its SSH credential switch. SUID-capable
@@ -70,8 +134,8 @@ fi
 
 TS_AUTHKEY="${TS_AUTHKEY:-${WORKER_TS_KEY:-}}"
 
-if [ -z "${TS_AUTHKEY:-}" ]; then
-  echo "[start-wh] ERROR: TS_AUTHKEY is required" >&2
+if (( ! slurm_mode )) && [ -z "$TS_AUTHKEY" ] && [ ! -r "${TS_AUTHKEY_FILE:-}" ]; then
+  echo "[start-wh] ERROR: TS_AUTHKEY or readable TS_AUTHKEY_FILE is required" >&2
   exit 1
 fi
 if [ -z "${ORCHESTRATOR_HOST:-}" ]; then
@@ -84,7 +148,9 @@ mkdir -p "$wh_dir_host" "$compat_dir" "${wh_dir_host}/home/${ssh_user}"
 # ── Writable overlay (persistent apt installs across restarts) ───────
 overlay_file="${WH_OVERLAY:-$wh_dir_host/overlay.ext3}"
 overlay_size="${WH_OVERLAY_SIZE:-8192}"   # MiB (8 GB default)
-if [ ! -f "$overlay_file" ]; then
+if (( slurm_mode )); then
+  overlay_file=""
+elif [ ! -f "$overlay_file" ]; then
   if "$runtime" overlay create --size "$overlay_size" "$overlay_file" 2>/dev/null; then
     echo "[start-wh] Created ${overlay_size}MiB writable overlay at $overlay_file"
   else
@@ -167,12 +233,22 @@ for group_id in host_group_ids:
 out_group.write_text("\n".join(group_lines) + "\n")
 PY
 
-mount_args=($fakeroot_flag --nv \
+mount_args=($fakeroot_flag \
   --home "$wh_dir_host/home/$ssh_user:$ssh_home_container" \
   --bind "$wh_dir_host:$wh_dir_container" \
   --bind "$passwd_file:/etc/passwd" \
   --bind "$group_file:/etc/group" \
   --workdir "$ssh_home_container")
+if (( ! slurm_mode )) || [ "$slurm_kind" = gpu ]; then
+  mount_args+=(--nv)
+fi
+if (( slurm_mode )); then
+  # Do not inherit login-node CWD or site-wide host bind configuration.
+  # /tmp is private to this one container, shared by daemon and SSH children.
+  mount_args+=(--contain --no-mount=cwd,hostfs,bind-paths)
+  mount_args+=(--bind "${wh_dir_host%/runtime}/tailnet.key:$TS_AUTHKEY_FILE:ro"
+    --bind "${wh_dir_host%/runtime}/worker.token:$WH_WORKER_TOKEN_FILE:ro")
+fi
 
 # Add writable overlay if available (allows persistent apt installs)
 if [ -n "$overlay_file" ] && [ -f "$overlay_file" ]; then
@@ -240,6 +316,7 @@ normalize_host_source() {
   printf '%s\n' "$source"
 }
 
+if (( ! slurm_mode )); then
 # Cluster nodes reach the shared collections natively instead of through
 # rclone. The user filesystem is the same directory other workers mount as
 # /data/shared/ibex, and it also holds the checked-out repositories.
@@ -289,8 +366,65 @@ else
     append_managed_root "$_mount_dir"
   done
 fi
+fi
 
-if [ -n "$ibex_user_root" ]; then
+# Explicit shared storage uses the same bind list and discovery manifest as
+# automatic mounts. Validate the entire mapping before adding any entries.
+# Keep parsing in a command substitution: a validation failure must stop startup,
+# unlike a failed producer behind process substitution.
+shared_bind_pairs="$(python3 - "${WH_SHARED_ROOTS_JSON:-}" <<'PY'
+import json
+import os
+import re
+import sys
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate storage_id: {key!r}")
+        result[key] = value
+    return result
+
+
+try:
+    roots = json.loads(sys.argv[1] or "{}", object_pairs_hook=unique_object)
+    if not isinstance(roots, dict):
+        raise ValueError("expected a JSON object mapping storage_id to host directory")
+    binds = []
+    for storage_id, root in roots.items():
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", storage_id):
+            raise ValueError(f"invalid storage_id: {storage_id!r}")
+        if not isinstance(root, str) or not os.path.isabs(root):
+            raise ValueError(f"{storage_id}: host directory must be an absolute path")
+        if any(character in ":;," or ord(character) < 32 or ord(character) == 127 for character in root):
+            raise ValueError(f"{storage_id}: host directory contains an unsupported bind delimiter or control character")
+        root = os.path.realpath(root)
+        if not os.path.isdir(root):
+            raise ValueError(f"{storage_id}: host directory does not exist: {root}")
+        if any(character in ":;," or ord(character) < 32 or ord(character) == 127 for character in root):
+            raise ValueError(f"{storage_id}: resolved host directory contains an unsupported bind delimiter or control character")
+        binds.append(f"{root}:/data/shared/{storage_id}")
+    print(";".join(binds))
+except (ValueError, OSError) as error:
+    print(f"[start-wh] ERROR: WH_SHARED_ROOTS_JSON: {error}", file=sys.stderr)
+    sys.exit(1)
+PY
+)"
+declare -A configured_shared_roots=()
+IFS=';' read -ra _shared_pairs <<< "$shared_bind_pairs"
+for _pair in "${_shared_pairs[@]}"; do
+  [ -n "$_pair" ] || continue
+  _shared_source="${_pair%%:*}"
+  _storage_id="${_pair##*/}"
+  configured_shared_roots["$_storage_id"]="$_shared_source"
+  append_effective_bind "$_pair"
+  append_managed_root "$_shared_source"
+done
+
+if (( ! slurm_mode )); then
+if [ -n "$ibex_user_root" ] && [ -z "${configured_shared_roots[ibex]+set}" ]; then
   ibex_user_root="$(normalize_host_source "$ibex_user_root")"
   append_effective_bind "$ibex_user_root:/data/shared/ibex"
   append_managed_root "$ibex_user_root"
@@ -301,11 +435,13 @@ fi
 IFS=';' read -ra _ibex_projects <<< "${WH_IBEX_PROJECTS-c2324}"
 for _project in "${_ibex_projects[@]}"; do
   [ -n "$_project" ] || continue
+  [ -z "${configured_shared_roots[ibex_$_project]+set}" ] || continue
   _project_dir="${WH_IBEX_PROJECT_ROOT-/ibex/project}/$_project"
   [ -d "$_project_dir" ] || continue
   append_effective_bind "$_project_dir:/data/shared/ibex_$_project"
   append_managed_root "$_project_dir"
 done
+fi
 
 if [ -n "${WH_EXTRA_BINDS:-}" ]; then
   IFS=';' read -ra _extra_pairs <<< "$WH_EXTRA_BINDS"
@@ -352,18 +488,43 @@ if [ -n "$effective_binds" ]; then
 fi
 
 exec_env_args=(
-  --env TS_AUTHKEY="$TS_AUTHKEY"
   --env TS_HOST="${TS_HOST:-https://headscale.d0me.xyz}"
   --env TS_HOSTNAME="${TS_HOSTNAME:-}"
-  --env TS_SOCKS5_ADDR="${TS_SOCKS5_ADDR:-127.0.0.1:1055}"
   --env ORCHESTRATOR_HOST="$ORCHESTRATOR_HOST"
   --env ORCHESTRATOR_PORT="${ORCHESTRATOR_PORT:-12888}"
   --env SSH_USER="$ssh_user"
   --env USER="$ssh_user"
   --env LOGNAME="$ssh_user"
   --env WH_DIR="$wh_dir_container"
-  --env WH_PROXY="${WH_PROXY:-socks5://127.0.0.1:1055}"
 )
+
+if (( slurm_mode )); then
+  exec_env_args+=(
+    --env TS_AUTHKEY_FILE="$TS_AUTHKEY_FILE"
+    --env WH_WORKER_TOKEN_FILE="$WH_WORKER_TOKEN_FILE"
+    --env WH_SLURM_WORKER_ID="$WH_SLURM_WORKER_ID"
+    --env WH_SLURM_SETTINGS_FILE="$WH_SLURM_SETTINGS_FILE"
+    --env WH_SLURM_COMPUTE_KIND="$slurm_kind"
+    --env WH_SLURM_CUDA_VISIBLE_DEVICES="$slurm_cuda_visible_devices"
+    --env CUDA_VISIBLE_DEVICES="$slurm_cuda_visible_devices"
+    --env TS_SOCKS5_ADDR=""
+    --env WH_PROXY=""
+  )
+  if [ "$slurm_kind" = cpu ]; then
+    exec_env_args+=(--env NVIDIA_VISIBLE_DEVICES=void)
+  fi
+else
+  exec_env_args+=(
+    --env TS_SOCKS5_ADDR="${TS_SOCKS5_ADDR:-127.0.0.1:1055}"
+    --env WH_PROXY="${WH_PROXY:-socks5://127.0.0.1:1055}"
+  )
+  if [ -n "${TS_AUTHKEY_FILE:-}" ]; then
+    mount_args+=(--bind "$TS_AUTHKEY_FILE:$TS_AUTHKEY_FILE:ro")
+    exec_env_args+=(--env TS_AUTHKEY_FILE="$TS_AUTHKEY_FILE")
+  else
+    exec_env_args+=(--env TS_AUTHKEY="$TS_AUTHKEY")
+  fi
+fi
 
 # Opt-in override for worker identity. Left unset, the container falls back
 # to its inherited hostname (unchanged default behavior for existing fleet

@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import json
+import re
 import logging
 import os
 import shlex
@@ -28,7 +31,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .machines import Machine
-from .models import Worker
+from .models import RunnerResult, Worker
 
 log = logging.getLogger("ssh-client")
 
@@ -170,12 +173,21 @@ def _worker_harness_dir(worker: Worker) -> str:
 
 
 def _worker_tmux_tmpdir(worker: Worker) -> str:
+    if worker.slurm is not None:
+        # tmux also uses AF_UNIX paths; shared allocation roots can be very long.
+        digest = hashlib.sha256(worker.id.encode()).hexdigest()[:16]
+        return f"/tmp/wh-tmux-{digest}"
     # Keep job sockets beneath the writable harness bind.  The historical
     # sibling `${WH_DIR}/tmux` can be shadowed by a read-only SIF overlay.
     return f"{_worker_harness_dir(worker)}/job-tmux"
 
 
 def _tmux_env(worker: Worker) -> str:
+    if worker.slurm is not None and worker.slurm.compute_kind == "cpu":
+        return (
+            f"env -u TMUX -u TMUX_PANE CUDA_VISIBLE_DEVICES='' "
+            f"TMUX_TMPDIR={shlex.quote(_worker_tmux_tmpdir(worker))} tmux"
+        )
     # Preserve the host-driver libraries that Apptainer binds under --nv, and
     # put CUDA tools on PATH for jobs launched through tmux.
     return (
@@ -362,13 +374,91 @@ async def async_machine_run_bytes(
     )
 
 
+def _runner_stage_command(worker: Worker) -> str:
+    """Atomically install the standalone module, including prebuilt images."""
+    source = Path(__file__).with_name("job_runner.py").read_bytes()
+    encoded = base64.b64encode(source).decode()
+    harness = shlex.quote(_worker_harness_dir(worker))
+    module = shlex.quote(f"{_worker_harness_dir(worker)}/.job_runner.py")
+    tmux_dir = shlex.quote(_worker_tmux_tmpdir(worker))
+    return (
+        f"umask 077; mkdir -p {harness} && "
+        f"mkdir -p -m 700 {tmux_dir} && test ! -L {tmux_dir} && test -O {tmux_dir} && "
+        f"chmod 700 {tmux_dir} && "
+        f"runner_tmp={module}.$$ && "
+        f"printf %s {shlex.quote(encoded)} | base64 -d > \"$runner_tmp\" && "
+        f"chmod 600 \"$runner_tmp\" && mv -f \"$runner_tmp\" {module}"
+    )
+
+
+async def ssh_stage_job_runner(worker: Worker) -> SSHResult:
+    """Stage supervision through the same authenticated SSH readiness path."""
+    return await _exec_ssh(
+        worker.id, _ssh_base_args(worker) + [_runner_stage_command(worker)],
+        lane_timeout=10.0, cmd_timeout=30.0, op_name="ssh_stage_job_runner",
+    )
+
+
+def _cluster_gpu_mask(worker: Worker, gpu_indices: list[int] | None) -> str:
+    if worker.slurm.compute_kind == "cpu":
+        if gpu_indices:
+            raise ValueError("CPU allocations cannot launch GPU jobs")
+        return ""
+    ids = worker.gpu_device_ids
+    if (len(ids) != worker.gpu_count or len(set(ids)) != len(ids)
+            or any(not re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value) for value in ids)):
+        raise ValueError("Allocation requires an unambiguous physical GPU UUID map")
+    indices = list(range(worker.gpu_count)) if gpu_indices is None else gpu_indices
+    if (len(set(indices)) != len(indices)
+            or any(type(index) is not int or not 0 <= index < len(ids) for index in indices)):
+        raise ValueError("Invalid allocation GPU indices")
+    return ",".join(ids[index] for index in indices)
+
+
+def _build_cluster_job_command(
+    worker: Worker, job_id: str, command: str,
+    gpu_indices: list[int] | None, queue_managed: bool,
+) -> str:
+    directory = f"{_worker_harness_dir(worker)}/{job_id}"
+    quoted = shlex.quote(directory)
+    metadata = {"job_id": job_id, "worker_id": worker.id, "queue_managed": queue_managed}
+    inputs = {
+        "script.sh": "#!/bin/bash\n" + command + "\n",
+        "gpu.env": f"CUDA_VISIBLE_DEVICES={_cluster_gpu_mask(worker, gpu_indices)}\n",
+        "launch.json": json.dumps(metadata) + "\n",
+    }
+    writes = [
+        f"printf %s {shlex.quote(base64.b64encode(value.encode()).decode())} | base64 -d "
+        f"> {shlex.quote(directory + '/' + name)}"
+        for name, value in inputs.items()
+    ]
+    launch = shlex.join([
+        "python3", f"{_worker_harness_dir(worker)}/.job_runner.py",
+        "run", "--job-dir", directory,
+    ])
+    return (
+        _runner_stage_command(worker) + " && "
+        f"mkdir -m 700 {quoted} && " + " && ".join(writes) + " && "
+        f"{_tmux_env(worker)} new-session -d -s {shlex.quote('wh_' + job_id)} {shlex.quote(launch)} && "
+        # Do not mark RUNNING merely because tmux accepted a process. A drain
+        # rejection is definite; a lost/hanging startup remains unknown.
+        f"for i in $(seq 1 100); do "
+        f"if test -e {quoted}/runtime.json || test -e {quoted}/result.json; then echo started; exit 0; fi; "
+        f"if test -e {quoted}/launch_error.json; then cat {quoted}/launch_error.json >&2; exit 1; fi; "
+        f"sleep 0.05; done; exit 255"
+    )
+
+
 def _build_job_command(
     worker: Worker,
     job_id: str,
     command: str,
     gpu_indices: list[int] | None = None,
+    queue_managed: bool = False,
 ) -> str:
-    """Compose the remote job-launch command. Pure string assembly — no I/O."""
+    """Compose the legacy or structured allocation job launch."""
+    if worker.slurm is not None:
+        return _build_cluster_job_command(worker, job_id, command, gpu_indices, queue_managed)
     harness_dir = f"{_worker_harness_dir(worker)}/{job_id}"
     script_path = f"{harness_dir}/script.sh"
     log_path = f"{harness_dir}/output.log"
@@ -405,15 +495,18 @@ async def ssh_tmux_new(
     command: str,
     pty_enabled: bool = True,
     gpu_indices: list[int] | None = None,
+    queue_managed: bool = False,
 ) -> SSHResult:
     """Start a tmux job on the worker."""
-    full_cmd = _build_job_command(worker, job_id, command, gpu_indices)
+    full_cmd = _build_job_command(worker, job_id, command, gpu_indices, queue_managed)
     args = _ssh_base_args(worker) + [full_cmd]
     # Note: pty_enabled is informational here (jobs always run via tmux).
     return await _exec_ssh(worker.id, args, lane_timeout=10.0, cmd_timeout=30.0, op_name="ssh_tmux_new")
 
 
 async def ssh_tmux_kill(worker: Worker, job_id: str) -> SSHResult:
+    if worker.slurm is not None:
+        return await ssh_job_control(worker, job_id, action="stop", signal_name="TERM")
     session = f"wh_{job_id}"
     tmux = _tmux_env(worker)
     cmd = (
@@ -424,6 +517,43 @@ async def ssh_tmux_kill(worker: Worker, job_id: str) -> SSHResult:
 
 async def ssh_job_started(worker: Worker, job_id: str) -> bool | None:
     """Probe durable launch evidence, including jobs whose tmux session already exited."""
+    if worker.slurm is not None:
+        directory = f"{_worker_harness_dir(worker)}/{job_id}"
+        probe = (
+            "import json, pathlib, sys\n"
+            "directory=pathlib.Path(sys.argv[1])\n"
+            "records={}\n"
+            "for name in ('runtime','result','launch_error'):\n"
+            " try: records[name]=json.loads((directory/(name+'.json')).read_text())\n"
+            " except (OSError,ValueError): pass\n"
+            "print(json.dumps(records))\n"
+        )
+        result = await async_ssh_run(
+            worker, shlex.join(["python3", "-c", probe, directory]), timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        try:
+            records = json.loads(result.stdout)
+            if "result" in records:
+                RunnerResult.model_validate(records["result"])
+                return True
+            runtime = records.get("runtime")
+            if isinstance(runtime, dict):
+                if (runtime.get("job_id") == job_id
+                        and type(runtime.get("runner_pid")) is int and runtime["runner_pid"] > 0
+                        and type(runtime.get("start_ticks")) is int
+                        and isinstance(runtime.get("boot_id"), str) and runtime["boot_id"]
+                        and type(runtime.get("queue_managed")) is bool
+                        and runtime.get("checkpoint_signal") in ("USR1", "TERM")):
+                    return True
+                return None
+            error = records.get("launch_error")
+            if isinstance(error, dict) and isinstance(error.get("error"), str) and error["error"]:
+                return False
+        except (ValueError, AttributeError, TypeError):
+            pass
+        return None
     session = f"wh_{job_id}"
     tmux = _tmux_env(worker)
     log_path = shlex.quote(f"{_worker_harness_dir(worker)}/{job_id}/output.log")
@@ -446,6 +576,8 @@ async def ssh_job_started(worker: Worker, job_id: str) -> bool | None:
 async def ssh_tmux_running(worker: Worker, job_id: str) -> bool | None:
     """Return remote running state, or None when the SSH probe failed."""
     log_path = f"{_worker_harness_dir(worker)}/{job_id}/output.log"
+    if worker.slurm is not None:
+        return False if await ssh_job_result(worker, job_id) is not None else None
     result = await async_ssh_run(
         worker,
         f"grep -q '^EXIT:' '{log_path}' 2>/dev/null && echo 'done' || echo 'running'",
@@ -491,6 +623,9 @@ async def ssh_read_log(
 
 
 async def ssh_get_exit_code(worker: Worker, job_id: str) -> int | None:
+    if worker.slurm is not None:
+        result = await ssh_job_result(worker, job_id)
+        return result.exit_code if result is not None else None
     result = await async_ssh_run(
         worker,
         f"grep -E '^EXIT:' '{_worker_harness_dir(worker)}/{job_id}/output.log' 2>/dev/null | sed 's/EXIT://'",
@@ -503,6 +638,31 @@ async def ssh_get_exit_code(worker: Worker, job_id: str) -> int | None:
             pass
     return None
 
+
+
+async def ssh_job_result(worker: Worker, job_id: str) -> RunnerResult | None:
+    """Read validated descendant-exit proof; missing evidence is not completion."""
+    path = shlex.quote(f"{_worker_harness_dir(worker)}/{job_id}/result.json")
+    response = await async_ssh_run(worker, f"cat {path} 2>/dev/null", timeout=5)
+    if response.returncode != 0:
+        return None
+    try:
+        return RunnerResult.model_validate_json(response.stdout)
+    except ValueError:
+        return None
+
+
+async def ssh_job_control(
+    worker: Worker, job_id: str, *, action: str, signal_name: str,
+) -> SSHResult:
+    if action not in ("stop", "checkpoint") or signal_name not in ("USR1", "TERM"):
+        raise ValueError("Invalid runner control request")
+    command = shlex.join([
+        "python3", f"{_worker_harness_dir(worker)}/.job_runner.py", "control",
+        "--job-dir", f"{_worker_harness_dir(worker)}/{job_id}",
+        "--action", action, "--signal", signal_name,
+    ])
+    return await async_ssh_run(worker, command, timeout=15)
 
 async def ssh_upload_bytes(worker: Worker, content: bytes, remote_path: str, *, timeout: int = 60) -> SSHResult:
     """Upload raw bytes to a worker path."""

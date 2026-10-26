@@ -11,10 +11,20 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
-from worker_harness.db import Database
+from worker_harness.db import Database, SlurmError
 from worker_harness.heartbeat import create_app, reconcile_queued_jobs
 from worker_harness.job import JobManager
-from worker_harness.models import GPUInfo, Job, JobStatus, WorkerRegistration, WorkerStatus
+from worker_harness.models import (
+    GPUInfo,
+    Job,
+    JobStatus,
+    RunnerResult,
+    SlurmObservation,
+    SlurmReservationRequest,
+    WorkerRegistration,
+    Worker,
+    WorkerStatus,
+)
 from worker_harness.ssh import SSHResult, _build_job_command
 
 
@@ -45,6 +55,35 @@ def registration(worker_id: str, gpu_count: int = 4, *, busy: list[bool | None] 
 
 def launch_success(*_args, **_kwargs) -> SSHResult:
     return SSHResult(stdout="started", stderr="", returncode=0)
+
+
+def cpu_reservation(request_id: str = "cpu-reservation") -> SlurmReservationRequest:
+    return SlurmReservationRequest(
+        request_id=request_id,
+        name="CPU preparation",
+        gpu_count=0,
+        recipient_id="queue-tests",
+        registration_token_hash="0" * 64,
+        slurm={
+            "cluster_id": "test-cpu",
+            "storage_id": "test",
+            "compute_kind": "cpu",
+            "cpus": 1,
+            "memory_mb": 4096,
+            "walltime_seconds": 600,
+            "failure_grace_seconds": 120,
+            "warning_seconds": 30,
+            "termination_grace_seconds": 10,
+        },
+    )
+
+
+def reserved_registration(worker: Worker) -> WorkerRegistration:
+    return registration(worker.id, 0).model_copy(update={
+        "name": worker.name,
+        "cpu_cores": worker.slurm.cpus,
+        "total_ram_gb": worker.slurm.memory_mb / 1024,
+    })
 
 
 class QueueSchedulerTests(unittest.IsolatedAsyncioTestCase):
@@ -338,11 +377,212 @@ class QueueSchedulerTests(unittest.IsolatedAsyncioTestCase):
             refreshed = await self.manager.refresh_job_status(self.worker, job)
         self.assertEqual((refreshed.status, refreshed.exit_code), (JobStatus.FAILED, -1))
 
+    async def test_cpu_reservation_waits_offline_then_dispatches_serially(self) -> None:
+        worker = await self.db.reserve_slurm_worker(cpu_reservation())
+        launch = AsyncMock(side_effect=launch_success)
+        with patch("worker_harness.job.ssh_tmux_new", new=launch):
+            first = await self.manager.enqueue_job(
+                worker, "prepare", "prepare", 30, gpu_count=0,
+                submission_key="cpu-reservation",
+            )
+            second = await self.manager.enqueue_job(worker, "next", "next", 30, gpu_count=0)
+            self.assertEqual((first.status, second.status), (JobStatus.PENDING, JobStatus.PENDING))
+            launch.assert_not_awaited()
+            reserved = await self.db.get_worker(worker.id)
+            self.assertEqual(reserved.slurm.initial_job_id, first.id)
+            self.assertEqual(first.notify_recipient_id, "queue-tests")
+
+            await self.db.register_slurm_worker(reserved_registration(worker), ready=True)
+            # Even the original OFFLINE snapshot dispatches against fresh state.
+            await self.manager.dispatch_worker(worker)
+            self.assertEqual((await self.db.get_job(first.id)).status, JobStatus.RUNNING)
+            self.assertEqual((await self.db.get_job(second.id)).status, JobStatus.PENDING)
+            launch.assert_awaited_once()
+            self.assertEqual(launch.await_args.kwargs["gpu_indices"], [])
+
+            with patch("worker_harness.job.ssh_job_result", new=AsyncMock(return_value=RunnerResult(
+                exit_code=0, descendants_exited=True, finished_at=time.time(),
+                finished_monotonic=time.monotonic(), boot_id="queue-test",
+            ))):
+                await self.manager.refresh_job_status(worker, first)
+        self.assertEqual((await self.db.get_job(second.id)).status, JobStatus.RUNNING)
+        self.assertEqual(launch.await_count, 2)
+        self.assertTrue(all(call.kwargs["gpu_indices"] == [] for call in launch.await_args_list))
+
+    async def test_cpu_unknown_launch_blocks_next_transactional_claim(self) -> None:
+        worker = await self.db.reserve_slurm_worker(cpu_reservation())
+        worker = await self.db.register_slurm_worker(reserved_registration(worker), ready=True)
+        launch = AsyncMock(return_value=SSHResult("", "connection lost", 255))
+        other_manager = JobManager(self.db)
+        with patch("worker_harness.job.ssh_tmux_new", new=launch):
+            first, second = await asyncio.gather(
+                self.manager.enqueue_job(worker, "one", "one", 30, gpu_count=0),
+                other_manager.enqueue_job(worker, "two", "two", 30, gpu_count=0),
+            )
+            await other_manager.dispatch_worker(worker)
+        self.assertEqual((first.status, second.status), (JobStatus.STARTING, JobStatus.PENDING))
+        self.assertIsNone(await self.db.claim_queued_job(second.id, [], 100, worker_id=worker.id))
+        self.assertEqual((await self.db.get_job(first.id)).gpu_indices, [])
+        launch.assert_awaited_once()
+
+    async def test_zero_gpu_admission_only_allows_cpu_allocations(self) -> None:
+        with self.assertRaises(ValueError):
+            await self.manager.enqueue_job(self.worker, "cpu", "cpu", 30, gpu_count=0)
+        cpu = await self.db.reserve_slurm_worker(cpu_reservation())
+        with self.assertRaises(ValueError):
+            await self.manager.enqueue_job(cpu, "gpu", "gpu", 30, gpu_count=1)
+        gpu_request = cpu_reservation("gpu-reservation").model_dump()
+        gpu_request["gpu_count"] = 1
+        gpu_request["slurm"]["compute_kind"] = "gpu"
+        gpu = await self.db.reserve_slurm_worker(SlurmReservationRequest(**gpu_request))
+        with self.assertRaises(ValueError):
+            await self.manager.enqueue_job(gpu, "cpu", "cpu", 30, gpu_count=0)
+
+    async def test_enqueue_submission_key_replays_without_duplicate_launch(self) -> None:
+        launch = AsyncMock(side_effect=launch_success)
+        with patch("worker_harness.job.ssh_tmux_new", new=launch):
+            first, repeated = await asyncio.gather(*(
+                self.manager.enqueue_job(
+                    self.worker, "once", "once", 30, submission_key="stable-key",
+                    notify_recipient_id="recipient",
+                )
+                for _ in range(2)
+            ))
+            self.assertEqual(first.id, repeated.id)
+            self.assertEqual(first.notify_recipient_id, "recipient")
+            with self.assertRaises(SlurmError) as conflict:
+                await self.manager.enqueue_job(
+                    self.worker, "changed", "once", 30, submission_key="stable-key",
+                    notify_recipient_id="recipient",
+                )
+        self.assertEqual(conflict.exception.code, "IDEMPOTENCY_CONFLICT")
+        self.assertEqual(len(await self.db.list_jobs(self.worker.id)), 1)
+        launch.assert_awaited_once()
+
+    async def test_terminal_allocation_replays_initial_job_but_rejects_new_work(self) -> None:
+        worker = await self.db.reserve_slurm_worker(cpu_reservation())
+        first = await self.manager.enqueue_job(
+            worker, "once", "once", 30, gpu_count=0, submission_key="cpu-reservation",
+        )
+        await self.db.observe_slurm_worker(
+            worker.id, SlurmObservation(scheduler_state="FAILED", observed_at=time.time()),
+        )
+        launch = AsyncMock(side_effect=AssertionError("finished allocations must not launch"))
+        with patch("worker_harness.job.ssh_tmux_new", new=launch):
+            repeated = await self.manager.enqueue_job(
+                worker, "once", "once", 30, gpu_count=0, submission_key="cpu-reservation",
+            )
+            self.assertEqual(repeated.id, first.id)
+            self.assertEqual(repeated.status, JobStatus.FAILED)
+            for action in (
+                self.manager.enqueue_job(worker, "new", "new", 30, gpu_count=0),
+                self.manager.start_job(worker, "diagnose"),
+            ):
+                with self.assertRaises(SlurmError) as finished:
+                    await action
+                self.assertEqual(finished.exception.code, "SLURM_WORKER_FINISHED")
+                self.assertIn("fresh", str(finished.exception).lower())
+            self.assertEqual(await self.manager.dispatch_worker(worker), [])
+        launch.assert_not_awaited()
+
+    async def test_draining_worker_rejects_stale_online_start_and_enqueue(self) -> None:
+        await self.db.set_worker_status(self.worker.id, WorkerStatus.DRAINING)
+        launch = AsyncMock()
+        with patch("worker_harness.job.ssh_tmux_new", new=launch):
+            with self.assertRaises(SlurmError):
+                await self.manager.start_job(self.worker, "diagnose")
+            with self.assertRaises(SlurmError):
+                await self.manager.enqueue_job(self.worker, "later", "later", 30)
+            self.assertEqual(await self.manager.dispatch_worker(self.worker), [])
+        self.assertEqual(await self.db.list_jobs(self.worker.id), [])
+        launch.assert_not_awaited()
+
+    async def test_stale_online_snapshot_cannot_start_or_dispatch_offline_worker(self) -> None:
+        await self.db.set_worker_status(self.worker.id, WorkerStatus.OFFLINE)
+        launch = AsyncMock()
+        with patch("worker_harness.job.ssh_tmux_new", new=launch):
+            queued = await self.manager.enqueue_job(self.worker, "later", "later", 30)
+            self.assertEqual(queued.status, JobStatus.PENDING)
+            with self.assertRaisesRegex(ValueError, "offline"):
+                await self.manager.start_job(self.worker, "now")
+            self.assertEqual(await self.manager.dispatch_worker(self.worker), [])
+        launch.assert_not_awaited()
+        self.assertEqual(len(await self.db.list_jobs(self.worker.id)), 1)
+
+    async def test_job_managers_share_start_and_enqueue_dispatch_lock(self) -> None:
+        other_manager = JobManager(self.db)
+        self.assertIs(self.manager._dispatch_lock("w1"), other_manager._dispatch_lock("w1"))
+        active = 0
+        peak = 0
+
+        async def launch(*_args, **_kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0)
+            active -= 1
+            return launch_success()
+
+        with patch("worker_harness.job.ssh_tmux_new", new=launch):
+            await asyncio.gather(
+                self.manager.start_job(self.worker, "diagnostic"),
+                other_manager.enqueue_job(self.worker, "useful", "useful", 30),
+            )
+        self.assertEqual(peak, 1)
+
+    async def test_successful_ssh_reply_cannot_reopen_confirmed_failed_job(self) -> None:
+        async def launch(_worker, job_id, *_args, **_kwargs):
+            confirmed = await self.db.get_job(job_id)
+            confirmed.status = JobStatus.FAILED
+            confirmed.exit_code = 7
+            confirmed.finished_at = int(time.time())
+            await self.db.update_job(confirmed)
+            return launch_success()
+
+        with patch("worker_harness.job.ssh_tmux_new", new=launch):
+            job = await self.manager.start_job(
+                self.worker, "failed", notify_recipient_id="failure-recipient",
+            )
+        self.assertEqual((job.status, job.exit_code), (JobStatus.FAILED, 7))
+        self.assertEqual((await self.db.get_job(job.id)).status, JobStatus.FAILED)
+
+    async def test_cpu_diagnostics_keep_grace_until_useful_job_actually_starts(self) -> None:
+        worker = await self.db.reserve_slurm_worker(cpu_reservation())
+        worker = await self.db.register_slurm_worker(reserved_registration(worker), ready=True)
+        launch = AsyncMock(side_effect=launch_success)
+        with patch("worker_harness.job.ssh_tmux_new", new=launch):
+            failed = await self.manager.enqueue_job(worker, "fail", "fail", 30, gpu_count=0)
+            failed.status = JobStatus.FAILED
+            failed.exit_code = 1
+            failed.finished_at = int(time.time())
+            await self.db.update_job(failed)
+            deadline = (await self.db.get_worker(worker.id)).slurm.failure_deadline
+            self.assertIsNotNone(deadline)
+            diagnostic = await self.manager.start_job(worker, "diagnose")
+            self.assertEqual(diagnostic.status, JobStatus.RUNNING)
+            self.assertEqual(launch.await_args.kwargs["gpu_indices"], [])
+            self.assertEqual((await self.db.get_worker(worker.id)).slurm.failure_deadline, deadline)
+
+        unknown = AsyncMock(return_value=SSHResult("", "lost launch reply", 255))
+        with patch("worker_harness.job.ssh_tmux_new", new=unknown):
+            useful = await self.manager.enqueue_job(worker, "rerun", "rerun", 30, gpu_count=0)
+        self.assertEqual(useful.status, JobStatus.STARTING)
+        self.assertEqual((await self.db.get_worker(worker.id)).slurm.failure_deadline, deadline)
+        with patch("worker_harness.job.ssh_job_started", new=AsyncMock(return_value=True)), patch(
+            "worker_harness.job.ssh_job_result", new=AsyncMock(return_value=None),
+        ):
+            await self.manager.reconcile_starting_job(worker, useful)
+        self.assertIsNone((await self.db.get_worker(worker.id)).slurm.failure_deadline)
+        self.assertEqual(unknown.await_args.kwargs["gpu_indices"], [])
+        self.assertTrue(unknown.await_args.kwargs["queue_managed"])
+        self.assertFalse(launch.await_args.kwargs["queue_managed"])
+
     async def test_job_script_exports_only_queued_gpu_indices(self) -> None:
         with tempfile.TemporaryDirectory() as harness_dir:
             self.worker.harness_dir = harness_dir
             for job_id, indices, expected in (
                 ("queued", [3, 1], "3,1"),
+                ("cpu", [], ""),
                 ("immediate", None, "inherited"),
             ):
                 output_dir = Path(harness_dir) / job_id
@@ -425,6 +665,31 @@ class QueueApiTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(self.db.get_job(response.json()["id"])).status, JobStatus.RUNNING)
         launch.assert_awaited_once()
+
+    def test_terminal_allocation_returns_conflict_with_fresh_allocation_guidance(self) -> None:
+        worker = asyncio.run(self.db.reserve_slurm_worker(cpu_reservation()))
+        payload = {
+            "worker_id": worker.id,
+            "command": "prepare",
+            "name": "prepare",
+            "expected_seconds": 30,
+            "gpu_count": 0,
+            "submission_key": "cpu-reservation",
+        }
+        initial = self.client.post("/api/v1/jobs/queue", json=payload)
+        self.assertEqual(initial.status_code, 200, initial.text)
+        asyncio.run(self.db.observe_slurm_worker(
+            worker.id, SlurmObservation(scheduler_state="COMPLETED", observed_at=time.time()),
+        ))
+        replay = self.client.post("/api/v1/jobs/queue", json=payload)
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertEqual(replay.json()["id"], initial.json()["id"])
+        fresh = self.client.post(
+            "/api/v1/jobs/queue", json={**payload, "submission_key": "new-work"},
+        )
+        self.assertEqual(fresh.status_code, 409, fresh.text)
+        self.assertIn("SLURM_WORKER_FINISHED", fresh.text)
+        self.assertIn("fresh allocation", fresh.text.lower())
 
     def test_end_to_end_completion_advances_next_job(self) -> None:
         launch = AsyncMock(side_effect=launch_success)

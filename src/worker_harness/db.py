@@ -6,8 +6,12 @@ import asyncio
 import aiosqlite
 import json
 import time
+import hashlib
+import hmac
 from datetime import datetime, timezone
 from pathlib import Path
+from contextlib import asynccontextmanager
+from functools import wraps
 from uuid import uuid4
 
 from .models import (
@@ -15,6 +19,13 @@ from .models import (
     Job,
     JobKind,
     JobStatus,
+    JobEvent,
+    JobResultReport,
+    RunnerResult,
+    RunnerStartObservation,
+    SlurmObservation,
+    SlurmReservationRequest,
+    SlurmWorkerInfo,
     PiBridgeEventBatch,
     PiBridgeRegister,
     PiSession,
@@ -30,6 +41,31 @@ from .models import (
     WorkerStatus,
 )
 
+class SlurmError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+_TERMINAL_SLURM_STATES = {
+    "BOOT_FAIL", "CANCELLED", "COMPLETED", "DEADLINE", "FAILED", "NODE_FAIL",
+    "OUT_OF_MEMORY", "PREEMPTED", "REVOKED", "TIMEOUT",
+}
+
+def _write_locked(method):
+    """Prevent an unrelated writer from committing another method's transaction."""
+    @wraps(method)
+    async def locked(self, *args, **kwargs):
+        async with self._queue_lock:
+            try:
+                return await method(self, *args, **kwargs)
+            except BaseException:
+                await self._db.rollback()
+                raise
+    return locked
+
+
+
 
 class Database:
     """Async SQLite database with all repository methods."""
@@ -38,11 +74,11 @@ class Database:
         self.path = Path(path).expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db: aiosqlite.Connection | None = None
-        # Registration-port job reports can be retried concurrently; serialize
-        # their conditional UPSERTs on this process's single SQLite writer.
-        self._worker_job_report_lock = asyncio.Lock()
-        self._pi_bridge_lock = asyncio.Lock()
+        # All writers share the connection, so even unrelated table writes must
+        # not interleave commits with an allocation/job transaction.
         self._queue_lock = asyncio.Lock()
+        self._worker_job_report_lock = self._queue_lock
+        self._pi_bridge_lock = self._queue_lock
 
     async def connect(self) -> None:
         self._db = await aiosqlite.connect(str(self.path))
@@ -68,6 +104,17 @@ class Database:
 
     async def __aexit__(self, *args) -> None:
         await self.close()
+
+    @asynccontextmanager
+    async def _queue_transaction(self):
+        async with self._queue_lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+                await self._db.commit()
+            except BaseException:
+                await self._db.rollback()
+                raise
 
     async def _init_schema(self) -> None:
         await self._db.execute("""
@@ -348,12 +395,152 @@ class Database:
                  (SELECT id FROM pi_sessions WHERE session_type='delegated')"""
         )
         await self._db.execute("DELETE FROM pi_sessions WHERE session_type='delegated'")
+        if "gpu_device_ids" not in colnames:
+            await self._db.execute("ALTER TABLE workers ADD COLUMN gpu_device_ids TEXT NOT NULL DEFAULT '[]'")
+        for column, declaration in {
+            "notify_recipient_id": "TEXT",
+            "submission_key": "TEXT",
+            "submission_digest": "TEXT",
+            "runner_result": "TEXT",
+        }.items():
+            if column not in job_cols:
+                await self._db.execute(f"ALTER TABLE jobs ADD COLUMN {column} {declaration}")
+        await self._db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_submission_key
+            ON jobs(submission_key) WHERE submission_key IS NOT NULL
+        """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS slurm_workers (
+                worker_id TEXT PRIMARY KEY REFERENCES workers(id),
+                request_id TEXT NOT NULL UNIQUE,
+                request_digest TEXT NOT NULL,
+                policy TEXT NOT NULL,
+                recipient_id TEXT NOT NULL,
+                registration_token_hash TEXT NOT NULL,
+                token_revoked INTEGER NOT NULL DEFAULT 0,
+                initial_job_id TEXT,
+                slurm_job_id TEXT,
+                scheduler_state TEXT,
+                scheduler_reason TEXT,
+                observed_at REAL,
+                submission_attempted INTEGER NOT NULL DEFAULT 0,
+                submission_failed INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                submitted_at REAL,
+                started_at REAL,
+                finished_at REAL,
+                failure_deadline REAL,
+                startup_error TEXT,
+                checkpoint_requested INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        slurm_cols = {row["name"] for row in await self._db.execute_fetchall("PRAGMA table_info(slurm_workers)")}
+        for column, declaration in {
+            "last_useful_started_at": "REAL",
+            "last_useful_started_monotonic": "REAL",
+            "last_useful_boot_id": "TEXT",
+            "failure_finished_monotonic": "REAL",
+            "failure_boot_id": "TEXT",
+        }.items():
+            if column not in slurm_cols:
+                await self._db.execute(f"ALTER TABLE slurm_workers ADD COLUMN {column} {declaration}")
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS job_events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipient_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                job_id TEXT,
+                event_type TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL
+            )
+        """)
+        await self._db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_job_events_recipient
+            ON job_events(recipient_id, sequence)
+        """)
+        # Triggers keep every ordinary status writer (including report UPSERTs)
+        # in the same SQLite statement as its durable notification.
+        await self._db.execute("""
+            CREATE TRIGGER IF NOT EXISTS job_status_event
+            AFTER UPDATE OF status ON jobs
+            WHEN OLD.status != NEW.status
+              AND OLD.status NOT IN ('done', 'failed')
+              AND NEW.status IN ('running', 'done', 'failed')
+            BEGIN
+                INSERT INTO job_events
+                  (recipient_id, worker_id, job_id, event_type, details, created_at)
+                SELECT NEW.notify_recipient_id, NEW.worker_id, NEW.id,
+                  CASE NEW.status WHEN 'running' THEN 'job_started'
+                    WHEN 'failed' THEN 'job_failed' ELSE 'job_finished' END,
+                  json_object('exit_code', NEW.exit_code, 'finished_at', NEW.finished_at,
+                    'failure_deadline', (SELECT failure_deadline FROM slurm_workers
+                      WHERE worker_id=NEW.worker_id),
+                    'log_context', 'Use ordinary job logs or retained shared allocation logs'),
+                  unixepoch()
+                WHERE NEW.notify_recipient_id IS NOT NULL;
+            END
+        """)
+        await self._db.execute("""
+            CREATE TRIGGER IF NOT EXISTS initial_slurm_job
+            AFTER INSERT ON jobs WHEN NEW.queue_managed=1 AND NEW.submission_key IS NOT NULL
+            BEGIN
+                UPDATE slurm_workers SET initial_job_id=NEW.id
+                WHERE worker_id=NEW.worker_id AND request_id=NEW.submission_key
+                  AND initial_job_id IS NULL;
+            END
+        """)
+        await self._db.execute("DROP TRIGGER IF EXISTS slurm_job_failure_deadline")
+        await self._db.execute("""
+            CREATE TRIGGER IF NOT EXISTS slurm_job_failure_deadline
+            BEFORE UPDATE OF status ON jobs
+            WHEN OLD.status NOT IN ('done', 'failed') AND NEW.status='failed'
+              AND NEW.queue_managed=1
+              AND (OLD.status IN ('starting','running') OR NEW.runner_result IS NOT NULL)
+            BEGIN
+                UPDATE slurm_workers SET
+                  failure_boot_id=json_extract(NEW.runner_result, '$.boot_id'),
+                  failure_finished_monotonic=json_extract(NEW.runner_result, '$.finished_monotonic'),
+                  failure_deadline=NEW.finished_at + json_extract(policy, '$.failure_grace_seconds')
+                WHERE worker_id=NEW.worker_id
+                  AND (failure_deadline IS NULL OR CASE
+                    WHEN failure_boot_id=json_extract(NEW.runner_result, '$.boot_id')
+                        AND failure_finished_monotonic IS NOT NULL
+                        AND json_extract(NEW.runner_result, '$.finished_monotonic') IS NOT NULL
+                      THEN json_extract(NEW.runner_result, '$.finished_monotonic') < failure_finished_monotonic
+                      ELSE NEW.finished_at < failure_deadline - json_extract(policy, '$.failure_grace_seconds')
+                    END)
+                  AND NOT (
+                  CASE WHEN last_useful_boot_id=json_extract(NEW.runner_result, '$.boot_id')
+                      AND last_useful_started_monotonic IS NOT NULL
+                      AND json_extract(NEW.runner_result, '$.finished_monotonic') IS NOT NULL
+                    THEN last_useful_started_monotonic > json_extract(NEW.runner_result, '$.finished_monotonic')
+                    ELSE COALESCE(last_useful_started_at, 0) > NEW.finished_at
+                  END
+                );
+            END
+        """)
+        await self._db.execute("DROP TRIGGER IF EXISTS slurm_useful_job_started")
+        await self._db.execute("""
+            CREATE TRIGGER IF NOT EXISTS slurm_useful_job_started
+            BEFORE UPDATE OF status ON jobs
+            WHEN OLD.status != 'running' AND NEW.status='running' AND NEW.queue_managed=1
+            BEGIN
+                UPDATE slurm_workers SET failure_deadline=NULL, failure_boot_id=NULL,
+                  failure_finished_monotonic=NULL WHERE worker_id=NEW.worker_id;
+            END
+        """)
         await self._db.commit()
 
     # ── Workers ──────────────────────────────────────────────────────
 
+    @_write_locked
     async def upsert_worker(self, reg: WorkerRegistration) -> Worker:
         existing = await self.get_worker(reg.worker_id)
+        if existing and existing.slurm:
+            raise PermissionError("reserved workers require scoped authenticated registration")
+        if reg.worker_id.startswith("cluster:"):
+            raise ValueError("cluster: is reserved for client-only targets")
         if existing:
             existing.update_from_registration(reg)
             await self._update_worker(existing)
@@ -370,20 +557,22 @@ class Database:
         row = await cursor.fetchone()
         if not row:
             return None
-        return self._row_to_worker(row)
+        return await self._project_worker(row)
 
     async def list_workers(self) -> list[Worker]:
         rows = await self._db.execute_fetchall("SELECT * FROM workers ORDER BY name")
-        return [self._row_to_worker(r) for r in rows]
+        return [await self._project_worker(r) for r in rows]
 
+    @_write_locked
     async def mark_workers_offline(self, cutoff_ts: int) -> int:
         cursor = await self._db.execute(
-            "UPDATE workers SET status = ? WHERE last_heartbeat_ts < ? AND status != ?",
-            (WorkerStatus.OFFLINE.value, cutoff_ts, WorkerStatus.OFFLINE.value),
+            "UPDATE workers SET status = ? WHERE last_heartbeat_ts < ? AND status = ?",
+            (WorkerStatus.OFFLINE.value, cutoff_ts, WorkerStatus.ONLINE.value),
         )
         await self._db.commit()
         return cursor.rowcount
 
+    @_write_locked
     async def set_worker_status(self, worker_id: str, status: WorkerStatus) -> None:
         await self._db.execute(
             "UPDATE workers SET status = ? WHERE id = ?",
@@ -391,7 +580,7 @@ class Database:
         )
         await self._db.commit()
 
-    async def _insert_worker(self, w: Worker) -> None:
+    async def _insert_worker(self, w: Worker, *, commit: bool = True) -> None:
         await self._db.execute(
             """INSERT INTO workers
                (id, name, worker_ip, dns_name, ssh_user, harness_dir, gpu_count, gpu_names, gpu_vram_gb,
@@ -408,9 +597,12 @@ class Database:
                 w.status.value, w.last_heartbeat_ts, w.created_at,
             ),
         )
-        await self._db.commit()
+        await self._db.execute("UPDATE workers SET gpu_device_ids=? WHERE id=?",
+                               (json.dumps(w.gpu_device_ids), w.id))
+        if commit:
+            await self._db.commit()
 
-    async def _update_worker(self, w: Worker) -> None:
+    async def _update_worker(self, w: Worker, *, commit: bool = True) -> None:
         await self._db.execute(
             """UPDATE workers SET
                name=?, worker_ip=?, dns_name=?, ssh_user=?, harness_dir=?, gpu_count=?, gpu_names=?,
@@ -427,7 +619,10 @@ class Database:
                 w.status.value, w.last_heartbeat_ts, w.id,
             ),
         )
-        await self._db.commit()
+        await self._db.execute("UPDATE workers SET gpu_device_ids=? WHERE id=?",
+                               (json.dumps(w.gpu_device_ids), w.id))
+        if commit:
+            await self._db.commit()
 
     def _row_to_worker(self, row: aiosqlite.Row) -> Worker:
         return Worker(
@@ -442,6 +637,7 @@ class Database:
             gpu_vram_gb=json.loads(row["gpu_vram_gb"]),
             gpu_used_vram_gb=json.loads(row["gpu_used_vram_gb"]),
             gpu_busy=json.loads(row["gpu_busy"] or "[]"),
+            gpu_device_ids=json.loads(row["gpu_device_ids"] or "[]"),
             cpu_cores=row["cpu_cores"],
             total_ram_gb=row["total_ram_gb"],
             used_ram_gb=row["used_ram_gb"],
@@ -452,6 +648,387 @@ class Database:
             last_heartbeat_ts=row["last_heartbeat_ts"],
             created_at=row["created_at"],
         )
+
+    async def _project_worker(self, row: aiosqlite.Row) -> Worker:
+        worker = self._row_to_worker(row)
+        metadata = await (await self._db.execute(
+            "SELECT * FROM slurm_workers WHERE worker_id=?", (worker.id,),
+        )).fetchone()
+        if metadata:
+            worker.slurm = SlurmWorkerInfo(
+                **json.loads(metadata["policy"]),
+                **{key: metadata[key] for key in (
+                    "request_id", "recipient_id", "initial_job_id", "slurm_job_id",
+                    "scheduler_state", "scheduler_reason", "observed_at",
+                    "submission_attempted", "submission_failed", "cancel_requested",
+                    "submitted_at", "started_at", "finished_at", "failure_deadline",
+                    "last_useful_started_at", "last_useful_started_monotonic", "last_useful_boot_id",
+                )},
+            )
+        return worker
+
+    @staticmethod
+    def _digest(payload: dict) -> str:
+        return hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode()).hexdigest()
+
+    async def reserve_slurm_worker(self, request: SlurmReservationRequest) -> Worker:
+        request = SlurmReservationRequest.model_validate(request)
+        digest = self._digest(request.model_dump())
+        async with self._queue_lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                previous = await (await self._db.execute(
+                    "SELECT worker_id, request_digest FROM slurm_workers WHERE request_id=?",
+                    (request.request_id,),
+                )).fetchone()
+                if previous:
+                    if previous["request_digest"] != digest:
+                        raise SlurmError("IDEMPOTENCY_CONFLICT", "reservation request_id reused with a different body")
+                    worker = await self.get_worker(previous["worker_id"])
+                else:
+                    worker = Worker(
+                        id=str(uuid4()), name=request.name, worker_ip="",
+                        gpu_count=request.gpu_count, cpu_cores=request.slurm.cpus,
+                        total_ram_gb=request.slurm.memory_mb / 1024,
+                        created_at=int(time.time()),
+                    )
+                    await self._insert_worker(worker, commit=False)
+                    await self._db.execute(
+                        """INSERT INTO slurm_workers
+                           (worker_id, request_id, request_digest, policy, recipient_id, registration_token_hash)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (worker.id, request.request_id, digest, request.slurm.model_dump_json(),
+                         request.recipient_id, request.registration_token_hash),
+                    )
+                    worker = await self.get_worker(worker.id)
+                await self._db.commit()
+                assert worker is not None
+                return worker
+            except BaseException:
+                await self._db.rollback()
+                raise
+
+    async def authenticate_slurm_worker(self, worker_id: str, token: str) -> bool:
+        row = await (await self._db.execute(
+            "SELECT registration_token_hash, token_revoked FROM slurm_workers WHERE worker_id=?",
+            (worker_id,),
+        )).fetchone()
+        return bool(row and not row["token_revoked"] and hmac.compare_digest(
+            hashlib.sha256(token.encode()).hexdigest(), row["registration_token_hash"],
+        ))
+
+    async def revoke_slurm_worker_token(self, worker_id: str) -> None:
+        async with self._queue_lock:
+            await self._db.execute("UPDATE slurm_workers SET token_revoked=1 WHERE worker_id=?", (worker_id,))
+            await self._db.commit()
+
+    async def assert_worker_accepts_jobs(self, worker_id: str) -> Worker:
+        worker = await self.get_worker(worker_id)
+        if worker is None:
+            raise KeyError(worker_id)
+        if worker.status == WorkerStatus.DRAINING or (
+            worker.slurm and (worker.slurm.finished_at is not None
+                              or worker.slurm.submission_failed or worker.slurm.cancel_requested)
+        ):
+            raise SlurmError(
+                "SLURM_WORKER_FINISHED",
+                "Worker is draining or its allocation has finished; submit a fresh allocation",
+            )
+        return worker
+
+    @staticmethod
+    def _validate_queue_capacity(worker: Worker, gpu_count: int) -> None:
+        cpu = worker.slurm is not None and worker.slurm.compute_kind == "cpu"
+        if gpu_count < 0 or (cpu and gpu_count != 0) or (not cpu and gpu_count == 0):
+            raise ValueError("gpu_count must be zero only for a CPU Slurm worker, and positive otherwise")
+        if gpu_count > worker.gpu_count:
+            raise ValueError("gpu_count exceeds worker capacity")
+
+    async def _worker_event(self, worker: Worker, event_type: str, details: dict | None = None) -> None:
+        assert worker.slurm is not None
+        encoded = json.dumps(details or {}, ensure_ascii=True)
+        if len(encoded.encode()) > 8192:
+            raise ValueError("job event details exceed 8192 bytes")
+        await self._db.execute(
+            """INSERT INTO job_events
+               (recipient_id, worker_id, job_id, event_type, details, created_at)
+               SELECT ?, ?, NULL, ?, ?, ?
+               WHERE NOT EXISTS (SELECT 1 FROM job_events
+                 WHERE worker_id=? AND job_id IS NULL AND event_type=?)""",
+            (worker.slurm.recipient_id, worker.id, event_type, encoded, time.time(),
+             worker.id, event_type),
+        )
+
+    async def list_job_events(self, recipient_id: str, after: int = 0, limit: int = 100) -> list[JobEvent]:
+        rows = await self._db.execute_fetchall(
+            "SELECT * FROM job_events WHERE recipient_id=? AND sequence>? ORDER BY sequence LIMIT ?",
+            (recipient_id, max(0, after), max(1, min(limit, 1000))),
+        )
+        return [JobEvent(**{**dict(row), "details": json.loads(row["details"])}) for row in rows]
+
+    async def _record_useful_start(
+        self, worker: Worker, job: Job, started_at: float,
+        started_monotonic: float, boot_id: str,
+    ) -> None:
+        # Admission and usefulness come from the assigned job, never a report's
+        # queue_managed flag. Ordinary workers retain their existing semantics.
+        if not worker.slurm or not job.queue_managed:
+            return
+        metadata = await (await self._db.execute(
+            "SELECT * FROM slurm_workers WHERE worker_id=?", (worker.id,),
+        )).fetchone()
+        same_boot = (metadata["last_useful_boot_id"] == boot_id
+                     and metadata["last_useful_started_monotonic"] is not None)
+        newer = (started_monotonic > metadata["last_useful_started_monotonic"] if same_boot
+                 else metadata["last_useful_started_at"] is None
+                 or started_at > metadata["last_useful_started_at"])
+        if newer:
+            await self._db.execute(
+                """UPDATE slurm_workers SET last_useful_started_at=?,
+                   last_useful_started_monotonic=?, last_useful_boot_id=? WHERE worker_id=?""",
+                (started_at, started_monotonic, boot_id, worker.id),
+            )
+        if metadata["failure_deadline"] is not None:
+            same_failure_boot = (metadata["failure_boot_id"] == boot_id
+                                 and metadata["failure_finished_monotonic"] is not None)
+            after_failure = (started_monotonic > metadata["failure_finished_monotonic"]
+                             if same_failure_boot else
+                             started_at > metadata["failure_deadline"] - worker.slurm.failure_grace_seconds)
+            if after_failure:
+                await self._db.execute(
+                    """UPDATE slurm_workers SET failure_deadline=NULL,
+                       failure_boot_id=NULL, failure_finished_monotonic=NULL WHERE worker_id=?""",
+                    (worker.id,),
+                )
+
+    async def _apply_active_runner_starts(self, worker: Worker, active_jobs: list[dict]) -> None:
+        observations = []
+        for value in active_jobs:
+            if not any(key in value for key in ("started_at", "started_monotonic", "boot_id")):
+                continue
+            observation = RunnerStartObservation.model_validate(value)
+            job = await self.get_job(observation.job_id)
+            if job is None or job.worker_id != worker.id:
+                raise ValueError("runner start does not match a job assigned to this worker")
+            observations.append((job, observation))
+        for job, observation in observations:
+            await self._record_useful_start(
+                worker, job, observation.started_at, observation.started_monotonic, observation.boot_id,
+            )
+
+    async def _apply_runner_results(self, worker: Worker, reports: list[JobResultReport]) -> None:
+        # Validate the complete batch first so a bad linkage never partly commits.
+        jobs = []
+        for report in reports:
+            job = await self.get_job(report.job_id)
+            if job is None or job.worker_id != worker.id:
+                raise ValueError("runner result does not match a job assigned to this worker")
+            jobs.append((job, report.result))
+        # Observe every actual start before any finish. A newer useful job may
+        # already have exited before an older failure is replayed.
+        for job, result in jobs:
+            evidence = job.runner_result if job.status in (JobStatus.DONE, JobStatus.FAILED) else result
+            if evidence and evidence.started_at is not None:
+                await self._record_useful_start(
+                    worker, job, evidence.started_at, evidence.started_monotonic, evidence.boot_id,
+                )
+        for job, result in jobs:
+            if job.status in (JobStatus.DONE, JobStatus.FAILED):
+                continue
+            await self._db.execute(
+                """UPDATE jobs SET status=?, exit_code=?, finished_at=?, runner_result=?
+                   WHERE id=? AND status NOT IN ('done','failed')""",
+                (JobStatus.DONE.value if result.exit_code == 0 else JobStatus.FAILED.value,
+                 result.exit_code, result.finished_at, result.model_dump_json(), job.id),
+            )
+
+    async def apply_job_runner_result(
+        self, worker_id: str, job_id: str, result: RunnerResult,
+    ) -> Job:
+        """Persist verified SSH runner evidence through the heartbeat result path."""
+        report = JobResultReport(job_id=job_id, result=RunnerResult.model_validate(result))
+        async with self._queue_transaction():
+            worker = await self.get_worker(worker_id)
+            if worker is None:
+                raise KeyError(worker_id)
+            await self._apply_runner_results(worker, [report])
+            job = await self.get_job(job_id)
+            assert job is not None
+            return job
+
+    async def register_slurm_worker(self, reg: WorkerRegistration, ready: bool) -> Worker:
+        async with self._queue_lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                worker = await self.get_worker(reg.worker_id)
+                if not worker or not worker.slurm:
+                    raise KeyError(reg.worker_id)
+                info = worker.slurm
+                if info.finished_at is not None or info.submission_failed:
+                    raise SlurmError("SLURM_WORKER_FINISHED", "allocation finished; submit a fresh allocation")
+                if (reg.name != worker.name or reg.gpu_count != worker.gpu_count
+                        or reg.cpu_cores != info.cpus
+                        or abs(reg.total_ram_gb * 1024 - info.memory_mb) > 1):
+                    raise SlurmError("SLURM_IDENTITY_CONFLICT", "registration differs from reserved identity/capacity")
+                startup_failed = bool(reg.slurm and reg.slurm.startup_error)
+                if not startup_failed:
+                    ids = [gpu.uuid for gpu in reg.gpus]
+                    if (len(reg.gpus) != worker.gpu_count
+                            or [gpu.index for gpu in reg.gpus] != list(range(worker.gpu_count))
+                            or any(not value or not value.startswith("GPU-") for value in ids)
+                            or len(set(ids)) != len(ids)
+                            or (worker.gpu_device_ids and ids != worker.gpu_device_ids)):
+                        raise SlurmError("SLURM_IDENTITY_CONFLICT", "registration requires stable ordered physical GPU UUIDs")
+                previous_status = worker.status
+                if startup_failed:
+                    # GPU mapping can itself be the startup failure. Record
+                    # the authenticated error without treating incomplete
+                    # telemetry as an allocation identity or ready mapping.
+                    worker.last_heartbeat_ts = int(time.time())
+                else:
+                    worker.update_from_registration(reg)
+                worker.status = (WorkerStatus.DRAINING if previous_status == WorkerStatus.DRAINING
+                                 or info.cancel_requested else
+                                 WorkerStatus.ONLINE if ready or previous_status == WorkerStatus.ONLINE
+                                 else WorkerStatus.OFFLINE)
+                if reg.slurm:
+                    await self._apply_active_runner_starts(worker, reg.active_jobs)
+                    await self._apply_runner_results(worker, reg.slurm.results)
+                    if reg.slurm.startup_error:
+                        cursor = await self._db.execute(
+                            "UPDATE slurm_workers SET startup_error=? WHERE worker_id=? AND startup_error IS NULL",
+                            (reg.slurm.startup_error, worker.id),
+                        )
+                        if cursor.rowcount:
+                            await self._worker_event(worker, "worker_start_failed", {"error": reg.slurm.startup_error})
+                        if worker.status != WorkerStatus.DRAINING:
+                            worker.status = WorkerStatus.OFFLINE
+                    if reg.slurm.checkpoint_requested:
+                        cursor = await self._db.execute(
+                            "UPDATE slurm_workers SET checkpoint_requested=1 WHERE worker_id=? AND checkpoint_requested=0",
+                            (worker.id,),
+                        )
+                        worker.status = WorkerStatus.DRAINING
+                        if cursor.rowcount:
+                            await self._worker_event(worker, "checkpoint_requested")
+                    if reg.slurm.draining:
+                        # Useful-work emptiness and admission close share this writer transaction.
+                        useful = await self._db.execute_fetchall(
+                            """SELECT 1 FROM jobs WHERE worker_id=? AND queue_managed=1
+                               AND status IN ('pending','starting','running')
+                               UNION ALL SELECT 1 FROM slurm_workers WHERE worker_id=?
+                                 AND failure_deadline > ? LIMIT 1""",
+                            (worker.id, worker.id, time.time()),
+                        )
+                        if not useful:
+                            worker.status = WorkerStatus.DRAINING
+                await self._update_worker(worker, commit=False)
+                if worker.status == WorkerStatus.ONLINE:
+                    cursor = await self._db.execute(
+                        "UPDATE slurm_workers SET started_at=? WHERE worker_id=? AND started_at IS NULL",
+                        (time.time(), worker.id),
+                    )
+                    if cursor.rowcount:
+                        await self._worker_event(worker, "worker_ready")
+                await self._db.commit()
+                return await self.get_worker(worker.id)
+            except BaseException:
+                await self._db.rollback()
+                raise
+
+    async def observe_slurm_worker(self, worker_id: str, observation: SlurmObservation) -> Worker:
+        observation = SlurmObservation.model_validate(observation)
+        async with self._queue_lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                worker = await self.get_worker(worker_id)
+                if not worker or not worker.slurm:
+                    raise KeyError(worker_id)
+                info = worker.slurm
+                if observation.cancel_if_empty:
+                    useful = await self._db.execute_fetchall(
+                        """SELECT 1 FROM jobs WHERE worker_id=? AND queue_managed=1
+                           AND status IN ('pending','starting','running') LIMIT 1""",
+                        (worker_id,),
+                    )
+                    if (useful or info.started_at is not None or info.finished_at is not None
+                            or info.submission_failed):
+                        # Job-scope cancellation may only retire an empty
+                        # pre-start allocation. The same writer transaction
+                        # fences concurrent admission and readiness.
+                        await self._db.commit()
+                        return worker
+                if (observation.slurm_job_id and info.slurm_job_id
+                        and observation.slurm_job_id != info.slurm_job_id):
+                    raise SlurmError("SLURM_IDENTITY_CONFLICT", "scheduler job ID is already bound")
+                # Results precede terminal evidence, including results from a stale
+                # scheduler poll. They prove individual outcomes, never readiness.
+                await self._apply_runner_results(worker, observation.recovered_results)
+                if observation.slurm_job_id:
+                    await self._db.execute(
+                        "UPDATE slurm_workers SET slurm_job_id=COALESCE(slurm_job_id, ?), submitted_at=COALESCE(submitted_at, ?) WHERE worker_id=?",
+                        (observation.slurm_job_id, observation.observed_at, worker_id),
+                    )
+                if observation.submission_attempted:
+                    await self._db.execute("UPDATE slurm_workers SET submission_attempted=1 WHERE worker_id=?", (worker_id,))
+                if observation.cancel_requested:
+                    await self._db.execute("UPDATE slurm_workers SET cancel_requested=1 WHERE worker_id=?", (worker_id,))
+                    if info.finished_at is None:
+                        await self._db.execute("UPDATE workers SET status='draining' WHERE id=?", (worker_id,))
+                state = observation.scheduler_state
+                terminal = bool(state and state.upper().split()[0].rstrip("+") in _TERMINAL_SLURM_STATES)
+                fresh = info.observed_at is None or observation.observed_at >= info.observed_at
+                if fresh and info.finished_at is None:
+                    await self._db.execute(
+                        """UPDATE slurm_workers SET
+                           scheduler_state=COALESCE(?, scheduler_state),
+                           scheduler_reason=COALESCE(?, scheduler_reason), observed_at=?
+                           WHERE worker_id=?""",
+                        (state, observation.scheduler_reason, observation.observed_at, worker_id),
+                    )
+                failed_submission = bool(observation.submission_failed and info.slurm_job_id is None
+                                         and observation.slurm_job_id is None and info.started_at is None)
+                if observation.submission_failed and not failed_submission and not info.submission_failed:
+                    raise SlurmError("SLURM_IDENTITY_CONFLICT", "cannot mark a submitted or started allocation submission-failed")
+                if (terminal and fresh or failed_submission) and info.finished_at is None:
+                    await self._db.execute(
+                        """UPDATE slurm_workers SET finished_at=?, token_revoked=1,
+                           submission_failed=MAX(submission_failed, ?) WHERE worker_id=?""",
+                        (observation.observed_at, int(failed_submission), worker_id),
+                    )
+                    await self._db.execute("UPDATE workers SET status='offline' WHERE id=?", (worker_id,))
+                    await self._db.execute(
+                        """UPDATE jobs SET status='failed', exit_code=-1, finished_at=?
+                           WHERE worker_id=? AND status NOT IN ('done','failed')""",
+                        (observation.observed_at, worker_id),
+                    )
+                    details = {
+                        "scheduler_state": state, "reason": observation.scheduler_reason,
+                        "submission_failed": failed_submission,
+                    }
+                    if info.started_at is None:
+                        await self._worker_event(worker, "worker_start_failed", details)
+                    await self._worker_event(worker, "worker_stopped", details)
+                await self._db.commit()
+                return await self.get_worker(worker_id)
+            except BaseException:
+                await self._db.rollback()
+                raise
+
+    async def drain_slurm_worker(self, worker_id: str) -> bool:
+        async with self._queue_lock:
+            cursor = await self._db.execute(
+                """UPDATE workers SET status='draining' WHERE id=?
+                   AND EXISTS (SELECT 1 FROM slurm_workers WHERE worker_id=workers.id AND finished_at IS NULL
+                     AND (failure_deadline IS NULL OR failure_deadline<=unixepoch()))
+                   AND NOT EXISTS (SELECT 1 FROM jobs WHERE worker_id=workers.id
+                     AND queue_managed=1 AND status IN ('pending','starting','running'))""",
+                (worker_id,),
+            )
+            await self._db.commit()
+            return bool(cursor.rowcount)
 
     # ── Pi sessions ──────────────────────────────────────────────────
 
@@ -486,6 +1063,7 @@ class Database:
             created_at=row["created_at"], updated_at=row["updated_at"],
         )
 
+    @_write_locked
     async def insert_pi_session(self, session: PiSession) -> None:
         await self._db.execute(
             """INSERT INTO pi_sessions
@@ -506,6 +1084,7 @@ class Database:
         )
         await self._db.commit()
 
+    @_write_locked
     async def update_pi_session(self, session: PiSession) -> None:
         await self._db.execute(
             """UPDATE pi_sessions SET worker_id=?, parent_session_id=?, session_type=?, state=?, task=?, cwd=?,
@@ -543,6 +1122,7 @@ class Database:
         )
         return [self._row_to_pi_session(row) for row in rows]
 
+    @_write_locked
     async def update_pi_session_meta(self, session_id: str, meta: dict) -> None:
         await self._db.execute(
             "UPDATE pi_sessions SET meta=json_patch(meta, ?) WHERE id=?",
@@ -566,6 +1146,7 @@ class Database:
                 raise KeyError(session_id)
             return int(row[0])
 
+    @_write_locked
     async def reparent_pi_session_children(self, old_id: str, new_id: str) -> None:
         await self._db.execute(
             """UPDATE pi_sessions SET parent_session_id=?
@@ -881,6 +1462,7 @@ class Database:
             await self._db.commit()
             return session_ids
 
+    @_write_locked
     async def insert_pi_session_event(self, event: PiSessionEvent) -> None:
         await self._db.execute(
             "INSERT OR IGNORE INTO pi_session_events (id, session_id, event_type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -946,42 +1528,64 @@ class Database:
 
     # ── Jobs ──────────────────────────────────────────────────────────
 
-    async def insert_job(self, job: Job) -> None:
+    async def _insert_job_record(self, job: Job, digest: str | None = None) -> None:
         await self._db.execute(
             """INSERT INTO jobs
                (id, worker_id, name, tmux_session, command, status, queue_managed,
                 exit_code, pty_enabled, kind, origin_session_id, report_revision,
-                expected_seconds, gpu_count, gpu_indices, queue_order, started_at, finished_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                job.id, job.worker_id, job.name, job.tmux_session, job.command,
-                job.status.value, int(job.queue_managed), job.exit_code,
-                int(job.pty_enabled), job.kind.value, job.origin_session_id,
-                job.report_revision, job.expected_seconds, job.gpu_count,
-                json.dumps(job.gpu_indices), job.queue_order, job.started_at,
-                job.finished_at,
-            ),
+                expected_seconds, gpu_count, gpu_indices, queue_order, started_at, finished_at,
+                notify_recipient_id, submission_key, submission_digest)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (job.id, job.worker_id, job.name, job.tmux_session, job.command,
+             job.status.value, int(job.queue_managed), job.exit_code, int(job.pty_enabled),
+             job.kind.value, job.origin_session_id, job.report_revision,
+             job.expected_seconds, job.gpu_count, json.dumps(job.gpu_indices),
+             job.queue_order, job.started_at, job.finished_at, job.notify_recipient_id,
+             job.submission_key, digest),
         )
-        await self._db.commit()
+
+    async def insert_job(self, job: Job) -> None:
+        async with self._queue_lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                if job.worker_id:
+                    worker = await self.get_worker(job.worker_id)
+                    if worker:
+                        await self.assert_worker_accepts_jobs(job.worker_id)
+                        if job.notify_recipient_id is None and worker.slurm:
+                            job.notify_recipient_id = worker.slurm.recipient_id
+                await self._insert_job_record(job)
+                await self._db.commit()
+            except BaseException:
+                await self._db.rollback()
+                raise
 
     async def update_job(self, job: Job) -> None:
-        await self._db.execute(
-            """UPDATE jobs
-               SET worker_id=?, name=?, tmux_session=?, command=?, status=?,
-                   queue_managed=?, exit_code=?, pty_enabled=?, kind=?,
-                   origin_session_id=?, report_revision=?, expected_seconds=?,
-                   gpu_count=?, gpu_indices=?, queue_order=?, started_at=?, finished_at=?
-               WHERE id=?""",
-            (
-                job.worker_id, job.name, job.tmux_session, job.command,
-                job.status.value, int(job.queue_managed), job.exit_code,
-                int(job.pty_enabled), job.kind.value, job.origin_session_id,
-                job.report_revision, job.expected_seconds, job.gpu_count,
-                json.dumps(job.gpu_indices), job.queue_order, job.started_at,
-                job.finished_at, job.id,
-            ),
-        )
-        await self._db.commit()
+        async with self._queue_transaction():
+            previous = await self.get_job(job.id)
+            if previous and previous.worker_id:
+                source = await self.get_worker(previous.worker_id)
+                if (source and source.slurm and source.slurm.initial_job_id == job.id
+                        and source.slurm.submission_attempted
+                        and (job.worker_id != previous.worker_id or job.gpu_count != previous.gpu_count)):
+                    raise SlurmError("SLURM_IDENTITY_CONFLICT", "submitted allocation resources are frozen; cancel and enqueue a fresh allocation")
+            # Terminal outcomes are absorbing, including a result recovered while
+            # an ordinary SSH launch or reconciliation was still outstanding.
+            await self._db.execute(
+                """UPDATE jobs
+                   SET worker_id=?, name=?, tmux_session=?, command=?, status=?,
+                       queue_managed=?, exit_code=?, pty_enabled=?, kind=?,
+                       origin_session_id=?, report_revision=?, expected_seconds=?,
+                       gpu_count=?, gpu_indices=?, queue_order=?, started_at=?, finished_at=?
+                   WHERE id=? AND status NOT IN ('done','failed')""",
+                (job.worker_id, job.name, job.tmux_session, job.command,
+                 job.status.value, int(job.queue_managed), job.exit_code,
+                 int(job.pty_enabled), job.kind.value, job.origin_session_id,
+                 job.report_revision, job.expected_seconds, job.gpu_count,
+                 json.dumps(job.gpu_indices), job.queue_order, job.started_at,
+                 job.finished_at, job.id),
+            )
+            await self._db.commit()
 
     async def get_job(self, job_id: str) -> Job | None:
         cursor = await self._db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
@@ -1010,35 +1614,52 @@ class Database:
         query += " ORDER BY started_at DESC"
         rows = await self._db.execute_fetchall(query, params)
         return [self._row_to_job(r) for r in rows]
+    async def get_job_by_submission_key(self, key: str) -> Job | None:
+        row = await (await self._db.execute("SELECT * FROM jobs WHERE submission_key=?", (key,))).fetchone()
+        return self._row_to_job(row) if row else None
+
     async def insert_queued_job(self, job: Job) -> Job:
         async with self._queue_lock:
-            cursor = await self._db.execute(
-                """SELECT COALESCE(MAX(queue_order), 0)
-                   FROM jobs
-                   WHERE queue_managed = 1 AND worker_id = ? AND status IN (?, ?, ?)""",
-                (job.worker_id, JobStatus.PENDING.value, JobStatus.STARTING.value, JobStatus.RUNNING.value),
-            )
-            job.queue_managed = True
-            job.status = JobStatus.PENDING
-            job.gpu_indices = []
-            job.queue_order = (await cursor.fetchone())[0] + 1
-            job.started_at = 0
-            job.finished_at = 0
-            await self._db.execute(
-                """INSERT INTO jobs
-                   (id, worker_id, name, tmux_session, command, status, queue_managed,
-                    exit_code, pty_enabled, kind, origin_session_id, report_revision,
-                    expected_seconds, gpu_count, gpu_indices, queue_order, started_at, finished_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    job.id, job.worker_id, job.name, job.tmux_session, job.command,
-                    job.status.value, 1, job.exit_code, int(job.pty_enabled),
-                    job.kind.value, job.origin_session_id, job.report_revision,
-                    job.expected_seconds, job.gpu_count, "[]", job.queue_order, 0, 0,
-                ),
-            )
-            await self._db.commit()
-            return job
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                existing_worker = await self.get_worker(job.worker_id)
+                payload = {key: getattr(job, key) for key in (
+                    "worker_id", "name", "command", "pty_enabled", "origin_session_id",
+                    "expected_seconds", "gpu_count", "notify_recipient_id",
+                )}
+                if payload["notify_recipient_id"] is None and existing_worker and existing_worker.slurm:
+                    payload["notify_recipient_id"] = existing_worker.slurm.recipient_id
+                digest = self._digest(payload)
+                if job.submission_key:
+                    previous = await (await self._db.execute(
+                        "SELECT * FROM jobs WHERE submission_key=?", (job.submission_key,),
+                    )).fetchone()
+                    if previous:
+                        if previous["submission_digest"] != digest:
+                            raise SlurmError("IDEMPOTENCY_CONFLICT", "submission_key reused with a different job payload")
+                        await self._db.commit()
+                        return self._row_to_job(previous)
+                worker = await self.assert_worker_accepts_jobs(job.worker_id)
+                self._validate_queue_capacity(worker, job.gpu_count)
+                if job.notify_recipient_id is None and worker.slurm:
+                    job.notify_recipient_id = worker.slurm.recipient_id
+                cursor = await self._db.execute(
+                    """SELECT COALESCE(MAX(queue_order), 0) FROM jobs
+                       WHERE queue_managed=1 AND worker_id=? AND status IN ('pending','starting','running')""",
+                    (job.worker_id,),
+                )
+                job.queue_managed = True
+                job.status = JobStatus.PENDING
+                job.gpu_indices = []
+                job.queue_order = (await cursor.fetchone())[0] + 1
+                job.started_at = 0
+                job.finished_at = 0
+                await self._insert_job_record(job, digest)
+                await self._db.commit()
+                return job
+            except BaseException:
+                await self._db.rollback()
+                raise
 
     async def list_queued_jobs(self, worker_id: str | None = None) -> list[Job]:
         query = """
@@ -1082,6 +1703,20 @@ class Database:
                    SET status = ?, gpu_indices = ?, started_at = ?
                    WHERE id = ? AND queue_managed = 1 AND status = ?
                      AND worker_id = ? AND gpu_count = ?
+                     AND EXISTS (
+                       SELECT 1 FROM workers WHERE id=jobs.worker_id AND status='online'
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM slurm_workers WHERE worker_id=jobs.worker_id
+                         AND (finished_at IS NOT NULL OR submission_failed=1 OR cancel_requested=1)
+                     )
+                     AND (gpu_count>0 OR (
+                       EXISTS (SELECT 1 FROM slurm_workers WHERE worker_id=jobs.worker_id
+                         AND json_extract(policy, '$.compute_kind')='cpu')
+                       AND NOT EXISTS (SELECT 1 FROM jobs AS active_cpu
+                         WHERE active_cpu.worker_id=jobs.worker_id AND active_cpu.queue_managed=1
+                           AND active_cpu.status IN ('starting','running'))
+                     ))
                      AND id = (
                        SELECT id FROM jobs
                        WHERE queue_managed = 1 AND worker_id = ? AND status = ?
@@ -1125,7 +1760,7 @@ class Database:
         expected_seconds: int | None,
         gpu_count: int | None,
     ) -> Job:
-        async with self._queue_lock:
+        async with self._queue_transaction():
             row = await (
                 await self._db.execute(
                     "SELECT * FROM jobs WHERE id = ? AND queue_managed = 1",
@@ -1139,12 +1774,14 @@ class Database:
 
             source_worker_id = row["worker_id"]
             destination_worker_id = worker_id if worker_id is not None else source_worker_id
-            destination_worker = await self.get_worker(destination_worker_id)
+            destination_worker = await self.assert_worker_accepts_jobs(destination_worker_id)
             requested_gpu_count = gpu_count if gpu_count is not None else row["gpu_count"]
-            if destination_worker is None:
-                raise ValueError("destination worker no longer exists")
-            if requested_gpu_count > destination_worker.gpu_count:
-                raise ValueError("gpu_count exceeds destination worker capacity")
+            source = await self.get_worker(source_worker_id)
+            if (source and source.slurm and source.slurm.initial_job_id == job_id
+                    and source.slurm.submission_attempted
+                    and (destination_worker_id != source_worker_id or requested_gpu_count != row["gpu_count"])):
+                raise SlurmError("SLURM_IDENTITY_CONFLICT", "submitted allocation resources are frozen; cancel and enqueue a fresh allocation")
+            self._validate_queue_capacity(destination_worker, requested_gpu_count)
             source_rows = await self._db.execute_fetchall(
                 """SELECT id FROM jobs
                    WHERE queue_managed = 1 AND worker_id = ? AND status = ? AND id != ?
@@ -1329,6 +1966,9 @@ class Database:
         or letting an older report overwrite a newer worker projection.
         """
         async with self._worker_job_report_lock:
+            worker = await self.get_worker(worker_id)
+            if worker and worker.slurm:
+                raise PermissionError("reserved workers cannot use legacy job reports")
             session = await self.get_pi_session(report.origin_session_id)
             if not session:
                 raise KeyError(report.origin_session_id)
@@ -1358,7 +1998,8 @@ class Database:
                    WHERE jobs.worker_id=excluded.worker_id
                      AND jobs.origin_session_id=excluded.origin_session_id
                      AND jobs.kind='delegated'
-                     AND jobs.report_revision < excluded.report_revision""",
+                     AND jobs.report_revision < excluded.report_revision
+                     AND jobs.status NOT IN ('done','failed')""",
                 (
                     report.id, worker_id, report.tmux_session, report.command,
                     report.status.value, report.exit_code, int(report.pty_enabled),
@@ -1397,12 +2038,16 @@ class Database:
             gpu_count=row["gpu_count"] if "gpu_count" in row.keys() else 0,
             gpu_indices=json.loads(row["gpu_indices"]) if "gpu_indices" in row.keys() else [],
             queue_order=row["queue_order"] if "queue_order" in row.keys() else 0,
+            notify_recipient_id=row["notify_recipient_id"],
+            submission_key=row["submission_key"],
+            runner_result=RunnerResult.model_validate_json(row["runner_result"]) if row["runner_result"] else None,
             started_at=row["started_at"],
             finished_at=row["finished_at"],
         )
 
     # ── Port Forwards ─────────────────────────────────────────────────
 
+    @_write_locked
     async def insert_port_forward(self, pf: PortForward) -> None:
         await self._db.execute(
             """INSERT INTO port_forwards
@@ -1415,6 +2060,7 @@ class Database:
         )
         await self._db.commit()
 
+    @_write_locked
     async def update_port_forward_pid(self, pf_id: str, pid: int) -> None:
         await self._db.execute(
             "UPDATE port_forwards SET pid = ? WHERE id = ?", (pid, pf_id)
@@ -1430,6 +2076,7 @@ class Database:
         rows = await self._db.execute_fetchall(query, params)
         return [self._row_to_pf(r) for r in rows]
 
+    @_write_locked
     async def delete_port_forward(self, pf_id: str) -> None:
         await self._db.execute("DELETE FROM port_forwards WHERE id = ?", (pf_id,))
         await self._db.commit()
@@ -1447,6 +2094,7 @@ class Database:
 
     # ── Marimo Sessions ────────────────────────────────────────────────
 
+    @_write_locked
     async def insert_marimo_session(self, session: MarimoSession) -> None:
         await self._db.execute(
             """INSERT INTO marimo_sessions
@@ -1478,6 +2126,7 @@ class Database:
         rows = await self._db.execute_fetchall(query, params)
         return [self._row_to_marimo(row) for row in rows]
 
+    @_write_locked
     async def delete_marimo_session(self, session_id: str) -> None:
         await self._db.execute("DELETE FROM marimo_sessions WHERE id = ?", (session_id,))
         await self._db.commit()
@@ -1488,6 +2137,7 @@ class Database:
 
     # ── Failures ───────────────────────────────────────────────────────
 
+    @_write_locked
     async def insert_failure(self, failure: Failure) -> None:
         await self._db.execute(
             """INSERT INTO failures (job_id, worker_id, exit_code, timestamp, summary)
@@ -1514,8 +2164,12 @@ class Database:
 
     # ── Admin ─────────────────────────────────────────────────────────
 
+    @_write_locked
     async def delete_worker(self, worker_id: str) -> bool:
         """Delete a worker and all its associated records."""
+        worker = await self.get_worker(worker_id)
+        if worker and worker.slurm:
+            raise SlurmError("SLURM_WORKER_FINISHED", "Slurm reservation and job history cannot be deleted")
         cursor = await self._db.execute(
             "DELETE FROM jobs WHERE worker_id = ?", (worker_id,)
         )
@@ -1531,10 +2185,15 @@ class Database:
         await self._db.commit()
         return cursor.rowcount > 0
 
+    @_write_locked
     async def prune_workers(self, older_than_ts: int) -> int:
         """Delete all workers not seen since older_than_ts."""
         cursor = await self._db.execute(
-            "DELETE FROM workers WHERE last_heartbeat_ts < ?", (older_than_ts,)
+            """DELETE FROM workers WHERE last_heartbeat_ts < ?
+               AND id NOT IN (SELECT worker_id FROM slurm_workers)
+               AND id NOT IN (SELECT worker_id FROM jobs WHERE queue_managed=1
+                 AND worker_id IS NOT NULL AND status IN ('pending','starting','running'))""",
+            (older_than_ts,),
         )
         await self._db.commit()
         return cursor.rowcount

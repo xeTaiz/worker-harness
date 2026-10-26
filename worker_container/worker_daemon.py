@@ -8,6 +8,8 @@ Responsibilities:
 """
 
 import asyncio
+import ctypes
+import fcntl
 import getpass
 import json
 import logging
@@ -16,6 +18,8 @@ import signal
 import socket
 import subprocess
 import sys
+import math
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,9 +35,9 @@ ORCHESTRATOR_PORT: int = int(os.environ.get("ORCHESTRATOR_PORT", "12888"))
 HEARTBEAT_INTERVAL: int = int(os.environ.get("HEARTBEAT_INTERVAL", "60"))
 WORKER_NAME: str = os.environ.get("WORKER_NAME", socket.gethostname())
 WH_DIR: Path = Path(os.environ.get("WH_DIR", os.path.join(Path.home(), ".local", "worker-harness"))).expanduser()
-TS_SOCKET: str = str(WH_DIR / "tailscale" / "run" / "tailscaled.sock")
+TS_SOCKET: str = os.environ.get("TS_SOCKET", str(WH_DIR / "tailscale" / "run" / "tailscaled.sock"))
 HARNESS_DIR: Path = WH_DIR / "harness"
-JOB_TMUX_DIR: Path = HARNESS_DIR / "job-tmux"
+JOB_TMUX_DIR: Path = Path(os.environ.get("JOB_TMUX_DIR", str(HARNESS_DIR / "job-tmux")))
 WORKER_ID_FILE: Path = WH_DIR / "worker-daemon" / "id"
 WH_PROXY: str = os.environ.get("WH_PROXY", "").strip()
 def _detect_ssh_user() -> str:
@@ -163,6 +167,7 @@ def get_gpu_info() -> dict[str, Any]:
             gpus.append({
                 "index": int(idx.strip()),
                 "name": name.strip(),
+                "uuid": gpu_uuid.strip(),
                 "vram_total_gb": round(total_mb / 1024, 1),
                 "vram_used_gb": round(used_mb / 1024, 1),
                 "busy": (
@@ -180,8 +185,9 @@ def get_tailscale_identity() -> tuple[str, str]:
     """Get the Tailscale IPv4 address and MagicDNS hostname."""
     commands = [
         ["tailscale", f"--socket={TS_SOCKET}", "status", "--json"],
-        ["tailscale", "status", "--json"],
     ]
+    if not os.environ.get("WH_SLURM_WORKER_ID"):
+        commands.append(["tailscale", "status", "--json"])
 
     for cmd in commands:
         try:
@@ -305,6 +311,13 @@ def get_active_ports() -> list[dict[str, Any]]:
 
 def get_worker_id() -> str:
     """Load or create a stable worker ID persisted on the host volume."""
+    reserved = os.environ.get("WH_SLURM_WORKER_ID", "").strip()
+    if reserved:
+        WORKER_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if WORKER_ID_FILE.exists() and WORKER_ID_FILE.read_text().strip() != reserved:
+            raise ValueError("persisted worker identity differs from reserved allocation")
+        WORKER_ID_FILE.write_text(reserved)
+        return reserved
     WORKER_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
     if WORKER_ID_FILE.exists():
         return WORKER_ID_FILE.read_text().strip()
@@ -379,7 +392,460 @@ async def send_heartbeat(
 
 # ── Main loop ────────────────────────────────────────────────────────
 
+def atomic_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w") as stream:
+        os.chmod(temporary, 0o600)
+        json.dump(value, stream, allow_nan=False)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text())
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def timestamp(value: Any, default: float) -> float:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return default
+    return float(value) if type(value) in (int, float) and math.isfinite(value) else default
+
+
+def cuda_device_uuids(expected: int) -> list[str]:
+    """Resolve CUDA's Slurm-visible logical order, never host NVIDIA indices."""
+    visibility = os.environ.get("WH_SLURM_CUDA_VISIBLE_DEVICES")
+    if not visibility or "MIG" in visibility.upper():
+        raise ValueError("missing or unsupported MIG Slurm CUDA visibility")
+    os.environ["CUDA_VISIBLE_DEVICES"] = visibility
+    driver = ctypes.CDLL("libcuda.so.1")
+
+    def checked(name: str, *args: Any) -> None:
+        if getattr(driver, name)(*args) != 0:
+            raise ValueError(f"CUDA driver mapping failed: {name}")
+
+    checked("cuInit", 0)
+    count = ctypes.c_int()
+    checked("cuDeviceGetCount", ctypes.byref(count))
+    if count.value != expected:
+        raise ValueError("CUDA visible GPU count differs from reserved allocation")
+    mapped = []
+    for index in range(count.value):
+        device = ctypes.c_int()
+        checked("cuDeviceGet", ctypes.byref(device), index)
+        raw = (ctypes.c_ubyte * 16)()
+        if not hasattr(driver, "cuDeviceGetUuid_v2"):
+            raise ValueError("CUDA driver lacks unambiguous UUID v2 mapping (MIG unsupported)")
+        name = "cuDeviceGetUuid_v2"
+        checked(name, ctypes.byref(raw), device)
+        mapped.append("GPU-" + str(uuid.UUID(bytes=bytes(raw))))
+    if len(set(mapped)) != expected:
+        raise ValueError("ambiguous CUDA GPU UUID mapping")
+    return mapped
+
+
+def allocation_gpu_info(device_ids: list[str]) -> dict[str, Any]:
+    if not device_ids:
+        return {"gpu_count": 0, "gpus": []}
+    observed = get_gpu_info()["gpus"]
+    mapped: dict[str, dict[str, Any]] = {}
+    for gpu in observed:
+        key = gpu["uuid"]
+        if key in mapped:
+            raise ValueError("ambiguous NVIDIA GPU UUID telemetry")
+        mapped[key] = gpu
+    if any(device not in mapped for device in device_ids):
+        raise ValueError("CUDA mapping absent from physical NVIDIA telemetry (MIG unsupported)")
+    return {"gpu_count": len(device_ids), "gpus": [
+        dict(mapped[device], index=index) for index, device in enumerate(device_ids)
+    ]}
+
+
+def valid_result(value: dict[str, Any]) -> dict[str, Any] | None:
+    """Only runner descendant-exit proof, not shell output, releases a claim."""
+    if type(value.get("exit_code")) is not int or value.get("descendants_exited") is not True:
+        return None
+    for key, minimum in (("finished_at", 0), ("finished_monotonic", -1)):
+        number = value.get(key)
+        if type(number) not in (int, float) or not math.isfinite(number) or number <= minimum:
+            return None
+    if not isinstance(value.get("boot_id"), str) or not 0 < len(value["boot_id"]) <= 128:
+        return None
+    result = {key: value[key] for key in (
+        "exit_code", "descendants_exited", "finished_at", "finished_monotonic", "boot_id",
+    )}
+    if "started_at" in value or "started_monotonic" in value:
+        for key, minimum in (("started_at", 0), ("started_monotonic", -1)):
+            number = value.get(key)
+            if type(number) not in (int, float) or not math.isfinite(number) or number <= minimum:
+                return None
+            result[key] = number
+        if result["started_monotonic"] > result["finished_monotonic"]:
+            return None
+    reason = value.get("termination_reason")
+    if reason is not None:
+        if not isinstance(reason, str) or len(reason) > 1024:
+            return None
+        result["termination_reason"] = reason
+    return result
+
+
+def clock_after(left: dict[str, Any], left_prefix: str, right: dict[str, Any], right_prefix: str) -> bool:
+    if left.get("boot_id") and left.get("boot_id") == right.get("boot_id"):
+        return left[f"{left_prefix}_monotonic"] > right[f"{right_prefix}_monotonic"]
+    return left[f"{left_prefix}_at"] > right[f"{right_prefix}_at"]
+
+
+class SlurmRuntime:
+    """Finite mode of the ordinary daemon; execution remains in the runner."""
+
+    def __init__(self, settings: dict[str, Any], worker_id: str, token: str):
+        self.settings, self.worker_id, self.token = settings, worker_id, token
+        self.state_path = WH_DIR / "observations.json"
+        self.state = read_json(self.state_path) or {
+            "seen_results": {}, "pending_results": {}, "latest_start_clock": None,
+            "failure_deadline": None, "failure_clock": None,
+        }
+        if self.state.get("worker_id", worker_id) != worker_id:
+            raise ValueError("observation identity differs from reservation")
+        self.state["worker_id"] = worker_id
+        self.boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        self.active: dict[str, dict[str, Any]] = {}
+        self.device_ids: list[str] = []
+        self.ready = False
+        self.control_action = ""
+        self.control_deadline: float | None = None
+        self.controlled: set[tuple[str, str, str]] = set()
+        self.startup_error: str | None = None
+
+    def persist(self) -> None:
+        atomic_json(self.state_path, self.state)
+
+    def fence(self, *, idle_only: bool = False) -> bool:
+        HARNESS_DIR.mkdir(parents=True, exist_ok=True)
+        with (HARNESS_DIR / ".launch.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if idle_only:
+                self.scan()
+                if self.useful_active():
+                    return False
+            (HARNESS_DIR / ".draining").touch(mode=0o600, exist_ok=True)
+            return True
+
+    def scan(self) -> bool:
+        before = json.dumps(self.state, sort_keys=True)
+        active, records = {}, []
+        for directory in HARNESS_DIR.iterdir() if HARNESS_DIR.exists() else ():
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            started_runtime = read_json(directory / "runtime.json")
+            runtime = started_runtime or read_json(directory / "launch.json")
+            if not runtime or runtime.get("job_id") != directory.name:
+                continue
+            result = valid_result(read_json(directory / "result.json"))
+            if result and "started_at" in result and not started_runtime:
+                runtime = dict(runtime, **{key: result[key] for key in (
+                    "started_at", "started_monotonic", "boot_id",
+                )})
+            records.append((directory.name, runtime, result))
+            if result is None and started_runtime:
+                active[directory.name] = runtime
+            if runtime.get("queue_managed") is True:
+                started, monotonic = runtime.get("started_at"), runtime.get("started_monotonic")
+                if (type(started) in (int, float) and math.isfinite(started) and started > 0
+                        and type(monotonic) in (int, float) and math.isfinite(monotonic) and monotonic >= 0
+                        and isinstance(runtime.get("boot_id"), str) and runtime["boot_id"]):
+                    previous = self.state.get("latest_start_clock")
+                    if previous is None or clock_after(runtime, "started", previous, "started"):
+                        self.state["latest_start_clock"] = {key: runtime[key] for key in (
+                            "started_at", "started_monotonic", "boot_id",
+                        )}
+                        clock = self.state.get("failure_clock")
+                        if clock and clock_after(runtime, "started", clock, "finished"):
+                            self.state["failure_deadline"] = None
+                            self.state["failure_clock"] = None
+        self.active = active
+        for job_id, runtime, result in sorted(records, key=lambda item: (item[2] or {}).get("finished_at", 0)):
+            if result is None or job_id in self.state["seen_results"]:
+                continue
+            self.state["seen_results"][job_id] = result
+            self.state["pending_results"][job_id] = result
+            if (runtime.get("queue_managed") is True and result["exit_code"] != 0
+                    and (self.state["latest_start_clock"] is None or not clock_after(
+                        self.state["latest_start_clock"], "started", result, "finished"))
+                    and self.state["failure_deadline"] is None):
+                self.state["failure_deadline"] = result["finished_at"] + self.settings["failure_grace_seconds"]
+                self.state["failure_clock"] = result
+        changed = before != json.dumps(self.state, sort_keys=True)
+        if changed:
+            self.persist()
+        return changed
+
+    def grace_remaining(self) -> float | None:
+        deadline = self.state.get("failure_deadline")
+        if deadline is None:
+            return None
+        remaining = deadline - time.time()
+        clock = self.state.get("failure_clock")
+        if clock and clock["boot_id"] == self.boot_id:
+            remaining = min(remaining, clock["finished_monotonic"]
+                            + self.settings["failure_grace_seconds"] - time.monotonic())
+        return remaining
+
+    def useful_active(self) -> bool:
+        return any(runtime.get("queue_managed") is True for runtime in self.active.values())
+
+    def payload(self, ip: str, dns: str, drain: bool = False) -> dict[str, Any]:
+        # CPU mode never calls GPU/CUDA readiness or telemetry.
+        gpu = ({"gpu_count": self.settings["gpu_count"], "gpus": []}
+               if self.startup_error else allocation_gpu_info(self.device_ids))
+        system = get_system_info()
+        system["used_ram_gb"] = min(system.get("used_ram_gb", 0), self.settings["memory_mb"] / 1024)
+        return {
+            "worker_id": self.worker_id, "name": self.settings["worker_name"], "worker_ip": ip,
+            "dns_name": dns, "ssh_user": SSH_USER, "harness_dir": str(HARNESS_DIR),
+            **gpu, **system,
+            "cpu_cores": self.settings["cpus"], "total_ram_gb": self.settings["memory_mb"] / 1024,
+            "active_jobs": [{
+                "job_id": job_id, "status": "running",
+                **{key: record[key] for key in (
+                    "queue_managed", "started_at", "started_monotonic", "boot_id",
+                ) if key in record},
+            } for job_id, record in self.active.items()],
+            "active_ports": [], "data_paths": get_data_paths(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "slurm": {
+                "results": [{"job_id": job_id, "result": result} for job_id, result
+                            in list(self.state["pending_results"].items())[:100]],
+                "failure_deadline": self.state.get("failure_deadline"),
+                "checkpoint_requested": bool(self.control_action), "draining": drain,
+                "startup_error": self.startup_error,
+            },
+        }
+
+    async def heartbeat(self, client: httpx.AsyncClient, drain: bool = False) -> dict[str, Any] | None:
+        try:
+            ip, dns = await asyncio.to_thread(get_tailscale_identity)
+            payload = await asyncio.to_thread(self.payload, ip, dns, drain)
+            response = await client.post(
+                f"http://{ORCHESTRATOR_HOST}:{ORCHESTRATOR_PORT}/register",
+                json=payload, headers={"Authorization": f"Bearer {self.token}"}, timeout=12,
+            )
+            if response.status_code != 200:
+                log.warning("Scoped heartbeat refused: HTTP %s", response.status_code)
+                return None
+            body = response.json()
+            if body.get("worker_id") != self.worker_id or body.get("worker_status") not in {
+                "offline", "online", "draining",
+            }:
+                log.error("Scoped registration returned invalid identity/readiness")
+                return None
+            for report in payload["slurm"]["results"]:
+                self.state["pending_results"].pop(report["job_id"], None)
+            self.persist()
+            if body["worker_status"] == "online" and not self.ready:
+                atomic_json(WH_DIR / "ready", {"worker_id": self.worker_id, "ready_at": time.time()})
+                self.ready = True
+            return body
+        except (httpx.HTTPError, ValueError):
+            log.warning("Scoped heartbeat unavailable", exc_info=True)
+            return None
+
+    async def runner_control(self, job_id: str, action: str, requested_signal: str) -> None:
+        key = (job_id, action, requested_signal)
+        if key in self.controlled:
+            return
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, str(HARNESS_DIR / ".job_runner.py"), "control",
+                "--job-dir", str(HARNESS_DIR / job_id), "--action", action, "--signal", requested_signal,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                code = await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.CancelledError:
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+                raise
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+                return
+            if code == 0:
+                self.controlled.add(key)
+        except OSError:
+            log.exception("Runner control failed for %s", job_id)
+
+    async def controls(self) -> None:
+        request = read_json(WH_DIR / "control.json")
+        action = request.get("action")
+        if action in {"stop", "checkpoint"} and self.control_action != "stop":
+            self.control_action = action
+            self.fence()
+            self.scan()
+            if action == "stop" and self.control_deadline is None:
+                requested_at = timestamp(request.get("requested_at"), time.time())
+                remaining = max(0, min(self.settings["termination_grace_seconds"],
+                                      requested_at + self.settings["termination_grace_seconds"] - time.time()))
+                self.control_deadline = time.monotonic() + remaining
+        if not self.control_action:
+            return
+        stopping = self.control_action == "stop" and time.monotonic() >= self.control_deadline
+        await asyncio.gather(*(self.runner_control(
+            job_id, "stop" if stopping else "checkpoint",
+            "TERM" if self.control_action == "stop" else
+            self.active[job_id].get("checkpoint_signal", self.settings.get("checkpoint_signal", "USR1")),
+        ) for job_id in self.active))
+
+    async def stop_all(self, *, idle_only: bool = False) -> bool:
+        if not self.fence(idle_only=idle_only):
+            return False
+        self.scan()
+        await asyncio.gather(*(self.runner_control(job_id, "stop", "TERM") for job_id in self.active))
+        return True
+
+
+async def slurm_main() -> None:
+    worker_id = get_worker_id()
+    settings = read_json(Path(os.environ.get("WH_SLURM_SETTINGS_FILE", "")))
+    if settings.get("worker_id") != worker_id or settings.get("compute_kind") not in {"cpu", "gpu"}:
+        raise ValueError("invalid allocation settings or reserved identity")
+    if not isinstance(settings.get("worker_name"), str) or not settings["worker_name"]:
+        raise ValueError("allocation settings require the reserved worker name")
+    if settings.get("checkpoint_signal") not in {"USR1", "TERM"}:
+        raise ValueError("invalid workload checkpoint signal")
+    (WH_DIR / "ready").unlink(missing_ok=True)
+    for key in ("cpus", "memory_mb", "gpu_count", "failure_grace_seconds", "termination_grace_seconds"):
+        minimum = 1 if key in {"cpus", "memory_mb"} else 0
+        if type(settings.get(key)) is not int or settings[key] < minimum:
+            raise ValueError(f"invalid allocation setting {key}")
+    if (settings["compute_kind"] == "cpu") != (settings["gpu_count"] == 0):
+        raise ValueError("allocation GPU capacity does not match compute kind")
+    if not ORCHESTRATOR_HOST:
+        raise ValueError("ORCHESTRATOR_HOST required")
+    token = Path(os.environ["WH_WORKER_TOKEN_FILE"]).read_text().strip()
+    if not token or any(character.isspace() for character in token):
+        raise ValueError("invalid scoped worker token file")
+    runtime = SlurmRuntime(settings, worker_id, token)
+    if settings["compute_kind"] == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    else:
+        try:
+            runtime.device_ids = cuda_device_uuids(settings["gpu_count"])
+            allocation_gpu_info(runtime.device_ids)
+        except Exception as error:
+            log.error("Allocation GPU startup failed: %s", error)
+            runtime.startup_error = str(error)[:2048]
+            atomic_json(WH_DIR / "startup-error.json", {"error": runtime.startup_error})
+            runtime.fence()
+            async with build_http_client() as client:
+                await runtime.heartbeat(client)
+            raise
+    loop = asyncio.get_running_loop()
+
+    def requested(signum: int) -> None:
+        with (WH_DIR / "control.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            old = read_json(WH_DIR / "control.json")
+            if old.get("action") != "stop":
+                atomic_json(WH_DIR / "control.json", {
+                    "action": "checkpoint" if signum == signal.SIGUSR1 else "stop",
+                    "signal": settings["checkpoint_signal"] if signum == signal.SIGUSR1 else "TERM",
+                    "requested_at": time.time(),
+                })
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGUSR1):
+        loop.add_signal_handler(signum, requested, signum)
+    startup = read_json(WH_DIR / "startup.json")
+    deadline = timestamp(startup.get("deadline_epoch", startup.get("deadline", startup.get("deadline_at"))),
+                         time.time() + 180)
+    startup_deadline = time.monotonic() + min(180, max(0, deadline - time.time()))
+    task: asyncio.Task | None = None
+    control_task: asyncio.Task | None = None
+    connected, exit_code = False, 0
+    async with build_http_client() as client:
+        try:
+            while True:
+                runtime.scan()
+                if control_task is not None and control_task.done():
+                    control_task.result()
+                    control_task = None
+                if control_task is None:
+                    control_task = asyncio.create_task(runtime.controls())
+                if task is not None and task.done():
+                    body = task.result()
+                    task = None
+                    connected = body is not None
+                    if body and body.get("draining"):
+                        runtime.fence()
+                        if not runtime.useful_active():
+                            await runtime.stop_all()
+                            exit_code = 1 if runtime.grace_remaining() is not None or runtime.control_action == "stop" else 0
+                            break
+                remaining = runtime.grace_remaining()
+                if remaining is not None and remaining <= 0 and not runtime.useful_active():
+                    if await runtime.stop_all(idle_only=True):
+                        log.warning("Allocation failure grace expired at %s; releasing idle resources",
+                                    runtime.state["failure_deadline"])
+                        exit_code = 1
+                        break
+                if runtime.control_action and not runtime.active:
+                    exit_code = 1 if runtime.control_action == "stop" else 0
+                    break
+                if not runtime.ready and time.monotonic() >= startup_deadline:
+                    runtime.startup_error = "allocation startup timed out awaiting authenticated SSH readiness"
+                    atomic_json(WH_DIR / "startup-error.json", {"error": runtime.startup_error})
+                    log.error(runtime.startup_error)
+                    await runtime.stop_all()
+                    exit_code = 1
+                    break
+                if runtime.ready and not connected and task is None and not runtime.useful_active():
+                    if remaining is None or remaining <= 0:
+                        if await runtime.stop_all(idle_only=True):
+                            log.warning("Control unavailable after local useful work ended; releasing allocation")
+                            exit_code = 1
+                            break
+                if task is None:
+                    drain = (runtime.ready and not runtime.useful_active() and remaining is None
+                             and not runtime.control_action)
+                    task = asyncio.create_task(runtime.heartbeat(client, drain=drain))
+                await asyncio.sleep(1)
+        finally:
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            if control_task is not None:
+                control_task.cancel()
+                await asyncio.gather(control_task, return_exceptions=True)
+            runtime.scan()
+            runtime.persist()
+            if runtime.state["pending_results"] or runtime.control_action or runtime.startup_error:
+                try:
+                    await asyncio.wait_for(runtime.heartbeat(client, drain=not runtime.useful_active()), timeout=1)
+                except TimeoutError:
+                    pass
+    if exit_code:
+        raise SystemExit(exit_code)
+
+
 async def main() -> None:
+    if os.environ.get("WH_SLURM_WORKER_ID"):
+        await slurm_main()
+        return
     if not ORCHESTRATOR_HOST:
         log.error("ORCHESTRATOR_HOST is not set — cannot register. Exiting.")
         sys.exit(1)

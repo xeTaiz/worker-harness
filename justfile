@@ -95,6 +95,6 @@ deploy remote: dist
 deploy-local: dist
     @./scripts/deploy-worker.sh local
 
-# Refresh a Slurm-launched install (launcher + helpers only, no services).
-deploy-slurm dir *args:
-    @./scripts/deploy-slurm.sh "{{dir}}" {{args}}
+# Package the finite Slurm runtime from the root originals for extension staging.
+package-slurm-client:
+    @python3 scripts/package-slurm-client.py
