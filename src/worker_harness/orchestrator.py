@@ -79,10 +79,17 @@ async def serve(config: Config) -> None:
             run_control_server(db, config.control.host, config.control.port)
         )
 
-        await stop_event.wait()
-        sweeper_task.cancel()
-        registration_task.cancel()
-        control_task.cancel()
+        # A server that fails (e.g. invalid configuration or a busy port) must
+        # stop the process instead of leaving it half-running.
+        stop_task = asyncio.create_task(stop_event.wait())
+        servers = {registration_task, control_task}
+        done, _ = await asyncio.wait({stop_task, *servers}, return_when=asyncio.FIRST_COMPLETED)
+        for task in (sweeper_task, registration_task, control_task, stop_task):
+            task.cancel()
+        failed = [task for task in servers if task in done]
+        if failed and not stop_event.is_set():
+            name = "registration" if failed[0] is registration_task else "control"
+            raise RuntimeError(f"{name} server stopped") from failed[0].exception()
     finally:
         await db.close()
 
