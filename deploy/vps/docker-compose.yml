@@ -43,11 +43,11 @@ services:
       # Registration is reached by workers over the tailnet (never published).
       WH_HB_HOST: 0.0.0.0
       WH_HB_PORT: "12888"
-      # Proxies whose X-Forwarded-For hop is trusted for login rate limiting:
-      # worker-harness-web and the whole `proxy` network (SWAG). Replace
-      # PROXY_SUBNET with: docker network inspect proxy -f '{{(index .IPAM.Config 0).Subnet}}'
-      # The orchestrator refuses to start until it is a valid CIDR.
-      WH_TRUSTED_PROXIES: 172.31.250.11/32,PROXY_SUBNET
+      # Login rate limiting identifies browsers by position in X-Forwarded-For:
+      # exactly two appending proxies (SWAG, then worker-harness-web) sit in
+      # front of the API, which listens only on the internal network, so no
+      # proxy addresses are needed and SWAG may change its IP freely.
+      WH_TRUSTED_PROXY_HOPS: "2"
     volumes:
       - ./volumes/tailscale:/var/lib/tailscale
       - ./volumes/registry:/root/.config/worker-harness

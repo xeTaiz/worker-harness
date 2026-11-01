@@ -372,16 +372,48 @@ class LoginHardeningTests(unittest.IsolatedAsyncioTestCase):
         from ipaddress import ip_network
         from types import SimpleNamespace
 
-        from worker_harness.auth import client_address
+        from worker_harness.auth import ProxyTrust, client_address
 
         def connection(peer: str, forwarded: str):
             return SimpleNamespace(client=SimpleNamespace(host=peer), headers={"x-forwarded-for": forwarded})
 
-        trusted = (ip_network("172.20.0.0/16"),)
+        trusted = ProxyTrust(networks=(ip_network("172.20.0.0/16"),))
         spoofed = "1.2.3.4, 198.51.100.7"
         self.assertEqual(client_address(connection("172.20.0.5", spoofed), trusted), "198.51.100.7")
         self.assertEqual(client_address(connection("203.0.113.9", spoofed), trusted), "203.0.113.9")
-        self.assertEqual(client_address(connection("172.20.0.5", spoofed), ()), "172.20.0.5")
+        self.assertEqual(client_address(connection("172.20.0.5", spoofed), ProxyTrust()), "172.20.0.5")
+
+    def test_hop_count_takes_the_first_proxys_appended_address(self) -> None:
+        from types import SimpleNamespace
+
+        from worker_harness.auth import ProxyTrust, client_address
+
+        def connection(forwarded: str):
+            return SimpleNamespace(client=SimpleNamespace(host="172.31.250.11"), headers={"x-forwarded-for": forwarded})
+
+        # Browser -> SWAG (appends the browser) -> web edge (appends SWAG) -> API.
+        two = ProxyTrust(hops=2)
+        self.assertEqual(client_address(connection("198.51.100.7, 172.20.0.10"), two), "198.51.100.7")
+        # Client-supplied entries stay left of the address SWAG appended.
+        self.assertEqual(client_address(connection("9.9.9.9, 1.2.3.4, 198.51.100.7, 172.20.0.10"), two), "198.51.100.7")
+        # Fewer hops than configured means the chain is not the expected one.
+        self.assertEqual(client_address(connection("172.20.0.10"), two), "172.31.250.11")
+        self.assertEqual(client_address(connection("not-an-ip, 172.20.0.10"), two), "172.31.250.11")
+
+    def test_proxy_trust_configuration_is_validated(self) -> None:
+        from worker_harness.auth import load_proxy_trust
+
+        for env in (
+            {"WH_TRUSTED_PROXY_HOPS": "0"},
+            {"WH_TRUSTED_PROXY_HOPS": "two"},
+            {"WH_TRUSTED_PROXIES": "PROXY_SUBNET"},
+            {"WH_TRUSTED_PROXIES": "10.0.0.0/8", "WH_TRUSTED_PROXY_HOPS": "2"},
+        ):
+            with self.subTest(env=env), patch.dict("os.environ", env):
+                with self.assertRaises(RuntimeError):
+                    load_proxy_trust()
+        with patch.dict("os.environ", {"WH_TRUSTED_PROXY_HOPS": "2"}):
+            self.assertEqual(load_proxy_trust().hops, 2)
 
     async def test_login_cannot_issue_a_session_after_a_concurrent_reset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

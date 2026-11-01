@@ -160,36 +160,64 @@ class LoginRateLimiter:
                 self._prune(key, now).append(now)
 
 
-def load_trusted_proxies() -> tuple[IPv4Network | IPv6Network, ...]:
-    """Reverse proxies (WH_TRUSTED_PROXIES: comma-separated IPs/CIDRs) whose
-    X-Forwarded-For entry may identify the browser for login rate limiting."""
-    raw = os.environ.get("WH_TRUSTED_PROXIES", "")
+@dataclass(frozen=True)
+class ProxyTrust:
+    """How to find the browser's address for login rate limiting.
+
+    Either ``networks`` (WH_TRUSTED_PROXIES): peers inside these IPs/CIDRs are
+    proxies, and the nearest X-Forwarded-For hop outside them is the client.
+    Or ``hops`` (WH_TRUSTED_PROXY_HOPS): exactly this many appending reverse
+    proxies always sit in front of the API, so the client is the hop-th entry
+    from the right. Hop counting needs no addresses but is only sound when the
+    API cannot be reached without passing through all of those proxies.
+    """
+
+    networks: tuple[IPv4Network | IPv6Network, ...] = ()
+    hops: int = 0
+
+
+def load_proxy_trust() -> ProxyTrust:
+    raw_networks = os.environ.get("WH_TRUSTED_PROXIES", "").strip()
+    raw_hops = os.environ.get("WH_TRUSTED_PROXY_HOPS", "").strip()
+    if raw_networks and raw_hops:
+        raise RuntimeError("Set either WH_TRUSTED_PROXIES or WH_TRUSTED_PROXY_HOPS, not both")
+    if raw_hops:
+        if not raw_hops.isdecimal() or not 1 <= int(raw_hops) <= 8:
+            raise RuntimeError("WH_TRUSTED_PROXY_HOPS must be a number of proxies from 1 to 8")
+        return ProxyTrust(hops=int(raw_hops))
     try:
-        return tuple(ip_network(item.strip(), strict=False) for item in raw.split(",") if item.strip())
+        networks = tuple(ip_network(item.strip(), strict=False) for item in raw_networks.split(",") if item.strip())
     except ValueError as exc:
         raise RuntimeError("WH_TRUSTED_PROXIES must list IP addresses or CIDR networks") from exc
+    return ProxyTrust(networks=networks)
 
 
-def client_address(connection: HTTPConnection, trusted: tuple[IPv4Network | IPv6Network, ...]) -> str:
-    """Peer address, or the nearest untrusted X-Forwarded-For hop behind trusted proxies."""
+def client_address(connection: HTTPConnection, trust: ProxyTrust) -> str:
+    """Peer address, or the browser's address as forwarded by trusted proxies."""
 
-    def is_trusted(value: str) -> bool:
+    def valid(value: str) -> str | None:
         try:
-            address = ip_address(value)
+            return str(ip_address(value))
         except ValueError:
-            return False
-        return any(address in network for network in trusted)
+            return None
 
     peer = connection.client.host if connection.client else "unknown"
-    if not trusted or not is_trusted(peer):
-        return peer
     hops = [hop.strip() for hop in connection.headers.get("x-forwarded-for", "").split(",") if hop.strip()]
+    if trust.hops:
+        # Entries left of the first proxy's appended hop are client-supplied.
+        if len(hops) < trust.hops:
+            return peer
+        return valid(hops[-trust.hops]) or peer
+
+    def is_trusted(value: str) -> bool:
+        address = valid(value)
+        return address is not None and any(ip_address(address) in network for network in trust.networks)
+
+    if not trust.networks or not is_trusted(peer):
+        return peer
     for hop in reversed(hops):
         if not is_trusted(hop):
-            try:
-                return str(ip_address(hop))
-            except ValueError:
-                return peer
+            return valid(hop) or peer
     return peer
 
 

@@ -198,6 +198,11 @@ Set the following deployment environment (paths are on the server):
   `X-Forwarded-For` hop used as the client address for login rate limiting;
   without it every browser shares the edge's address and one attacker's five
   failed logins per minute would lock out the whole team.
+  Alternatively set `WH_TRUSTED_PROXY_HOPS` (not both) to the number of
+  appending reverse proxies that always sit in front of the API; the client is
+  then that many entries from the right of `X-Forwarded-For`, with no proxy
+  addresses to maintain. Only use it when the control API is reachable solely
+  through those proxies (see `deploy/vps/docker-compose.yml`).
 - `WH_FLEET_BASE_URL`: `http://orchestrator.hs.d0me.xyz:12889`.
 - `WH_ORCHESTRATOR_MACHINE`: `desktop`.
 - `WH_ORCHESTRATOR_CWD`: `/home/dome/Work/agent-orchestrator` on desktop.

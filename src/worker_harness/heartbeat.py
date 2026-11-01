@@ -33,7 +33,7 @@ from .auth import (
     MARIMO_PROXY_PATH,
     SESSION_COOKIE,
     LoginRateLimiter,
-    load_trusted_proxies,
+    load_proxy_trust,
     PasswordService,
     Principal,
     enforce_browser_mutation,
@@ -678,7 +678,7 @@ def create_app(db: Database) -> FastAPI:
     app.state.web_origin = load_web_origin()
     app.state.passwords = PasswordService()
     app.state.login_limiter = LoginRateLimiter()
-    app.state.trusted_proxies = load_trusted_proxies()
+    app.state.proxy_trust = load_proxy_trust()
     app.state.machines = load_machines()
     app.state.projects = load_projects()
     app.state.orchestrator = Orchestrator(

@@ -26,6 +26,11 @@ tailscaled \
   --socket="$TS_SOCKET" &
 TAILSCALED_PID=$!
 
+backend_state() {
+  tailscale --socket="$TS_SOCKET" status --json 2>/dev/null \
+    | sed -n 's/.*"BackendState": *"\([A-Za-z]*\)".*/\1/p' | head -n1
+}
+
 bootstrap_tailnet() {
   echo "[entrypoint] Tailnet bootstrap running asynchronously"
   for attempt in $(seq 1 30); do
@@ -44,18 +49,35 @@ bootstrap_tailnet() {
     --hostname="$TS_HOSTNAME"
     --accept-routes="$TS_ACCEPT_ROUTES"
   )
-  if [ -n "$TS_AUTHKEY" ]; then
-    UP_ARGS+=(--authkey="$TS_AUTHKEY")
-  fi
   if [ -n "$TS_EXTRA_ARGS" ]; then
     # shellcheck disable=SC2206
     EXTRA_ARGS=( $TS_EXTRA_ARGS )
     UP_ARGS+=("${EXTRA_ARGS[@]}")
   fi
 
+  # Passing --authkey forces a fresh registration even when the persisted
+  # identity is still valid; a spent single-use key then logs the node out.
+  # Restore the saved identity first and use the key only for a real login.
+  use_authkey=true
+  if [ -s "$TS_STATE_FILE" ]; then
+    use_authkey=false
+    for attempt in $(seq 1 15); do
+      case "$(backend_state)" in
+        NeedsLogin) use_authkey=true; break ;;
+        Running) break ;;
+      esac
+      sleep 1
+    done
+  fi
+  echo "[entrypoint] Tailnet login uses TS_AUTHKEY: $use_authkey"
+
   while kill -0 "$TAILSCALED_PID" 2>/dev/null; do
     echo "[entrypoint] Joining or restoring Tailnet identity..."
-    if timeout "$TS_UP_TIMEOUT" tailscale --socket="$TS_SOCKET" up "${UP_ARGS[@]}"; then
+    args=("${UP_ARGS[@]}")
+    if [ "$use_authkey" = true ] && [ -n "$TS_AUTHKEY" ]; then
+      args+=(--authkey="$TS_AUTHKEY")
+    fi
+    if timeout "$TS_UP_TIMEOUT" tailscale --socket="$TS_SOCKET" up "${args[@]}"; then
       for attempt in $(seq 1 30); do
         TS_IP="$(tailscale --socket="$TS_SOCKET" ip -4 2>/dev/null | head -n1 || true)"
         if [ -n "$TS_IP" ]; then
@@ -67,6 +89,10 @@ bootstrap_tailnet() {
       echo "[entrypoint] WARN: tailscale up succeeded but no IPv4 address appeared"
     else
       echo "[entrypoint] WARN: Tailnet join did not complete within ${TS_UP_TIMEOUT}s; retrying in 5s"
+      if [ "$use_authkey" = false ] && [ "$(backend_state)" = NeedsLogin ]; then
+        echo "[entrypoint] Saved Tailnet identity is not accepted; logging in with TS_AUTHKEY"
+        use_authkey=true
+      fi
     fi
     sleep 5
   done

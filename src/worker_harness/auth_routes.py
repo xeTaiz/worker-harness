@@ -122,7 +122,7 @@ def create_auth_router(
             raise HTTPException(status_code=403, detail="origin not allowed")
         db: Database = app_state.db
         username = payload.username.strip().lower()
-        client = client_address(request, app_state.trusted_proxies)
+        client = client_address(request, app_state.proxy_trust)
         keys = [f"user:{username}", f"client:{client}"]
         retry_after = app_state.login_limiter.reserve(keys)
         if retry_after:
