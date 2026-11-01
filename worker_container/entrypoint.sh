@@ -74,8 +74,8 @@ else
   SSH_HOME_DIR="${WH_DIR}/home/${SSH_USER}"
 fi
 
-if [ -z "$TS_AUTHKEY" ]; then
-  echo "[entrypoint] ERROR: TS_AUTHKEY is required"
+if [ -z "$TS_AUTHKEY" ] && [ ! -s "${TS_STATE_DIR}/tailscaled.state" ]; then
+  echo "[entrypoint] ERROR: TS_AUTHKEY is required for the first Tailnet join"
   exit 1
 fi
 
@@ -119,18 +119,47 @@ tailscaled \
   --tun=userspace-networking \
   --socks5-server="${TS_SOCKS5_ADDR}" &
 
-sleep 2
+backend_state() {
+  tailscale --socket="$TS_SOCKET" status --json 2>/dev/null \
+    | sed -n 's/.*"BackendState": *"\([A-Za-z]*\)".*/\1/p' | head -n1
+}
 
-echo "[entrypoint] Joining tailnet with Tailscale SSH enabled..."
+for attempt in $(seq 1 30); do
+  tailscale --socket="$TS_SOCKET" status --json >/dev/null 2>&1 && break
+  sleep 1
+done
+
+# Passing --authkey re-registers the node even when its saved identity is
+# still valid: a reusable key then creates a new node on every restart and a
+# spent single-use key logs it out. Use the key only when a login is needed.
+use_authkey=true
+if [ -s "${TS_STATE_DIR}/tailscaled.state" ]; then
+  use_authkey=false
+  for attempt in $(seq 1 15); do
+    case "$(backend_state)" in
+      NeedsLogin) use_authkey=true; break ;;
+      Running) break ;;
+    esac
+    sleep 1
+  done
+fi
+if [ "$use_authkey" = true ] && [ -z "$TS_AUTHKEY" ]; then
+  echo "[entrypoint] ERROR: saved Tailnet identity is not accepted and TS_AUTHKEY is empty"
+  exit 1
+fi
+
+echo "[entrypoint] Joining tailnet with Tailscale SSH enabled (auth key: ${use_authkey})..."
 UP_ARGS=(
   # The worker exclusively owns this userspace tailscaled state. Reset makes
   # restarts idempotent when a prior partial `tailscale up` persisted flags.
   --reset
   --login-server="$TS_HOST"
-  --authkey="$TS_AUTHKEY"
   --accept-routes="$TS_ACCEPT_ROUTES"
   --ssh
 )
+if [ "$use_authkey" = true ]; then
+  UP_ARGS+=(--authkey="$TS_AUTHKEY")
+fi
 
 if [ -n "$TS_HOSTNAME" ]; then
   UP_ARGS+=(--hostname="$TS_HOSTNAME")

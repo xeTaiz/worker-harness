@@ -81,8 +81,9 @@ fi
 
 TS_AUTHKEY="${TS_AUTHKEY:-${WORKER_TS_KEY:-}}"
 
-if [ -z "${TS_AUTHKEY:-}" ]; then
-  echo "[start-wh] ERROR: TS_AUTHKEY is required" >&2
+# The key is only needed until the worker's tailnet identity is saved.
+if [ -z "${TS_AUTHKEY:-}" ] && [ ! -s "$wh_dir_host/tailscale/state/tailscaled.state" ]; then
+  echo "[start-wh] ERROR: TS_AUTHKEY is required for the first Tailnet join" >&2
   exit 1
 fi
 if [ -z "${ORCHESTRATOR_HOST:-}" ]; then
