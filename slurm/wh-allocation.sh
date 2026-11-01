@@ -88,17 +88,37 @@ if s["runtime"] not in ("apptainer", "singularity"):
     raise ValueError("invalid runtime")
 if s["checkpoint_signal"] not in ("USR1", "TERM"):
     raise ValueError("invalid checkpoint signal")
+def safe_path(value):
+    return (isinstance(value, str) and value.startswith("/") and
+            not any(c in ":;," or ord(c) < 32 or ord(c) == 127 for c in value) and
+            not any(part in (".", "..") for part in value.split("/")) and
+            os.path.normpath(value) != "/")
 for key in ("host_run_path", "run_path", "shared_root", "sif_path", "tailnet_key_file", "worker_token_file"):
-    value = s[key]
-    if not isinstance(value, str) or not value.startswith("/") or any(c in value for c in "\x00\n\r:;,"):
+    if not safe_path(s[key]):
         raise ValueError(f"invalid {key}")
+additional = s.get("additional_shared_roots", [])
+if not isinstance(additional, list):
+    raise ValueError("additional_shared_roots must be an array")
+roots = {}
+for mapping in [{"storage_id": s["storage_id"], "shared_root": s["shared_root"]}] + additional:
+    if not isinstance(mapping, dict) or set(mapping) != {"storage_id", "shared_root"}:
+        raise ValueError("invalid shared root mapping")
+    storage_id, host_root = mapping["storage_id"], mapping["shared_root"]
+    if not isinstance(storage_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", storage_id):
+        raise ValueError("invalid storage_id")
+    if storage_id in roots:
+        raise ValueError("duplicate storage_id")
+    if not safe_path(host_root):
+        raise ValueError("invalid shared_root")
+    resolved = Path(host_root).resolve(strict=True)
+    if not resolved.is_dir() or not safe_path(str(resolved)):
+        raise ValueError("invalid resolved shared_root")
+    roots[storage_id] = str(resolved)
 run = Path(s["host_run_path"]).resolve(strict=True)
-shared = Path(s["shared_root"]).resolve(strict=True)
+shared = Path(roots[s["storage_id"]])
 relative_run = run.relative_to(shared)
 if run == shared or settings_path != run / "settings.json":
     raise ValueError("settings and run directory must be beneath shared_root")
-if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", s["storage_id"]):
-    raise ValueError("invalid storage_id")
 expected = Path("/data/shared") / s["storage_id"] / relative_run
 if Path(s["run_path"]) != expected:
     raise ValueError("run_path does not match shared storage mapping")
@@ -115,7 +135,8 @@ for key in ("tailnet_login_server", "orchestrator_host"):
         raise ValueError(f"invalid {key}")
 values = [worker_id, str(run), s["run_path"], s["shared_root"], s["storage_id"], s["sif_path"],
           s["runtime"], str(s["termination_grace_seconds"]), s["checkpoint_signal"],
-          s["tailnet_login_server"], s["orchestrator_host"], str(port)]
+          s["tailnet_login_server"], s["orchestrator_host"], str(port),
+          json.dumps(roots, separators=(",", ":"))]
 for value in values:
     sys.stdout.buffer.write(value.encode() + b"\0")
 PY
@@ -170,13 +191,7 @@ export TS_HOSTNAME="whc-$worker_id" WORKER_NAME="whc-$worker_id"
 export TS_AUTHKEY_FILE="$run_path/tailnet.key"
 export WH_WORKER_TOKEN_FILE="$run_path/worker.token"
 export TS_HOST="${config[9]}" ORCHESTRATOR_HOST="${config[10]}" ORCHESTRATOR_PORT="${config[11]}"
-export WH_SHARED_ROOTS_JSON
-WH_SHARED_ROOTS_JSON="$(python3 - "$storage_id" "$shared_root" <<'PY'
-import json
-import sys
-print(json.dumps({sys.argv[1]: sys.argv[2]}, separators=(",", ":")))
-PY
-)"
+export WH_SHARED_ROOTS_JSON="${config[12]}"
 
 started_at="$(now)"
 startup_deadline=$((started_at + 180))

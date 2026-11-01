@@ -1,4 +1,5 @@
 FROM nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
+LABEL org.worker-harness.slurm-runtime="1"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH=/usr/local/cuda/bin:/usr/local/nvidia/bin:${PATH}

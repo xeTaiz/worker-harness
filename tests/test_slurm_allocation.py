@@ -155,6 +155,96 @@ class SlurmAllocationTests(unittest.TestCase):
         startup = json.loads((self.runtime / "startup.json").read_text())
         self.assertEqual(startup["deadline_epoch"] - startup["started_at_epoch"], 180)
 
+    def test_multiple_shared_roots_reach_real_launcher_binds_and_manifest(self):
+        projects = self.root / "project files"
+        environments = projects / "environments"
+        environments.mkdir(parents=True)
+        alias = self.root / "project-alias"
+        alias.symlink_to(projects, target_is_directory=True)
+        self.settings["additional_shared_roots"] = [
+            {"storage_id": "projects", "shared_root": str(alias)},
+            {"storage_id": "envs", "shared_root": str(environments)},
+        ]
+        self.settings["worker_name"] = "whc-mapping-test"
+        self.write_settings()
+        shutil.copyfile(ROOT / "start-wh.sh", self.run / "start-wh.sh")
+        runtime = self.bin / "apptainer"
+        runtime.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "if args[0] == 'exec':\n"
+            "    print('root:x:0:0:root:/root:/bin/bash' if args[-1] == '/etc/passwd' else 'root:x:0:')\n"
+            "elif args[0] == 'run':\n"
+            "    state = pathlib.Path(os.environ['WH_DIR'])\n"
+            "    (state / 'ready').touch()\n"
+            "    (state / 'runtime-args.json').write_text(json.dumps(args))\n"
+            "    (state / 'environment.json').write_text(json.dumps(dict(os.environ)))\n"
+            "else:\n"
+            "    sys.exit(1)\n"
+        )
+        runtime.chmod(0o755)
+        self.assert_finished(self.start("success"), 0)
+        args = json.loads((self.runtime / "runtime-args.json").read_text())
+        binds = [args[index + 1] for index, value in enumerate(args) if value == "--bind"]
+        expected = {
+            "test": str(self.root),
+            "projects": str(projects),
+            "envs": str(environments),
+        }
+        for storage_id, host_root in expected.items():
+            self.assertIn(f"{host_root}:/data/shared/{storage_id}", binds)
+        manifest = json.loads((self.runtime / "data/bind-paths.json").read_text())
+        self.assertEqual(manifest["paths"], ["/data/shared/envs", "/data/shared/projects", "/data/shared/test"])
+        environment = json.loads((self.runtime / "environment.json").read_text())
+        self.assertEqual(json.loads(environment["WH_SHARED_ROOTS_JSON"]), expected)
+        self.assertEqual(environment["WH_SLURM_SETTINGS_FILE"], "/data/shared/test/.wh-slurm/test-worker/settings.json")
+
+    def test_invalid_additional_roots_fail_before_launch(self):
+        regular_file = self.root / "regular-file"
+        regular_file.touch()
+        unsafe = self.root / "unsafe;root"
+        unsafe.mkdir()
+        alias = self.root / "unsafe-alias"
+        alias.symlink_to(unsafe, target_is_directory=True)
+        root_alias = self.root / "filesystem-root-alias"
+        root_alias.symlink_to("/", target_is_directory=True)
+        invalid = [
+            None,
+            {},
+            [None],
+            [{"storage_id": "a", "shared_root": str(self.root), "unknown": True}],
+            [{"storage_id": "test", "shared_root": str(self.root)}],
+            [{"storage_id": "../a", "shared_root": str(self.root)}],
+            [{"storage_id": "a", "shared_root": str(self.root)}, {"storage_id": "a", "shared_root": str(self.root)}],
+        ]
+        invalid.extend(
+            [{"storage_id": "a", "shared_root": value}]
+            for value in ["/", "relative", str(self.root / "missing"), str(regular_file),
+                          str(alias), str(root_alias), str(self.root) + "/../escape",
+                          str(self.root) + "/bad\nroot", str(self.root) + "/bad:root"]
+        )
+        for mappings in invalid:
+            with self.subTest(mappings=mappings):
+                self.settings["additional_shared_roots"] = mappings
+                self.write_settings()
+                process = self.start("success")
+                _, stderr = process.communicate(timeout=8)
+                self.assertNotEqual(process.returncode, 0, stderr)
+                self.assertFalse((self.runtime / "launch-started").exists())
+                self.assertFalse((self.runtime / "child-started").exists())
+                self.assertTrue((self.run / "worker.token").exists())
+
+    def test_additional_mapping_cannot_replace_primary_run_identity(self):
+        self.settings["additional_shared_roots"] = [{"storage_id": "archive", "shared_root": str(self.root)}]
+        self.settings["run_path"] = "/data/shared/archive/.wh-slurm/test-worker"
+        self.write_settings()
+        process = self.start("success")
+        _, stderr = process.communicate(timeout=8)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("run_path does not match shared storage mapping", stderr)
+        self.assertFalse((self.runtime / "launch-started").exists())
+
     def test_child_failure_propagates_without_successor(self):
         self.assert_finished(self.start("failure"), 17)
 

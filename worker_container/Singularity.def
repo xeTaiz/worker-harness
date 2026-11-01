@@ -4,6 +4,7 @@ From: nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
 %labels
     Maintainer worker-harness
     Description "Worker Harness worker image (Tailscale SSH-only)"
+    org.worker-harness.slurm-runtime 1
 
 %environment
     export DEBIAN_FRONTEND=noninteractive

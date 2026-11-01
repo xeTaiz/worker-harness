@@ -2,9 +2,9 @@
 
 ## 1. Read this first
 
-This is the standalone handoff for the **single-user local Slurm feature**, including its client, control plane, and allocation runtime. Another OMP agent can use this document without the original conversation or unpublished plan. S1–S5 are implemented. `feature/local-slurm` is the transfer branch in both repositories; the root pins the exact extension commit. Publication does not mean deployment or live-cluster acceptance.
+This is the standalone handoff for the **single-user local Slurm feature**, including its client, control plane, and allocation runtime. Another OMP agent can use this document without the original conversation or unpublished plan. S1–S5 and the approved minimal, resumable SSH-first onboarding/additional-filesystem changes are implemented and locally verified. Current evidence is **439 Bun tests**, **339 isolated root Python tests**, actual **OMP 18.14.2 onboarding proof (32.13s)** and actual **multiple-filesystem launcher smoke (1.70s)**; section 9 records boundaries. `feature/local-slurm` is the transfer branch in both repositories; the root pins the exact extension commit. Publication is pending the parent handoff and does not mean deployment or live-cluster acceptance.
 
-**Evidence boundary:** the main agent's final native extension suite passed **361 Bun tests, zero failures**, 2,764 expectations across 14 files (2.19 seconds). Actual **OMP 18.14.2 shared-SSH onboarding/migration smoke passed in 32.39 seconds**, including exported native runtime messages; section 9 records its boundaries. The main agent's actual restored launcher/private-HOME proof **passed** with the plain default allowlist and actual source-generated fleet allowlists for `orchestrator`, `pm`, and `task`: interactive config/state were visible and writes persisted, while all three fleet allowlists kept them hidden. Ordinary Work access, unrelated SSH-directory masking, unset `SSH_AUTH_SOCK`, and role-based operator-environment stripping were unchanged. Earlier root/runtime/MCP/OMP and per-profile-key onboarding proofs are historical results detailed in section 9. Real login/cluster proof remains pending full sandbox restart and explicit testing; no real IBEX submission, candidate SIF build, fleet deployment, or live V3 acceptance has occurred.
+**Historical evidence boundary (recorded 2026-11-01; predates this minimal-workflow change):** the prior native extension suite passed **361 Bun tests, zero failures**, 2,764 expectations across 14 files (2.19s); prior actual **OMP 18.14.2 shared-SSH/migration smoke passed in 32.39s**. Those remain historical evidence, not the new proof. The restored launcher/private-HOME proof passed with the two plain config/state paths and separate source-generated fleet allowlists. The live production control OpenAPI is reachable (HTTP 200) but lacks reservation, Slurm-update and job-events routes: **updated server deployment is a hard enqueue prerequisite**. Candidate SIF build/execution and real Slurm/Tailnet/charged acceptance remain unperformed.
 
 The original checkout and the separate `specs/multi-user.md` work are preserved. This feature does not implement that multi-user plan. Recipient IDs, shared files, shell access, and Tailnet tags are not hostile-user isolation.
 
@@ -38,6 +38,15 @@ git -C extensions/pi-worker-harness switch --track origin/feature/local-slurm
 
 That `--track` form assumes the local branch does not exist. For an existing branch, switch to it without discarding local edits. Root and extension commits/pushes remain separate; update the root gitlink only after the new extension commit is available remotely. Do not copy dirty worktrees, private keys, `.env`, profile files, state journals, SIFs, caches, or token files into Git.
 
+For the user's existing remote-ref OMP installation, after the parent publishes the updated branch, explicitly replace the old ref with:
+
+```bash
+omp plugin install --force 'github:xeTaiz/pi-worker-harness#feature/local-slurm'
+omp plugin list
+```
+
+Restart OMP fully afterward. This force-replacement syntax is supported by the installed CLI; it does not build/deploy the SIF or server. The root-pinned local-link alternative follows.
+
 Before replacing an existing plugin, record `omp plugin list` and preserve the old install source/version/path and any local changes. Keep the old checkout or package for rollback. Then use the supported replacement sequence, with the actual absolute path from C1:
 
 C3
@@ -54,6 +63,8 @@ Restart OMP completely so its running module reloads. Confirm the listed plugin 
 ## 3. Deploy the matching control plane and runtime, not only the extension
 
 Installing the extension alone is insufficient. The updated server must support reservation/authentication/events/CPU admission, and the SIF must contain the updated entrypoint, daemon, and runner-compatible runtime. An old SIF cannot be made compatible just by updating the client or staging the small shell scripts.
+
+Both image definitions carry the static capability label **`org.worker-harness.slurm-runtime=1`**. Onboarding may inspect an existing SIF read-only with `apptainer inspect --json` or `singularity inspect --json`; it must not execute a container on a login node. A filename alone is not compatibility evidence. The label permits static discovery, not a claim of successful compute-node execution. Build the updated candidate and deploy the matching server before enqueue. Missing image/runtime, unavailable credentials or missing control API routes save a **blocked, resumable setup draft**, never a fabricated ready cluster profile.
 
 Before deployment, drain affected work, stop the existing control process through its current deployment manager, and take a consistent SQLite backup with its journal state. Preserve its existing registry and Tailscale identity. Run **one control process** against that registry. The local Slurm database changes migrate in place; do **not** apply the separate hierarchical-fleet document's fresh-registry/reset instructions to this rollout.
 
@@ -103,36 +114,45 @@ export WH_OPERATOR_TOKEN_FILE="$HOME/.config/worker-harness/operator.token"
 
 Create/distribute the protected credential out of band, not by pasting its value into this document, command arguments, shell history, or Git. Fleet clients use their supplied session token and do not fall back to the operator token. Review `headscale-policy.example.json` against broader existing rules: example tags do not remove preexisting broad grants, and no code applies live policy automatically.
 
-## 4. Interactive `/cluster-add`: configure first, then install SSH trust
+## 4. Interactive `/cluster-add`: SSH first, discover, then review
 
 Run this in an ordinary interactive OMP session after loading the checkout:
 
 C7
 ```text
 /cluster-add
+/cluster-add ibex
 ```
 
-`/cluster-add ibex-cpu` supplies the ID and skips that one prompt. Reusing an existing profile is a separate dialog choice, not an SSH/network operation.
+The argument names a cluster setup or resumes its saved draft; it is not a required CPU/GPU target ID. With no argument, existing drafts can be selected. The wizard never submits an allocation, installs software remotely, or deploys the control plane.
 
-The staged dialog validates a complete profile before explicit final confirmation. It does not submit work or run remote setup. Cancelled/invalid input must not install a partial profile. The default destination is `${XDG_CONFIG_HOME:-$HOME/.config}/worker-harness/clusters.json`; `WH_CLUSTER_CONFIG` selects an alternate file. Missing file means no cluster targets; unreadable, malformed, unknown-field, or inconsistent configuration is an explicit error, never silently ignored.
+The minimal sequence is:
 
-Supply operator-known values, not guessed IBEX defaults:
+1. Enter an existing SSH alias or `user@host`. Local OpenSSH `-G` resolves user, port and jump policy; a separate username question is conditional when resolution cannot supply it. Reuse an unambiguous managed connection automatically. Review the suggested short hostname/name (or command argument), then optionally describe the site.
+2. Explicitly consent to managed key/trust setup before local credential creation. Receive bootstrap first-connect, independent host-fingerprint verification, public-key installation and manual installation instructions immediately—not after a long scheduler form. The wizard does not execute bootstrap/copy-id commands or autoaccept host trust.
+3. Choose **“Key installed — test connection”** to run the real strict BatchMode probe. A failed probe remains a visible prerequisite, never a synthetic success. Save-and-exit is available; rerun `/cluster-add <name>` to continue without rebuilding a completed form.
+4. After SSH succeeds, select an existing WH shared path from `list_data`, or type `/data/shared/<storage_id>`, and enter its exact existing **cluster-host root**. Explicitly answer **“Add another filesystem mapping?”**; each yes repeats those same two fields. The first mapping remains the primary run/staging root; every additional mapping is retained in `additional_shared_roots`. Each mapping must pass backing-identity verification against a participating WH worker using a temporary random probe and cleanup.
+5. Bounded read-only SSH discovery inspects Slurm inventory/partition limits, account/default/QoS evidence, installed runtime/version and compatible SIF labels. No allocation, recursive filesystem scan or login-node container execution is used.
+6. Resolve only missing information: e.g. a trusted runtime/module prelude, candidate SIF path or an explicit billing choice required by the site. Visible accounts/QoS do not authorize choosing an arbitrary, premium or special one. Prefer the known default account; omit `account` when Slurm should select its default. Hidden association data remains marked unknown. Do not repeat upfront CPU/GPU/type/capacity/account/limits questionnaires.
+7. Review one editable summary and the generated safe CPU/GPU target set. Discovery derives CPU targets from supported CPU partitions and GPU targets per partition/exact physical GPU type using configured capacity, not currently free resources; ambiguous/MIG configurations remain unsupported evidence. Advanced settings are optional, not a mandatory menu. Save the complete validated target set atomically, with deterministic unique IDs and the same shared connection, trust and mappings.
 
-1. A unique profile ID, description including site preemption/utilization/account limits, and GPU or CPU compute kind.
-2. Existing SSH alias/direct login destination, or an existing profile's connection for another partition on the same site. Supply login user/port where requested. Existing aliases preserve their ProxyJump/ControlMaster/site policy.
-3. Shared storage ID, existing cluster-host shared root, and exact candidate SIF path. CPU/GPU profiles sharing one filesystem use the same storage ID/root/SIF.
-4. Installed runtime (`apptainer` or `singularity`) and any trusted site module/setup prelude; account and the actual authorized partition. GPU profiles need exact GRES GPU type and positive maximum GPUs; CPU profiles require `max_gpus: 0` and omit `gpu_type`.
-5. Explicit maximum walltime, site-permitted failure grace (zero when idle holding is forbidden), termination grace, enrollment key file/login server, and orchestrator registration hostname/port.
-6. Optional advanced QoS, simple feature constraint, CPU/RAM caps, warning and poll intervals. Defaults are warning 120 seconds, registration 12888, polling 15 seconds; these are software defaults, not an assertion of site permission.
-7. Review the profile, key/SSH actions and commands; use edit-field or cancel if needed, then explicitly confirm the unencrypted-key warning. No key generation, local file writes, or process spawning occurs before that confirmation. Optional fields can be cleared with `-` in the advanced flow. No credential value belongs in the profile.
+The default **allocation ceiling** is **604800 seconds (seven days)**, clamped downward by a finite partition MaxTime. It is not a requested allocation duration and never supplies a missing job duration: every enqueue still explicitly supplies `slurm.walltime_seconds`. Defaults are failure grace **0**, termination grace **20**, warning **120**, polling **15** seconds and registration port **12888**. Any positive failure grace, including the optional 300-second setting, requires explicit Advanced opt-in and a site idle-policy warning.
+
+Completed targets remain version-1 profiles at `${XDG_CONFIG_HOME:-$HOME/.config}/worker-harness/clusters.json`, overridden by `WH_CLUSTER_CONFIG`. Private version-1 drafts are in **`dirname(clusters.json)/setup-drafts.json`** (0600), separate from completed profiles and submission journals; incomplete/blocked drafts never appear as compute targets. Cancel before initial key-setup consent creates no credentials or completed profile. After consent, cancel reports the retained key/draft and preserves the last valid stage; cancellation aborts active discovery where supported. Invalid/unreadable/inconsistent completed configuration remains an explicit error, never an empty target list.
+
+Global cluster integration settings live in **`dirname(clusters.json)/cluster-integration.json`** (version 1, private 0600), collected once and reused: a **Tailnet key file path** and login server, plus an optional orchestrator registration override. Existing explicit integration/profile settings are reused. The registration default is the active control URL's hostname on **12888**, never worker access to privileged control **12889**. Only file existence/private permissions are inspected; no plaintext secret prompt or reading arbitrary `worker-harness.env` secrets, and no claim that enrollment thereby succeeds. Missing deployment/credential prerequisites retain a blocked resumable draft.
+
+Readiness first requires existing control Authorization from the API credential contract (`WH_OPERATOR_TOKEN_FILE`, `WH_OPERATOR_TOKEN`, or an authorized session), then the required OpenAPI routes. Missing authorization blocks the draft; there is no token-value prompt. A missing Tailnet key file can be provisioned at its saved path before resuming, with a conditional file-path correction only when needed. After a filesystem-identity failure, resume offers **Retry saved mappings / Edit filesystem mappings / Save and exit**; editing repeats the same catalogue/root/add-another loop. Wizard runtime-prelude edits permit safe module loads/generated PATH setup, not arbitrary login-node shell execution; manual-profile `runtime_setup` remains trusted operator configuration.
+
+Credential presence alone does not pass readiness. After checking required live OpenAPI routes, setup performs a bounded authenticated `GET /api/v1/job-events?recipient_id=wh-setup-<fresh UUID>&after=0`; only HTTP200 passes. It immediately cancels the response body/aborts without consuming events, creating reservations, mutating registry state or allocating work. HTTP401/403 or timeout retains a blocked resumable draft with existing-credential guidance; setup never asks for a token value.
 
 The flow manages **one shared Ed25519 login identity** for all onboarded clusters: `dirname(clusters.json)/id_ed25519` and `id_ed25519.pub`, plus `dirname(clusters.json)/known_hosts`. These shared files live directly in `~/.config/worker-harness` by default, **not** in its `ssh/` subdirectory; `XDG_CONFIG_HOME` and `WH_CLUSTER_CONFIG` select the actual configuration parent. Connection-specific `config` and `bootstrap_config` remain under `ssh/<profile-id>/`; connection reuse may retain the first profile's config path. Keeping shared files outside `ssh/` avoids collisions with valid legacy profile IDs such as `id_ed25519` or `known_hosts`. Directories are 0700 and generated files 0600. Existing shared key/trust files are reused, never overwritten. A profile's `ssh_config_file` selects its config through OpenSSH argv `-F`, without editing `~/.ssh/config`. Alias mode preserves ordinary user config/ProxyJump/ControlMaster policy. `/etc/ssh/ssh_config` is explicitly included only when readable, regular, root/current-UID owned and not group/world writable; otherwise a durable warning directs required site settings into user config. Strict OpenSSH checks on user config are not weakened. Direct mode creates a unique `wh-<id>` alias with the supplied hostname/user/port and optional ProxyJump.
 
 A newly generated shared private key is initially **unencrypted**; the dialog warns before generating it and never captures a passphrase. An existing shared key, including an encrypted one, is preserved. Add a passphrase in your own terminal with `ssh-keygen -p -f <printed-shared-key-path>` if desired, then unlock it through an accessible dedicated agent. **Read the sandbox restart/agent gate below before doing this:** the current launcher unsets `SSH_AUTH_SOCK`, so a host `ssh-add` does not by itself make the key usable inside this sandbox. BatchMode cannot unlock a key or answer MFA; resolve agent/site policy explicitly without weakening authentication.
 
-Onboarding prints commands; **it does not execute them**. Both the dedicated `config` and `bootstrap_config` explicitly use the shared configuration-parent `known_hosts` via `UserKnownHostsFile`. Its initial empty 0600 file is created only if absent; no user/global host-trust database is automatically copied, replaced or cleared. Existing independently verified entries may be copied manually after review. First connect with `bootstrap_config` and independently compare the site's fingerprint before accepting it into this managed trust file; `ssh-keyscan` alone is not verification. A newly added profile's bootstrap retains target/user/includes and existing key/agent/password/MFA authentication without the new IdentityFile/IdentitiesOnly restriction. Migration bootstrap additionally retains the old profile key via explicit IdentityFile, **without** IdentitiesOnly, so hosts previously authorizing only that key remain accessible while installing the shared key. Install **only the shared public key** with the printed `ssh-copy-id -F <bootstrap_config> -i <shared-public-key> <alias>` or manual authorized_keys alternative. The dedicated config selects the shared IdentityFile with IdentitiesOnly; require its printed probe using `BatchMode=yes`, `StrictHostKeyChecking=yes`, and `ConnectTimeout=10`. Never bypass a changed/missing trusted host key. No private key, enrollment value or control bearer belongs in Git or an allocation.
+Bootstrap and public-key installation commands are printed, **not executed**. Both the dedicated `config` and `bootstrap_config` explicitly use the shared configuration-parent `known_hosts` via `UserKnownHostsFile`. Its initial empty 0600 file is created only if absent; no user/global host-trust database is automatically copied, replaced or cleared. Existing independently verified entries may be copied manually after review. First connect with `bootstrap_config` and independently compare the site's fingerprint before accepting it into this managed trust file; `ssh-keyscan` alone is not verification. A new connection's bootstrap retains target/user/includes and existing key/agent/password/MFA authentication without the new IdentityFile/IdentitiesOnly restriction. Migration retains the old per-profile IdentityFile without IdentitiesOnly to install the shared key on old-key-only hosts. After **“Key installed — test connection”**, onboarding does execute the strict probe and read-only discovery through the existing bounded SSH transport; neither operation weakens host verification.
 
-Manual command shape (substitute the exact paths/alias printed by onboarding; no command below is run by the dialog):
+Manual command shape (substitute the exact paths/alias printed by onboarding; bootstrap/copy-id/key-protection commands remain operator actions):
 
 C16
 ```bash
@@ -153,7 +173,7 @@ ssh -F "$SSH_DIR/config" -o BatchMode=yes -o StrictHostKeyChecking=yes \
 
 An already running OMP process cannot inherit a newly selected agent environment. Under the current sandbox launcher, restarting OMP or merely exporting a host socket is insufficient; follow the dedicated-agent and full-sandbox restart gate below.
 
-For IBEX, obtain the real login alias, account, CPU partition, GPU partition/type/caps, runtime modules and site policy first. Add the GPU or CPU profile, then rerun `/cluster-add` for the other kind and reuse its connection/storage. The name `ibex-cpu` is only a local profile ID: it is **not** a guessed partition name. Onboarding makes local configuration and SSH setup easier; it cannot establish remote filesystem identity, install the runtime, authorize account access, or prove compute-node Tailnet reachability.
+For IBEX, use the real login destination and independently verified site policy. Read-only discovery supplies candidate partitions/types/caps rather than guessing IBEX names; the review must preserve uncertainty about authorization and compute-node Tailnet reachability. A single cluster registration derives its selected CPU/GPU target profiles, so a second full onboarding form is unnecessary. Discovery verifies existing mounts, not mounts or transfers them; it does not install a runtime, build a SIF, grant account permissions, deploy a server or authorize charged work.
 
 ### Migrate existing per-profile keys explicitly
 
@@ -188,11 +208,11 @@ With custom `XDG_CONFIG_HOME`, `WH_CLUSTER_CONFIG`, `XDG_STATE_HOME`, or `WH_CLU
 
 The launcher currently unsets `SSH_AUTH_SOCK`. An encrypted login key therefore additionally requires a deliberately provisioned **dedicated** agent/socket made accessible to the new sandbox and explicitly selected for its SSH client. Merely running `ssh-add` in a host shell, restarting OMP, or restarting the unchanged launcher does not make that agent accessible. Do not forward the general host agent or change launcher/forwarding policy as part of this migration. Without dedicated-agent access, a passphrase-protected key is a visible prerequisite failure for BatchMode, not a reason to weaken authentication.
 
-The main agent's actual restored dotfiles launcher/private-HOME proof **passed** using the plain default paths and `sandbox.paths_file_content` from the actual source for `orchestrator`, `pm`, and `task`. Interactive config/state files were visible and writes persisted outside the fixture; all three generated fleet allowlists kept those directories hidden. Ordinary Work access was unchanged, unrelated `~/.ssh` stayed hidden, `SSH_AUTH_SOCK` stayed unset, and role-based operator-environment stripping was unchanged. This fixture did not exercise real login. The final native extension suite passed 361 tests, and actual OMP 18.14.2 onboarding/migration smoke passed locally. After restart and migration, require the strict printed login probe with independently reviewed host trust; real login/cluster acceptance remains pending and is not implied by local fixture/source/UI tests. This gate does not authorize a charged allocation.
+**Historical baseline recorded 2026-11-01:** the restored launcher/private-HOME proof passed using the two plain paths and actual source-generated fleet allowlists. Interactive config/state persisted; fleet credentials remained hidden; Work access, unrelated SSH masking, unset `SSH_AUTH_SOCK` and role-based environment stripping were unchanged. The then-current 361-test suite and 32.39s OMP shared-SSH/migration proof predate the minimal flow. Current minimal-flow evidence appears in section 9. Existing host config/state directories are persistent 0700 binds, but the actual client has no completed profiles/default key/managed trust yet; local fixture success does not fabricate live readiness. Real login and charged acceptance remain separate gates.
 
 ### Complete manual configuration reference
 
-C8 is syntactically valid, schema-complete JSON for CPU and GPU targets sharing one collection. Every `OPERATOR_*` value, sample path, GPU type, limit and grace is an **operator-supplied placeholder**, not a discovered IBEX value; replace them before use. Optional `ssh_config_file` is shown for managed onboarding. If using your ordinary SSH config without onboarding, omit that field. Use an actual GPU GRES type in place of `OPERATOR_GPU_TYPE`. The description must reflect the real site's policy.
+C8 is syntactically valid version-1 JSON for CPU and GPU targets sharing two collections. Every `OPERATOR_*` value, sample path, GPU type and limit is an **operator-supplied placeholder**, not discovered IBEX policy. Optional `account` is deliberately omitted: Slurm selects its default; add `"account": "OPERATOR_ACCOUNT"` only for an explicit authorized choice. Optional `additional_shared_roots` may be omitted for a single mapping; old profile bodies do not gain an empty array. Optional `ssh_config_file` is shown for managed onboarding; omit it to use ordinary local SSH configuration. The seven-day cap shown assumes the partition permits it; use the lower finite partition maximum where applicable. Description must reflect real site policy.
 
 C8
 ```json
@@ -206,14 +226,16 @@ C8
       "ssh_config_file": "/home/OPERATOR/.config/worker-harness/ssh/ibex-cpu/config",
       "storage_id": "ibex",
       "shared_root": "/OPERATOR_SHARED_ROOT",
+      "additional_shared_roots": [
+        {"storage_id": "datasets", "shared_root": "/OPERATOR_DATASET_ROOT"}
+      ],
       "sif_path": "/OPERATOR_SHARED_ROOT/worker-harness/candidate-local-slurm.sif",
       "compute_kind": "cpu",
       "runtime": "apptainer",
       "runtime_setup": "",
-      "account": "OPERATOR_ACCOUNT",
       "partition": "OPERATOR_CPU_PARTITION",
       "max_gpus": 0,
-      "max_walltime_seconds": 600,
+      "max_walltime_seconds": 604800,
       "failure_grace_seconds": 0,
       "warning_seconds": 120,
       "termination_grace_seconds": 20,
@@ -230,15 +252,17 @@ C8
       "ssh_config_file": "/home/OPERATOR/.config/worker-harness/ssh/ibex-cpu/config",
       "storage_id": "ibex",
       "shared_root": "/OPERATOR_SHARED_ROOT",
+      "additional_shared_roots": [
+        {"storage_id": "datasets", "shared_root": "/OPERATOR_DATASET_ROOT"}
+      ],
       "sif_path": "/OPERATOR_SHARED_ROOT/worker-harness/candidate-local-slurm.sif",
       "compute_kind": "gpu",
       "gpu_type": "OPERATOR_GPU_TYPE",
       "runtime": "apptainer",
       "runtime_setup": "",
-      "account": "OPERATOR_ACCOUNT",
       "partition": "OPERATOR_GPU_PARTITION",
       "max_gpus": 1,
-      "max_walltime_seconds": 600,
+      "max_walltime_seconds": 604800,
       "failure_grace_seconds": 0,
       "warning_seconds": 120,
       "termination_grace_seconds": 20,
@@ -252,17 +276,19 @@ C8
 }
 ```
 
-`storage_id` defaults to `id` but must be explicitly shared here. Same-storage profiles must use the same cluster `shared_root`. `runtime_setup` is trusted operator-authored shell, never workload input. Optional `qos`, `constraint`, `max_cpus`, and `max_memory_mb` constrain policy; no account/QoS permission is inferred. Paths must be absolute and valid; onboarding outputs actual absolute paths rather than expanding `~` inside JSON. Do not point C8 at files that do not exist and assume schema validity proves access.
+`storage_id` defaults to `id` but must be explicitly shared here. Every mapping ID is unique within a profile; consistency for a shared ID extends across all profiles' primary and additional roots. Host roots must be safe normalized absolute paths; legitimate nested source roots with distinct IDs are allowed, not silently rejected. `runtime_setup` is trusted operator-authored shell, never workload input. Optional `qos`, `constraint`, `max_cpus`, and `max_memory_mb` constrain policy; no account/QoS permission is inferred. Omitting `account` omits `--account` from sbatch, leaving scheduler default selection intact; explicit accounts are preserved. Paths do not expand `~` in JSON. Schema validity alone does not prove access or readiness.
 
 ## 5. Shared storage and environment preparation
 
-At least one **existing participating WH worker** and the cluster must already mount the same filesystem. The original test/source worker need not. Configure `WH_SHARED_ROOTS_JSON` on participating fleet hosts using each host's actual directory; the cluster profile supplies its cluster-host `shared_root`. Both become `/data/shared/ibex` for these profiles. This is a bind of an existing directory, not a mount/transfer service. Preserve unrelated `WH_EXTRA_BINDS`.
+For **each** mapping, at least one existing participating WH worker and the cluster must already mount the same backing filesystem; the original source/test worker need not. Configure `WH_SHARED_ROOTS_JSON` on participating fleet hosts using each host's actual directories. Primary `storage_id`/`shared_root` plus `additional_shared_roots` supply the cluster-host paths; every mapping becomes `/data/shared/<storage_id>` in the allocation. The wrapper passes **all** mappings in `WH_SHARED_ROOTS_JSON` to the existing launcher. This binds existing directories, not mounts/transfers them. Preserve unrelated `WH_EXTRA_BINDS`. The first/primary mapping always holds `.wh-slurm/<worker_id>` batch/settings/run staging, even when project and environment use other roots.
 
 C9
 ```bash
 # Example only: participating fleet host, before its approved restart.
-export WH_SHARED_ROOTS_JSON='{"ibex":"/OPERATOR_EXISTING_HOST_MOUNT"}'
+export WH_SHARED_ROOTS_JSON='{"ibex":"/OPERATOR_EXISTING_HOST_MOUNT","datasets":"/OPERATOR_EXISTING_DATASET_MOUNT"}'
 ```
+
+Project and environment may independently use **any configured mapping**, e.g. project `/data/shared/datasets/project` and environment `/data/shared/ibex/envs/project`; both are resolved and validated against their selected mapping after symlink resolution (including the environment's `bin`), never only against the primary root. Unconfigured roots and symlink escapes fail. Identity checking and exact-probe cleanup cover every mapping; failure or failed cleanup must not be reported as verified. Repeat the manual proof below for every root rather than checking only the first.
 
 Use `list_data` to find that worker; discovery lists immediate non-symlink directories, so an entirely empty collection may not appear. Prove backing identity with a random probe, not matching path spelling. Through **ordinary WH `exec` on the participating worker**, run:
 
@@ -385,7 +411,8 @@ Emit exactly `--nodes=1 --ntasks=1 --cpus-per-task=<n> --mem=<MiB>M`, plus `--gp
 | Location | Content / ownership |
 | --- | --- |
 | `WH_CLUSTER_CONFIG` or XDG config `worker-harness/clusters.json` | Local version-1 profiles; no secret values. |
-| Configuration directory `ssh/<id>/...` | Managed login key/config; private permissions; not Git. |
+| Configuration parent `id_ed25519[.pub]`, `known_hosts`; `ssh/<id>/config`, `bootstrap_config` | Shared identity/trust and per-connection configs; private permissions; not Git. |
+| Configuration parent `setup-drafts.json` / `cluster-integration.json` | Private version-1 resumable setup drafts / one-time global integration settings; not completed compute profiles or submission journals. |
 | `WH_CLUSTER_STATE_DIR` or `${XDG_STATE_HOME:-$HOME/.local/state}/worker-harness/slurm` | 0700/0600 atomic journals, request digest, IDs/scoped token, scheduler evidence, recipient and SSE cursor; namespaced by orchestrator URL hash/client/session. No persisted control bearer. |
 | `<shared_root>/.wh-slurm/<worker_id>` | Batch/settings/logs/runtime and staged file secrets; preserve evidence, remove only known staged credential copies. Shared owner/storage remain trusted. |
 | `<run_path>/runtime/harness/<job_id>` | Runner output, `runtime.json`, `result.json`, descendant/exit evidence. |
@@ -404,6 +431,7 @@ Source map (all paths root-relative):
 - **S4 / actual allocation runtime:** `start-wh.sh`, `worker_container/entrypoint.sh`, `worker_container/worker_daemon.py`, `src/worker_harness/job_runner.py`, existing SSH/JobManager launch/reconciliation.
 - **S5 / shared clients and notifications:** extension `tools/compute-actions.ts`, `tools/grouped.ts`, `slurm/notifications.ts`, `mcp.ts`, `index.ts`; README/SPEC document client surface.
 - **Behavior fixtures:** root `tests/test_slurm_workers.py`, `test_job_events.py`, `test_job_runner.py`, `test_slurm_daemon.py`, `test_slurm_allocation.py`, `test_start_wh.py`, existing queue/API tests; extension `slurm/*.test.ts`, `mcp.test.ts`, compute/notification tests.
+- **Minimal onboarding / read-only discovery:** extension `slurm/setup.ts`, `slurm/discovery.ts`, existing strict `slurm/client.ts` transport and shared-mapping identity verification. `setup-drafts.json` and `cluster-integration.json` are private configuration-root data, not fake profiles or remote provisioning.
 
 ## 8. Optional Claude MCP client
 
@@ -438,7 +466,18 @@ Accept the development-channel warning and MCP consent. This requires a compatib
 
 ## 9. Verified work and remaining acceptance
 
-### Completed local evidence
+### Current integration evidence (2026-11-01)
+
+The parent ran the full **isolated root Python suite: 339 passed**, one existing Starlette warning, **59.39 seconds**. It used `.venv/bin/python -m pytest --ignore=tests/test_orchestrator_live_api.py`, empty `WH_MACHINES_PATH`/`WH_PROJECTS_PATH` TOML files and unset inherited `WH_OPERATOR_TOKEN`, `WH_OPERATOR_TOKEN_FILE`, `WH_SESSION_TOKEN`, `WH_SESSION_ROLE`; no live API test or cluster operation ran. Isolation avoids loading the now-visible personal registry and requiring its genuine control authorization; no production-auth behavior was weakened. Packaged Slurm runtime assets were regenerated. Local proofs are complete; publication/deployment remain separate.
+
+The parent ran **`bun test` in the extension checkout: 439 passed, zero failures**, **2,938 assertions across 16 files, 3.93 seconds**. This is the current minimal-workflow suite, separate from the historical 361-test baseline below.
+
+The parent's **actual multiple-filesystem smoke passed in 1.70 seconds**: real SlurmClient preflight/three identity write-read-cleanup probes/staging, then actual `wh-allocation.sh` → `start-wh.sh` → a bwrap workload in place of the SIF daemon. Three binds and the complete root manifest were observed; primary runtime staging stayed unchanged. A real Python project/import/input used an additional projects root and venv imports used a distinct additional environments root, including quoted paths. Project/environment symlink escapes were rejected **before reservation**; explicit job600s remained unchanged; staged credentials were removed; wrapper/workload exited0. Local-bash SSH transport, scheduler/control API and SIF-daemon boundaries were fixtures: no network, real SIF daemon, real Slurm job or charged work was exercised.
+
+The parent's **actual installed OMP 18.14.2 minimal-onboarding proof passed in 32.13 seconds**, with private HOME, normal linked-plugin discovery and a real PTY. Key instructions/pause persisted through a **fresh OMP process** and resume. Primary/additional filesystem identity verification used ordinary WH diagnostic writes, SSH reads and cleanup. Automatic targets included CPU, physical A100 maximum 4 and H100 maximum 8; CPU retained the 604800s ceiling while GPU targets clamped to the lower two-hour partition cap. Missing-image and missing-API cases saved blocked drafts **without targets**; global integration settings were reused once. Real OpenSSH `-G` checked normal aliases/includes, and strict SSH invocation flags were recorded. Evidence: `/tmp/wh-minimal-onboarding-7i9sjkqj/evidence.json` (ephemeral local artifact). SSH/Slurm/static-image inspection and control endpoints were local fixtures; no actual cluster access, allocation, secret leakage or model completion occurred.
+
+
+### Historical completed local evidence (recorded 2026-11-01)
 
 - S1–S5 implemented end to end: shared profiles/storage, reservations/events/CPU admission, ordinary-tool finite submission/resource sizing/recovery, finite daemon/runner/grace/signals, shared OMP/MCP handlers and notifications. Legacy chain scripts/recipe removed rather than aliased.
 - Root isolated suite: **336 passed**, one existing Starlette warning, 55.04 seconds. Extension: **278 passed, zero failed**, 1,388 expectations across 13 files. These are prior executed results, not claims that this documentation worker reran them or that newly added onboarding tests have passed.
@@ -449,8 +488,8 @@ Accept the development-channel warning and MCP consent. This requires a compatib
 - **Historical per-profile onboarding suite:** bare `bun test` passed **345 tests, zero failed**, 2,341 expectations across 14 files, 1.62 seconds, without bwrap or a system-config fixture. Safe conditional system-config inclusion handled this host's UID-65534-owned 0644 `/etc/ssh/ssh_config` by omitting that unsafe user Include with a durable warning, not bypassing OpenSSH checks. This result predates shared-key migration.
 - **Historical native actual OMP per-profile onboarding: passed**, 15.14 seconds, without bwrap or system-SSH-config substitution. The production inclusion guard and warning handled the actual unsafe host system file. An isolated plugin link/list/uninstall/list/relink/list sequence preceded normal discovery and real interactive cancel/save flows. Cancellation left no artifacts; saving preserved existing profiles. Real Ed25519 key generation was checked by derived public key/fingerprint and file permissions. Real OpenSSH `-G` checked bootstrap and dedicated host/user/port/jump resolution plus preservation of the original alias identity. Durable public-key/setup instructions were visible in the terminal. OMP's startup provider/catalog CONNECT attempts were recorded and denied with local proxy 403 responses before TLS, with zero forwarded connections or model completions. No real cluster SSH connection or submission occurred. This does not verify the shared-key/migration UI.
 - **Restored plain-path sandbox mount proof: passed**, reported by the main agent using the actual restored launcher/private-HOME fixture, actual default allowlist and actual source-generated `sandbox.paths_file_content` for `orchestrator`, `pm`, and `task`. Interactive config/state were visible and writes persisted; all three fleet-generated allowlists kept those directories hidden. Ordinary Work access, unrelated `~/.ssh` masking, unset `SSH_AUTH_SOCK`, and role-based operator-environment stripping were unchanged. This proves the existing selected-allowlist workflow without role-dependent path syntax, not real login or live-cluster acceptance.
-- **Current final native extension suite: passed**, **361 tests, zero failures**, 2,764 expectations across 14 files, 2.19 seconds.
-- **Current native actual OMP 18.14.2 shared-SSH smoke: passed**, 32.39 seconds. The normal plugin link/discovery path, `/cluster-add` cancellation and two independent profiles verified one configuration-root login key and explicit shared host trust. Migration cancellation and four legacy profiles—including valid IDs `id_ed25519` and `known_hosts`—verified selected-key promotion with the original fingerprint unchanged, preservation of legacy keys/external config/ordinary SSH config, real OpenSSH `-G` for both configs, and repeat-migration retention of the old bootstrap identity. Native OMP creates no JSONL journal before a first model turn; its supported `/export` exposed the actual persisted native `custom_message` entries, IDs, commands and warnings, proving runtime handoff without a model call. Startup CONNECT attempts were all denied with local 403 responses; there was no SSH network connection or real host-trust autoacceptance. These local proofs do not replace the full sandbox restart and real login/IBEX gates.
+- **Historical pre-minimal-workflow native extension suite: passed**, **361 tests, zero failures**, 2,764 expectations across 14 files, 2.19 seconds.
+- **Historical pre-minimal-workflow actual OMP 18.14.2 shared-SSH smoke: passed**, 32.39 seconds. Normal plugin discovery, shared configuration-root identity/trust, migration cancellation/four legacy profiles (including IDs `id_ed25519` and `known_hosts`), selected-key fingerprint preservation, legacy/external-config preservation, real OpenSSH `-G` and retained bootstrap identity were exercised. Native `/export` exposed persisted custom messages without model calls; startup CONNECT attempts were denied locally. No real SSH network connection or automatic host-trust acceptance occurred. This is not proof of the new minimal workflow.
 
 ### Repeatable checked-in test commands
 
@@ -474,13 +513,13 @@ For another full local changed-path proof, use a throwaway loopback fixture outs
 
 ### Live V3 / IBEX: NOT DONE
 
-Obtain an operator-designated CPU/GPU account and actual partition/type/policy, verified SSH host trust and noninteractive access, approved ephemeral tagged enrollment key, compute-node Tailnet/SSH capability, participating shared worker, candidate SIF, matching control deployment and **explicit approval for charged submissions**. Review exact requested CPU/RAM/GPU/walltime before each live test. Do not guess a CPU partition, reuse a privileged enrollment key, or submit to discover billing/policy.
+Obtain confirmed default-account authorization (or an explicit operator-designated billing account) and actual partition/type/policy, verified SSH host trust and noninteractive access, approved ephemeral tagged enrollment key, compute-node Tailnet/SSH capability, participating shared workers for all mappings, marked candidate SIF, matching control deployment and **explicit approval for charged submissions**. Review exact requested CPU/RAM/GPU/walltime before each live test; seven days is a ceiling, not an instruction to request seven days. Do not guess a CPU partition, reuse a privileged enrollment key, or submit to discover billing/policy.
 
 Acceptance order:
 
-- [ ] Verify deployed control auth/12888-vs-12889 restrictions and new runtime/image version; no public API exposure.
+- [ ] Verify deployed control auth/12888-vs-12889 restrictions and required reservation/Slurm-update/job-events routes; the currently reachable production API lacks them. Build/inspect the updated marked candidate image and record its hash; no public API exposure.
 - [ ] Create persistent configuration/state directories outside the old sandbox, select the edited paths file and fully restart agent-sandbox. Run `/cluster-ssh-migrate` for recognized legacy profiles or `/cluster-add` for a new profile. Inspect private paths/permissions; independently verify managed known_hosts, install only the shared public login key on each affected account, provision dedicated-agent access if encrypted, and pass the exact strict probe.
-- [ ] Discover CPU/GPU targets with list/get; confirm standard Slurm inventory/account policy. Find participating storage with `list_data`, compare random probe, and transfer only needed source/lock/data from the original worker if necessary.
+- [ ] Resume SSH-first discovery and review generated CPU/GPU targets; confirm inventory/default-account/site policy without selecting premium QoS or arbitrary billing. Find participating storage with `list_data`, compare and clean a random probe for **every** mapping; missing worker/catalog permission blocks a resumable draft. Transfer only needed source/lock/data from the original worker if necessary.
 - [ ] Start with an approved **small CPU run: 1 CPU/4096 MiB**, no GPUs, ten minutes or the allowed site minimum. Verify no CUDA/NVIDIA requirement, correct SIF/shared path, serial queue, finite shutdown, retained logs and notification. Prepare/test imports in the hashed environment using this CPU target if the existing worker uses a different image.
 - [ ] Then one GPU for **ten minutes or the allowed site minimum**, with CPU/RAM computed from actual configured capacity. Confirm pending ordinary WH job before startup, assigned physical UUID mapping, persisted cwd/environment wrapper, useful execution and no successor/requeue after completion.
 - [ ] With site-permitted positive grace, fail useful work; observe actual OMP event, ordinary exec diagnosis and enqueue recovery before the deadline. If idle holding is forbidden, retain zero grace and use a fresh explicit allocation instead. Verify no hidden deadline extension or retry.
