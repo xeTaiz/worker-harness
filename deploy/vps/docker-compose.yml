@@ -17,7 +17,9 @@
 #   docker compose up -d --build
 #   docker compose exec -it worker-harness-orch \
 #     python -m worker_harness.orchestrator bootstrap-admin --username admin
-name: worker-harness
+# Distinct from the single-user deployment's compose project ("worker-harness"):
+# sharing a project name would make `down`/`--remove-orphans` act on its containers.
+name: worker-harness-mu
 
 services:
   worker-harness-orch:
