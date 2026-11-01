@@ -360,12 +360,12 @@ class Orchestrator:
         if role == "orchestrator":
             parent_session_id = None
             briefing = ""
+        owner_user_id = await self._launch_owner(role, parent_session_id)
         session_id = str(uuid4())
         token = secrets.token_urlsafe(32)
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         worktree = ""
         actual_branch = ""
-
         if role == "task":
             try:
                 worktree, actual_branch = await create_worktree(
@@ -381,6 +381,7 @@ class Orchestrator:
                     worktree="",
                     branch=branch,
                     workspace=None,
+                    owner_user_id=owner_user_id,
                 )
                 await self.db.insert_pi_session(session)
                 await self._mark_failed(session, exc, event_type="launch-failed")
@@ -410,6 +411,7 @@ class Orchestrator:
                 worktree=worktree,
                 branch=actual_branch,
                 workspace=None,
+                owner_user_id=owner_user_id,
             )
             await self.db.insert_pi_session(session)
             await self._mark_failed(session, exc, event_type="launch-failed")
@@ -427,6 +429,7 @@ class Orchestrator:
             branch=actual_branch,
             workspace=workspace,
             resume_path=resume_path,
+            owner_user_id=owner_user_id,
         )
         await self.db.insert_pi_session(session)
 
@@ -514,6 +517,18 @@ class Orchestrator:
             await self._close_after_failed_launch(machine, session)
             raise
 
+    async def _launch_owner(self, role: str, parent_session_id: str | None) -> str:
+        """Fleet sessions belong to the bootstrap administrator; tasks inherit
+        the verified owner of their project manager."""
+        if role == "task":
+            parent = await self.db.get_pi_session(parent_session_id or "")
+            if parent is None or parent.role != "pm" or not parent.owner_user_id:
+                raise WorktreeError("task parent must be an owned project manager")
+            return parent.owner_user_id
+        owner_user_id = await self.db.bootstrap_user_id()
+        if not owner_user_id:
+            raise RuntimeError("the bootstrap administrator must exist before launching Pi sessions")
+        return owner_user_id
 
     def _new_session(
         self,
@@ -526,6 +541,7 @@ class Orchestrator:
         worktree: str,
         branch: str,
         workspace: dict[str, Any] | None,
+        owner_user_id: str,
         resume_path: str | None = None,
     ) -> PiSession:
         cache_dir = spec.machine.session_dir(session_id)
@@ -561,6 +577,7 @@ class Orchestrator:
             meta=meta,
             created_at=now,
             updated_at=now,
+            owner_user_id=owner_user_id,
         )
 
     async def _wait_for_bridge(self, machine: Machine, session: PiSession) -> PiSession:

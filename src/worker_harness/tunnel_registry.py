@@ -21,6 +21,8 @@ class TunnelProcess:
     remote_port: int
     proc: subprocess.Popen
     created_at: int
+    # Owner of the forward, for owner-scoped cleanup (e.g. account disable).
+    owner_user_id: str
 
 
 class TunnelRegistry:
@@ -36,13 +38,19 @@ class TunnelRegistry:
     def remove(self, tunnel_id: str) -> TunnelProcess | None:
         return self._entries.pop(tunnel_id, None)
 
-    def reap_dead(self) -> int:
-        """Reap dead tunnel leaders and terminate any surviving descendants."""
+    def reap_dead(self) -> list[str]:
+        """Reap dead tunnel leaders and terminate any surviving descendants.
+
+        Returns the reaped tunnel IDs so their persisted rows can be released.
+        """
         dead = [entry for entry in self._entries.values() if entry.proc.poll() is not None]
         for entry in dead:
             self.stop(entry, grace_seconds=0.1)
             self._entries.pop(entry.id, None)
-        return len(dead)
+        return [entry.id for entry in dead]
+
+    def ids(self) -> set[str]:
+        return set(self._entries)
 
     def stats(self) -> dict:
         by_worker: dict[str, int] = {}

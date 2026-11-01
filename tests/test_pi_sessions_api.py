@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from identity_support import bootstrap, create_user, issue_key, login
+
 from worker_harness.db import Database
 from worker_harness.heartbeat import create_app
 from worker_harness.machines import Machine
@@ -27,14 +29,12 @@ from worker_harness.projects import Project
 
 class PiSessionsApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        operator_env = patch.dict(os.environ, {"WH_OPERATOR_TOKEN": "o" * 43})
-        operator_env.start()
-        self.addCleanup(operator_env.stop)
         temporary = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
         temporary.close()
         self.path = Path(temporary.name)
         self.db = Database(self.path)
         asyncio.run(self.db.connect())
+        self.owner = asyncio.run(bootstrap(self.db))
         self.sessions = {
             "orchestrator": self._insert("orchestrator", "orchestrator", "orch-token"),
             "pm-one": self._insert("pm-one", "pm", "pm-one-token", project="one"),
@@ -61,7 +61,9 @@ class PiSessionsApiTests(unittest.TestCase):
         self.app.state.orchestrator.pm_session = manager_session
 
     def client(self) -> TestClient:
-        return TestClient(self.app, headers=self.auth("o" * 43))
+        client = TestClient(self.app)
+        client.headers.update(login(client, self.owner["username"]))
+        return client
 
     def tearDown(self) -> None:
         asyncio.run(self.db.close())
@@ -80,6 +82,7 @@ class PiSessionsApiTests(unittest.TestCase):
         session = PiSession(
             id=session_id,
             parent_session_id=parent,
+            owner_user_id=self.owner["id"],
             session_type=PiSessionType.INTERACTIVE,
             state=PiSessionState.IDLE,
             role=role,
@@ -306,6 +309,7 @@ class PiSessionsApiTests(unittest.TestCase):
             id="new-task",
             role="task",
             parent_session_id="pm-one",
+            owner_user_id=self.owner["id"],
             meta={"project": "one"},
         )
         self.app.state.orchestrator.launch_task.return_value = launched
@@ -389,6 +393,8 @@ class PiSessionsApiTests(unittest.TestCase):
         self.assertEqual(registered.status_code, 200, registered.text)
         after = asyncio.run(self.db.get_pi_session("task-one"))
         self.assertEqual(after.role, "task")
+        self.assertEqual(registered.json()["owner_user_id"], self.owner["id"])
+        self.assertEqual(after.owner_user_id, before.owner_user_id)
         self.assertEqual(after.token_hash, before.token_hash)
         self.assertEqual(after.parent_session_id, "pm-one")
         self.assertEqual(after.meta, {"project": "one"})
@@ -398,6 +404,7 @@ class PiSessionsApiTests(unittest.TestCase):
         fleet_session = PiSession(
             id="fleet-pm",
             session_type=PiSessionType.INTERACTIVE,
+            owner_user_id=self.owner["id"],
             state=PiSessionState.STARTING,
             role="pm",
             name="pm-worker-harness",
@@ -425,11 +432,59 @@ class PiSessionsApiTests(unittest.TestCase):
         self.assertEqual(persisted.name, "pm-worker-harness")
         self.assertEqual(persisted.host, "desktop")
 
+    def test_new_bridge_registration_and_replacement_keep_bootstrap_owner(self):
+        with self.client() as client:
+            for incarnation in ("initial", "replacement"):
+                response = client.post(
+                    "/api/v1/pi/bridge/register",
+                    json={"session_id": "plain-pi", "incarnation": incarnation},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["owner_user_id"], self.owner["id"])
+                persisted = asyncio.run(self.db.get_pi_session("plain-pi"))
+                self.assertEqual(persisted.owner_user_id, self.owner["id"])
+                self.assertEqual(persisted.bridge_incarnation, incarnation)
+
+    def test_bridge_registration_refuses_a_different_verified_owner(self):
+        with self.client() as client:
+            other = create_user(client, dict(client.headers), "other-owner")
+            foreign = PiSession(
+                id="foreign-pi", owner_user_id=other["id"],
+                session_type=PiSessionType.INTERACTIVE,
+                state=PiSessionState.IDLE, bridge_incarnation="original",
+            )
+            asyncio.run(self.db.insert_pi_session(foreign))
+            response = client.post(
+                "/api/v1/pi/bridge/register",
+                json={"session_id": foreign.id, "incarnation": "replacement"},
+            )
+        self.assertEqual(response.status_code, 409, response.text)
+        persisted = asyncio.run(self.db.get_pi_session(foreign.id))
+        self.assertEqual(persisted.owner_user_id, other["id"])
+        self.assertEqual(persisted.bridge_incarnation, "original")
+
+    def test_api_key_cannot_access_pi_routes_even_for_bootstrap_owner(self):
+        with self.client() as client:
+            token = issue_key(client, dict(client.headers))
+            for method, path, payload in (
+                ("GET", "/api/v1/pi/sessions", None),
+                ("POST", "/api/v1/pi/bridge/register", {
+                    "session_id": "api-key-pi", "incarnation": "initial",
+                }),
+            ):
+                with self.subTest(path=path):
+                    response = client.request(
+                        method, path, json=payload, headers=self.auth(token),
+                    )
+                    self.assertEqual(response.status_code, 403, response.text)
+        self.assertIsNone(asyncio.run(self.db.get_pi_session("api-key-pi")))
+
     def test_global_router_registration_preserves_type_and_claims_commands(self):
         token = "global-router-token"
         global_session = PiSession(
             id="global-router",
             session_type=PiSessionType.GLOBAL_ROUTER,
+            owner_user_id=self.owner["id"],
             state=PiSessionState.STARTING,
             role="orchestrator",
             token_hash=hashlib.sha256(token.encode()).hexdigest(),
@@ -470,6 +525,7 @@ class PiSessionsApiTests(unittest.TestCase):
         self.assertEqual([command["message"] for command in claimed.json()], ["route this task"])
         persisted = asyncio.run(self.db.get_pi_session("global-router"))
         self.assertEqual(persisted.session_type, PiSessionType.GLOBAL_ROUTER)
+        self.assertEqual(persisted.owner_user_id, self.owner["id"])
 
         swept = asyncio.run(
             self.db.sweep_stale_interactive_pi_sessions(cutoff_ts=10**12, now=200)
@@ -478,7 +534,7 @@ class PiSessionsApiTests(unittest.TestCase):
         persisted = asyncio.run(self.db.get_pi_session("global-router"))
         self.assertEqual(persisted.state, PiSessionState.STOPPED)
 
-    def test_operator_auth_cannot_be_bypassed_by_omitting_bearer(self):
+    def test_missing_and_legacy_operator_credentials_are_unauthenticated(self):
         with TestClient(self.app) as client:
             for method, path, payload in (
                 ("GET", "/api/v1/pi/sessions", None),
@@ -488,13 +544,11 @@ class PiSessionsApiTests(unittest.TestCase):
                     "session_id": "pm-one", "incarnation": "hijack",
                 }),
             ):
-                with self.subTest(path=path):
-                    response = client.request(method, path, json=payload)
-                    self.assertEqual(response.status_code, 401, response.text)
+                for headers in ({}, self.auth("o" * 43)):
+                    with self.subTest(path=path, headers=headers):
+                        response = client.request(method, path, json=payload, headers=headers)
+                        self.assertEqual(response.status_code, 401, response.text)
             self.assertEqual(client.get("/health").status_code, 200)
-        self.app.state.operator_token = ""
-        with TestClient(self.app) as client:
-            self.assertEqual(client.get("/api/v1/workers").status_code, 401)
 
     def test_orchestrator_cannot_access_worker_compute_or_admin_routes(self):
         with self.client() as client:
@@ -592,6 +646,12 @@ class PiSessionsApiTests(unittest.TestCase):
                 json={"session_id": "task-two", "incarnation": "hijack"},
             )
             self.assertEqual(spoofed.status_code, 403, spoofed.text)
+            invented = client.post(
+                "/api/v1/pi/bridge/register", headers=self.auth("task-one-token"),
+                json={"session_id": "invented-task", "incarnation": "hijack"},
+            )
+            self.assertEqual(invented.status_code, 403, invented.text)
+            self.assertIsNone(asyncio.run(self.db.get_pi_session("invented-task")))
             stopped = client.post(
                 "/api/v1/pi/bridge/task-one/events", headers=self.auth("task-one-token"),
                 json={"incarnation": "task-one-inc", "state": "stopped"},
@@ -648,7 +708,9 @@ class PiSessionsApiTests(unittest.TestCase):
 
     def test_delegated_database_cutover_removes_dependents_and_is_idempotent(self):
         async def migrate():
-            legacy = PiSession(id="legacy", state=PiSessionState.WORKING)
+            legacy = PiSession(
+                id="legacy", state=PiSessionState.WORKING, owner_user_id=self.owner["id"],
+            )
             await self.db.insert_pi_session(legacy)
             await self.db.insert_pi_session_event(PiSessionEvent(
                 id="legacy-event", session_id="legacy", event_type="message-end",
@@ -726,22 +788,18 @@ class PiSessionsApiTests(unittest.TestCase):
             self.assertTrue(session.has_pending_messages)
         asyncio.run(exercise())
 
-    def test_operator_token_file_and_invalid_configuration(self):
+    def test_legacy_operator_token_environment_and_file_are_ignored(self):
         secret_file = self.path.with_suffix(".token")
         self.addCleanup(secret_file.unlink, missing_ok=True)
-        secret_file.write_text("f" * 43 + "\n")
+        secret_file.write_text("weak")
         with patch.dict(os.environ, {
-            "WH_OPERATOR_TOKEN": "", "WH_OPERATOR_TOKEN_FILE": str(secret_file),
+            "WH_OPERATOR_TOKEN": "o" * 43, "WH_OPERATOR_TOKEN_FILE": str(secret_file),
         }):
             app = create_app(self.db)
             with TestClient(app) as client:
-                self.assertEqual(client.get("/api/v1/workers").status_code, 401)
-                self.assertEqual(client.get(
-                    "/api/v1/workers", headers=self.auth("f" * 43),
-                ).status_code, 200)
-            secret_file.write_text("weak")
-            with self.assertRaises(ValueError):
-                create_app(self.db)
+                for token in ("o" * 43, "weak"):
+                    response = client.get("/api/v1/pi/sessions", headers=self.auth(token))
+                    self.assertEqual(response.status_code, 401, response.text)
 
 
 if __name__ == "__main__":

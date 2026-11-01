@@ -5,7 +5,7 @@ set -euo pipefail
 readonly MARIMO_VERSION="0.23.16"
 
 usage() {
-  echo "usage: wh-marimo-launch --notebook ABSOLUTE_PATH --environment ABSOLUTE_PATH --port PORT" >&2
+  echo "usage: wh-marimo-launch --notebook ABSOLUTE_PATH --environment ABSOLUTE_PATH --port PORT --token-file PATH --base-url PREFIX" >&2
   exit 2
 }
 
@@ -17,6 +17,8 @@ fail() {
 notebook=""
 environment=""
 port=""
+token_file=""
+base_url=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --notebook)
@@ -34,15 +36,29 @@ while [[ $# -gt 0 ]]; do
       port=$2
       shift 2
       ;;
+    --token-file)
+      [[ $# -ge 2 ]] || usage
+      token_file=$2
+      shift 2
+      ;;
+    --base-url)
+      [[ $# -ge 2 ]] || usage
+      base_url=$2
+      shift 2
+      ;;
     *) usage ;;
   esac
 done
 
-[[ -n "$notebook" && -n "$environment" && -n "$port" ]] || usage
+[[ -n "$notebook" && -n "$environment" && -n "$port" && -n "$token_file" && -n "$base_url" ]] || usage
 [[ "$notebook" != *$'\n'* && "$notebook" != *$'\r'* ]] || fail "notebook path must not contain newlines"
 [[ "$environment" != *$'\n'* && "$environment" != *$'\r'* ]] || fail "environment path must not contain newlines"
 [[ "$notebook" == /* ]] || fail "notebook path must be absolute"
 [[ "$environment" == /* ]] || fail "environment path must be absolute"
+[[ "$token_file" == /* && "$token_file" != *$'\n'* && "$token_file" != *$'\r'* ]] || fail "token file must be an absolute single-line path"
+[[ "$token_file" != */../* && "$token_file" != */./* && "$token_file" != *//* && "$token_file" != */.. && "$token_file" != */. && "$token_file" != */ ]] || fail "token file must be normalized"
+[[ -f "$token_file" && -r "$token_file" && -s "$token_file" && ! -L "$token_file" ]] || fail "token file is missing or unreadable"
+[[ "$base_url" =~ ^/api/v1/marimo/[A-Za-z0-9-]+/proxy$ ]] || fail "invalid proxy base URL"
 [[ "$port" =~ ^[0-9]+$ ]] || fail "port must be an integer between 1 and 65535"
 (( 10#$port >= 1 && 10#$port <= 65535 )) || fail "port must be an integer between 1 and 65535"
 
@@ -69,8 +85,10 @@ exec "$uv_bin" run \
   --no-project \
   --python "$target_python" \
   --with "marimo==${MARIMO_VERSION}" \
-  marimo edit "$notebook" \
+  marimo -q edit "$notebook" \
+  --token \
+  --token-password-file "$token_file" \
+  --base-url "$base_url" \
   --host 127.0.0.1 \
   --port "$port" \
-  --headless \
-  --no-token
+  --headless

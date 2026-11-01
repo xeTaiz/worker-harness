@@ -1,8 +1,8 @@
 {
-  "name": "Worker Harness Pi Sessions",
-  "short_name": "Pi Sessions",
-  "description": "Follow and steer Pi sessions across the tailnet.",
-  "start_url": "/",
+  "name": "Worker Harness",
+  "short_name": "Harness",
+  "description": "Shared FIFO job board, allocated usage, owned tunnels and notebooks.",
+  "start_url": "/#jobs",
   "scope": "/",
   "display": "standalone",
   "background_color": "#090d14",

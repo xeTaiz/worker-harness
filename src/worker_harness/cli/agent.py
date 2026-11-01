@@ -1,4 +1,4 @@
-"""agent subcommand group — machine-friendly JSON output for AI agents."""
+"""Local operator worker diagnostics with job counts from the public API board."""
 
 from __future__ import annotations
 
@@ -28,6 +28,15 @@ async def _db_connect():
 
 def _agent_workers_impl():
     async def run():
+        from worker_harness.client import request
+        board = await request("GET", "/api/v1/jobs/queue")
+        running_counts = {
+            group["worker_id"]: sum(
+                job["status"] in {"starting", "running"}
+                for job in group["jobs"] + group["cpu_jobs"]
+            )
+            for group in board["workers"]
+        }
         db = await _db_connect()
         async with db:
             from worker_harness.models import (
@@ -37,7 +46,7 @@ def _agent_workers_impl():
             workers = await db.list_workers()
             summaries: list[WorkerSummary] = []
             for w in workers:
-                running_count = await db.get_running_job_count_for_worker(w.id)
+                running_count = running_counts.get(w.id, 0)
                 summaries.append(WorkerSummary(
                     id=w.id,
                     name=w.name,
@@ -63,7 +72,11 @@ def _agent_workers_impl():
                 total_offline=sum(1 for s in summaries if s.status.value == "offline"),
             )
             console.print(response.model_dump_json(indent=2))
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except RuntimeError as exc:
+        console.print(str(exc), markup=False)
+        raise typer.Exit(1) from exc
 
 
 def _agent_free_gpus_impl():
@@ -96,6 +109,6 @@ def _agent_free_gpus_impl():
 
 
 # Build the typer app
-app = typer.Typer(name="agent", help="Machine-friendly commands for AI agents.")
+app = typer.Typer(name="agent", help="Local operator worker diagnostics (not an ordinary API-key capability).")
 app.command(name="workers")(_agent_workers_impl)
 app.command(name="free-gpus")(_agent_free_gpus_impl)

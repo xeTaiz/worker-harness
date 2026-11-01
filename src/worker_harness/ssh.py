@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import json
 import os
 import shlex
 import signal
@@ -25,7 +26,7 @@ import subprocess  # Popen return type for ssh_port_forward
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 
 from .machines import Machine
 from .models import Worker
@@ -161,8 +162,20 @@ def _ssh_target(worker: Worker) -> str:
     return f"{worker.ssh_user}@{worker.ssh_host}"
 
 
+def tailscale_cli(*args: str) -> list[str]:
+    """`tailscale` argv addressing the orchestrator's tailscaled.
+
+    ``WH_TAILSCALE_SOCKET`` selects the daemon's local API socket on hosts
+    running several tailscaleds; unset uses the CLI's default socket.
+    """
+    socket_path = os.environ.get("WH_TAILSCALE_SOCKET", "").strip()
+    if socket_path:
+        return ["tailscale", f"--socket={socket_path}", *args]
+    return ["tailscale", *args]
+
+
 def _ssh_base_args(worker: Worker) -> list[str]:
-    return ["tailscale", "ssh", _ssh_target(worker)]
+    return tailscale_cli("ssh", _ssh_target(worker))
 
 
 def _worker_harness_dir(worker: Worker) -> str:
@@ -366,107 +379,148 @@ def _build_job_command(
     worker: Worker,
     job_id: str,
     command: str,
-    gpu_indices: list[int] | None = None,
+    gpu_indices: list[int],
 ) -> str:
-    """Compose the remote job-launch command. Pure string assembly — no I/O."""
-    harness_dir = f"{_worker_harness_dir(worker)}/{job_id}"
-    script_path = f"{harness_dir}/script.sh"
-    log_path = f"{harness_dir}/output.log"
-    gpu_export = (
-        f"export CUDA_VISIBLE_DEVICES={','.join(str(index) for index in gpu_indices)}\n"
-        if gpu_indices is not None
-        else ""
+    """Assemble one remote shell command, including the standalone supervisor."""
+    job_dir = f"{_worker_harness_dir(worker)}/{job_id}"
+    quoted_dir = shlex.quote(job_dir)
+    tmux = _tmux_env(worker)
+    session = shlex.quote(f"wh_{job_id}")
+    runner_source = Path(__file__).with_name("job_runner.py").read_bytes()
+    inputs = {
+        "runner.py": runner_source,
+        "script.sh": f"#!/bin/bash\n{command}\n".encode(),
+        "gpu.env": f"CUDA_VISIBLE_DEVICES={','.join(str(index) for index in gpu_indices)}\n".encode(),
+    }
+    writes = [
+        f"printf %s {shlex.quote(base64.b64encode(content).decode())} | "
+        f"base64 -d > {shlex.quote(f'{job_dir}/{name}')}"
+        for name, content in inputs.items()
+    ]
+    runner = (
+        f"exec python3 {shlex.quote(f'{job_dir}/runner.py')} run --job-dir {quoted_dir}"
+    )
+    # No runtime/result on a crashed launcher is not proof of failed execution.
+    # Only a supervisor error written before spawning work is a definite failure.
+    wait_script = (
+        "import pathlib, subprocess, sys, time\n"
+        f"directory = pathlib.Path({job_dir!r})\n"
+        "deadline = time.monotonic() + 10\n"
+        "while time.monotonic() < deadline:\n"
+        "    if (directory / 'runtime.json').exists():\n"
+        "        print('started', flush=True)\n"
+        "        sys.exit(0)\n"
+        "    if (directory / 'launch_error.json').exists():\n"
+        "        print((directory / 'output.log').read_text(), file=sys.stderr)\n"
+        "        sys.exit(1)\n"
+        f"    live = subprocess.run({(tmux + ' has-session -t ' + shlex.quote('=wh_' + job_id))!r}, "
+        "shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "    if live.returncode != 0:\n"
+        "        if (directory / 'runtime.json').exists():\n"
+        "            print('started', flush=True)\n"
+        "            sys.exit(0)\n"
+        "        if (directory / 'launch_error.json').exists():\n"
+        "            print((directory / 'output.log').read_text(), file=sys.stderr)\n"
+        "            sys.exit(1)\n"
+        "        print('Supervisor exited without launch proof', file=sys.stderr)\n"
+        "        sys.exit(255)\n"
+        "    time.sleep(0.05)\n"
+        "print('Supervisor launch acknowledgement timed out', file=sys.stderr)\n"
+        "sys.exit(255)\n"
+    )
+    return (
+        "umask 077; "
+        "command -v python3 >/dev/null 2>&1 || "
+        "{ echo 'python3 is required for supervised jobs' >&2; exit 127; }; "
+        f"mkdir -p {shlex.quote(_worker_harness_dir(worker))} "
+        f"{shlex.quote(_worker_tmux_tmpdir(worker))} || exit 1; "
+        f"mkdir {quoted_dir} || exit 255; "
+        + " && ".join(writes)
+        + f" && {tmux} new-session -d -s {session} {shlex.quote(runner)}"
+        + f" && python3 -c {shlex.quote(wait_script)}"
     )
 
-    script_content = (
-        f"#!/bin/bash\n"
-        f"exec >>{log_path} 2>&1\n"
-        f"{gpu_export}"
-        f"({command}); ec=$?\n"
-        f"echo EXIT:$ec\n"
-        f"sleep 60\n"
-        f"tmux kill-session -t wh_{job_id} 2>/dev/null\n"
-    )
-    script_b64 = base64.b64encode(script_content.encode()).decode().rstrip()
 
-    full_cmd = (
-        f"mkdir -p {harness_dir} && "
-        f"echo '{script_b64}' | base64 -d > {script_path} && "
-        f"chmod +x {script_path} && "
-        f"{_tmux_env(worker)} new-session -d -s wh_{job_id} 'bash {script_path}' && "
-        f"echo 'started'"
-    )
-    return full_cmd
-
-
-async def ssh_tmux_new(
-    worker: Worker,
-    job_id: str,
-    command: str,
-    pty_enabled: bool = True,
-    gpu_indices: list[int] | None = None,
+async def ssh_job_launch(
+    worker: Worker, job_id: str, command: str, *, gpu_indices: list[int],
 ) -> SSHResult:
-    """Start a tmux job on the worker."""
-    full_cmd = _build_job_command(worker, job_id, command, gpu_indices)
-    args = _ssh_base_args(worker) + [full_cmd]
-    # Note: pty_enabled is informational here (jobs always run via tmux).
-    return await _exec_ssh(worker.id, args, lane_timeout=10.0, cmd_timeout=30.0, op_name="ssh_tmux_new")
-
-
-async def ssh_tmux_kill(worker: Worker, job_id: str) -> SSHResult:
-    session = f"wh_{job_id}"
-    tmux = _tmux_env(worker)
-    cmd = (
-        f"{tmux} kill-session -t '{session}' 2>/dev/null || true; "
-        f"{tmux} has-session -t '{session}' 2>/dev/null && echo still_running || echo stopped"
+    """Launch a supervised workload; transport uncertainty must retain its claim."""
+    return await _exec_ssh(
+        worker.id,
+        _ssh_base_args(worker) + [_build_job_command(worker, job_id, command, gpu_indices)],
+        lane_timeout=10.0, cmd_timeout=30.0, op_name="ssh_job_launch",
     )
-    return await async_ssh_run(worker, cmd, timeout=10)
 
-async def ssh_job_started(worker: Worker, job_id: str) -> bool | None:
-    """Probe durable launch evidence, including jobs whose tmux session already exited."""
-    session = f"wh_{job_id}"
-    tmux = _tmux_env(worker)
-    log_path = shlex.quote(f"{_worker_harness_dir(worker)}/{job_id}/output.log")
-    result = await async_ssh_run(
-        worker,
-        f"if {tmux} has-session -t '={session}' 2>/dev/null; then echo exists; "
-        f"elif test -e {log_path}; then echo exists; else echo absent; fi",
-        timeout=5,
+
+@dataclass(frozen=True)
+class JobProbe:
+    # launch_failed: the supervisor recorded launch_error.json before any
+    # workload existed (no runtime.json), i.e. the job definitely never ran.
+    state: Literal["absent", "starting", "running", "finished", "lost", "launch_failed"]
+    exit_code: int | None = None
+    termination_reason: str | None = None
+
+
+def _job_probe_command(worker: Worker, job_id: str) -> str:
+    """Probe durable proof and Linux identity, never tmux or workload output."""
+    job_dir = f"{_worker_harness_dir(worker)}/{job_id}"
+    script = (
+        "import json, pathlib\n"
+        f"directory = pathlib.Path({job_dir!r})\n"
+        "result_path = directory / 'result.json'\n"
+        "runtime_path = directory / 'runtime.json'\n"
+        "if not directory.exists():\n"
+        "    value = {'state': 'absent'}\n"
+        "elif result_path.exists():\n"
+        "    result = json.loads(result_path.read_text())\n"
+        "    if result.get('descendants_exited') is not True or type(result.get('exit_code')) is not int:\n"
+        "        raise ValueError('Unconfirmed supervisor result')\n"
+        "    value = {'state': 'finished', 'exit_code': result['exit_code'], "
+        "'termination_reason': result.get('termination_reason')}\n"
+        "elif not runtime_path.exists():\n"
+        "    failed = (directory / 'launch_error.json').exists()\n"
+        "    value = {'state': 'launch_failed' if failed else 'starting'}\n"
+        "else:\n"
+        "    runtime = json.loads(runtime_path.read_text())\n"
+        "    alive = False\n"
+        "    try:\n"
+        "        boot = pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()\n"
+        "        stat = pathlib.Path('/proc/%d/stat' % int(runtime['runner_pid'])).read_text()\n"
+        "        fields = stat[stat.rfind(')') + 2:].split()\n"
+        "        alive = (boot == runtime['boot_id'] and int(fields[19]) == runtime['start_ticks'] "
+        "and fields[0] not in ('Z', 'X'))\n"
+        "    except (OSError, ValueError, IndexError):\n"
+        "        pass\n"
+        "    value = {'state': 'running' if alive else 'lost'}\n"
+        "print(json.dumps(value))\n"
     )
+    return f"python3 -c {shlex.quote(script)}"
+
+
+async def ssh_job_probe(worker: Worker, job_id: str) -> JobProbe | None:
+    result = await async_ssh_run(worker, _job_probe_command(worker, job_id), timeout=5)
     if result.returncode != 0:
         return None
-    output = result.stdout.strip()
-    if output == "exists":
-        return True
-    if output == "absent":
-        return False
-    return None
-
-
-async def ssh_tmux_running(worker: Worker, job_id: str) -> bool | None:
-    """Return remote running state, or None when the SSH probe failed."""
-    log_path = f"{_worker_harness_dir(worker)}/{job_id}/output.log"
-    result = await async_ssh_run(
-        worker,
-        f"grep -q '^EXIT:' '{log_path}' 2>/dev/null && echo 'done' || echo 'running'",
-        timeout=5,
-    )
-    if result.returncode != 0:
-        log.warning(
-            "Could not probe job %s on %s: %s",
-            job_id,
-            worker.name,
-            result.stderr.strip() or f"exit {result.returncode}",
-        )
+    try:
+        value = json.loads(result.stdout)
+        if value["state"] not in {"absent", "starting", "running", "finished", "lost", "launch_failed"}:
+            return None
+        return JobProbe(**value)
+    except (ValueError, TypeError, KeyError):
         return None
-    return result.stdout.strip() == "running"
 
 
-async def ssh_tmux_capture(worker: Worker, job_id: str) -> str:
-    session = f"wh_{job_id}"
-    cmd = f"{_tmux_env(worker)} capture-pane -t '{session}' -p 2>/dev/null"
-    result = await async_ssh_run(worker, cmd, timeout=5)
-    return result.stdout
+def _job_stop_command(worker: Worker, job_id: str, reason: str) -> str:
+    job_dir = f"{_worker_harness_dir(worker)}/{job_id}"
+    return (
+        f"python3 {shlex.quote(f'{job_dir}/runner.py')} stop "
+        f"--job-dir {shlex.quote(job_dir)} --reason {shlex.quote(reason)}"
+    )
+
+
+async def ssh_job_stop(worker: Worker, job_id: str, reason: str) -> JobProbe | None:
+    await async_ssh_run(worker, _job_stop_command(worker, job_id, reason), timeout=12)
+    return await ssh_job_probe(worker, job_id)
 
 
 async def ssh_read_log(
@@ -477,31 +531,67 @@ async def ssh_read_log(
     *,
     timeout: int = 10,
 ) -> str:
+    if tail == 0:
+        return ""
     log_path = f"{_worker_harness_dir(worker)}/{job_id}/output.log"
     if head is not None:
         cmd = f"head -n {head} '{log_path}' 2>/dev/null"
     elif tail is not None and tail > 0:
         cmd = f"tail -n {tail} '{log_path}' 2>/dev/null"
-    elif tail == 0:
-        cmd = f"grep -E '^EXIT:' '{log_path}' 2>/dev/null || echo 'still running'"
     else:
         cmd = f"tail -n 10 '{log_path}' 2>/dev/null"
     result = await async_ssh_run(worker, cmd, timeout=timeout)
     return result.stdout
 
 
-async def ssh_get_exit_code(worker: Worker, job_id: str) -> int | None:
-    result = await async_ssh_run(
-        worker,
-        f"grep -E '^EXIT:' '{_worker_harness_dir(worker)}/{job_id}/output.log' 2>/dev/null | sed 's/EXIT://'",
-        timeout=5,
+def _log_range_command(worker: Worker, job_id: str, start: int | None, max_bytes: int) -> str:
+    """Print "<start> <end>" then exactly the log bytes in [start, end).
+
+    ``start`` None means the last ``max_bytes`` of the file. The size is
+    sampled once, so a concurrently growing log is never read past ``end``.
+    """
+    log_path = shlex.quote(f"{_worker_harness_dir(worker)}/{job_id}/output.log")
+    first = -1 if start is None else int(start)
+    limit = int(max_bytes)
+    return (
+        f"f={log_path}; size=$(stat -c %s \"$f\" 2>/dev/null || echo 0); start={first}; "
+        f"if [ \"$start\" -lt 0 ]; then start=$(( size > {limit} ? size - {limit} : 0 )); fi; "
+        "if [ \"$start\" -gt \"$size\" ]; then start=$size; fi; "
+        f"end=$(( size - start > {limit} ? start + {limit} : size )); "
+        "echo \"$start $end\"; "
+        "if [ \"$end\" -gt \"$start\" ]; then tail -c +$((start + 1)) \"$f\" | head -c $((end - start)); fi"
     )
-    if result.returncode == 0 and result.stdout.strip():
-        try:
-            return int(result.stdout.strip())
-        except ValueError:
-            pass
-    return None
+
+
+async def ssh_read_log_range(
+    worker: Worker, job_id: str, start: int | None, *, max_bytes: int = 1 << 20, timeout: int = 10,
+) -> tuple[int, int, bytes] | None:
+    """Return (start, end, bytes) of the job log, or None if the probe failed.
+
+    The slice travels base64-encoded over the ordinary text transport so the
+    exact-length check survives replacement decoding of non-UTF-8 output.
+    """
+    command = (
+        f"{{ {_log_range_command(worker, job_id, start, max_bytes)}; }} | "
+        "{ IFS= read -r header; printf '%s\\n' \"$header\"; base64 -w0; }"
+    )
+    result = await _exec_ssh(
+        worker.id,
+        _ssh_base_args(worker) + [command],
+        lane_timeout=min(10.0, max(1.0, timeout / 3)), cmd_timeout=float(timeout),
+        op_name="ssh_read_log_range",
+    )
+    if result.returncode != 0:
+        return None
+    header, separator, encoded = result.stdout.partition("\n")
+    try:
+        first, end = (int(value) for value in header.split())
+        content = base64.b64decode(encoded.strip(), validate=True)
+    except ValueError:
+        return None
+    if not separator or len(content) != end - first:
+        return None
+    return first, end, content
 
 
 async def ssh_upload_bytes(worker: Worker, content: bytes, remote_path: str, *, timeout: int = 60) -> SSHResult:

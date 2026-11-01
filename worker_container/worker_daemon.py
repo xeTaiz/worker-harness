@@ -16,7 +16,9 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -36,6 +38,7 @@ HARNESS_DIR: Path = WH_DIR / "harness"
 JOB_TMUX_DIR: Path = HARNESS_DIR / "job-tmux"
 WORKER_ID_FILE: Path = WH_DIR / "worker-daemon" / "id"
 WH_PROXY: str = os.environ.get("WH_PROXY", "").strip()
+DAEMON_INSTANCE_ID: str = str(uuid.uuid4())
 def _detect_ssh_user() -> str:
     for key in (
         "SSH_USER",
@@ -89,91 +92,132 @@ IGNORED_GPU_PROCESS_NAMES = {
 }
 
 
-def _gpu_process_usage(command: str) -> tuple[set[str], dict[str, int]]:
-    """Return GPU UUIDs with significant compute and ignored memory by UUID."""
-    try:
-        out = subprocess.check_output(
-            [
-                command,
-                "--query-compute-apps=gpu_uuid,process_name,used_gpu_memory",
-                "--format=csv,noheader,nounits",
-            ],
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        ).decode()
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return set(), {}
+def _required_text(node: ET.Element, path: str) -> str:
+    value = (node.findtext(path) or "").strip()
+    if not value or value.lower() in {
+        "n/a", "[not supported]", "not supported", "unknown",
+        "insufficient permissions", "[insufficient permissions]", "permission denied",
+    }:
+        raise ValueError(f"Missing or unsupported GPU field: {path}")
+    return value
 
-    significant: set[str] = set()
-    ignored_memory: dict[str, int] = {}
-    for line in out.strip().splitlines():
-        if not line:
-            continue
-        parts = [part.strip() for part in line.split(",", 2)]
-        if len(parts) != 3:
-            continue
-        gpu_uuid, process_name, used_mb_text = parts
-        try:
-            used_mb = int(used_mb_text)
-        except ValueError:
-            continue
-        executable = Path(process_name).name.lower()
-        if used_mb < GPU_PROCESS_IGNORE_MB or executable in IGNORED_GPU_PROCESS_NAMES:
-            ignored_memory[gpu_uuid] = ignored_memory.get(gpu_uuid, 0) + used_mb
-        else:
-            significant.add(gpu_uuid)
-    return significant, ignored_memory
+
+def _memory_bytes(node: ET.Element, path: str) -> int:
+    value = _required_text(node, path)
+    amount, unit = value.split()
+    scale = {"KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}[unit]
+    number = int(amount)
+    if number < 0:
+        raise ValueError("Negative GPU memory")
+    return number * scale
+
+
+def _parse_gpu(node: ET.Element) -> dict[str, Any]:
+    """Keep availability thresholds separate from fail-closed idle telemetry."""
+    gpu: dict[str, Any] = {
+        "index": 0, "uuid": "", "name": "", "vram_total_gb": 0.0,
+        "vram_used_gb": 0.0, "busy": None, "utilization_percent": None,
+        "memory_used_bytes": None, "process_count": None,
+        "workload_process_count": None, "workload_memory_bytes": None,
+        "display_only": False, "activity_valid": False,
+    }
+    try:
+        index_path = "index" if node.find("index") is not None else "minor_number"
+        gpu["index"] = int(_required_text(node, index_path))
+        if gpu["index"] < 0:
+            raise ValueError("Negative GPU index")
+        gpu["uuid"] = _required_text(node, "uuid")
+        gpu["name"] = _required_text(node, "product_name")
+        total_bytes = _memory_bytes(node, "fb_memory_usage/total")
+        gpu["vram_total_gb"] = round(total_bytes / 1024**3, 1)
+        used_bytes = _memory_bytes(node, "fb_memory_usage/used")
+        gpu["memory_used_bytes"] = used_bytes
+        gpu["vram_used_gb"] = round(used_bytes / 1024**3, 1)
+
+        # These are the existing availability rules, including the 512 MiB
+        # exception. They do NOT determine workload activity for idle stops.
+        total_mb, used_mb = total_bytes // 1024**2, used_bytes // 1024**2
+        mostly_free_limit_mb = max(
+            GPU_PROCESS_IGNORE_MB,
+            round(total_mb * (1.0 - GPU_MOSTLY_FREE_FRACTION)),
+        )
+        gpu["busy"] = used_mb > mostly_free_limit_mb
+        utilization = _required_text(node, "utilization/gpu_util").split()
+        if len(utilization) != 2 or utilization[1] != "%":
+            raise ValueError("Invalid GPU utilization")
+        percent = float(utilization[0])
+        if not 0 <= percent <= 100:
+            raise ValueError("Invalid GPU utilization")
+        gpu["utilization_percent"] = percent
+
+        # MIG-capable GPUs report Disabled/Enabled; GPUs without MIG support
+        # (e.g. GeForce) report N/A, which is equally whole-GPU telemetry.
+        mig = node.find("mig_mode")
+        if mig is not None and (mig.findtext("current_mig") or "").strip() not in {"Disabled", "N/A"}:
+            raise ValueError("MIG telemetry is not complete physical-GPU telemetry")
+        processes = node.find("processes")
+        if processes is None or (processes.text or "").strip():
+            raise ValueError("Missing or unavailable GPU process inventory")
+        ignored_mb = 0
+        significant = False
+        workload_count = 0
+        workload_bytes = 0
+        entries = list(processes)
+        for process in entries:
+            if process.tag != "process_info":
+                raise ValueError("Unrecognized GPU process inventory")
+            if int(_required_text(process, "pid")) <= 0:
+                raise ValueError("Invalid GPU process PID")
+            executable = Path(_required_text(process, "process_name")).name.lower()
+            process_type = _required_text(process, "type")
+            memory = _memory_bytes(process, "used_memory")
+            memory_mb = memory // 1024**2
+            if memory_mb < GPU_PROCESS_IGNORE_MB or executable in IGNORED_GPU_PROCESS_NAMES:
+                ignored_mb += memory_mb
+            else:
+                significant = True
+            display = process_type == "G" and executable in IGNORED_GPU_PROCESS_NAMES
+            if not display:
+                workload_count += 1
+                workload_bytes += memory
+        gpu["busy"] = significant or max(0, used_mb - ignored_mb) > mostly_free_limit_mb
+        gpu["process_count"] = len(entries)
+        gpu["workload_process_count"] = workload_count
+        gpu["workload_memory_bytes"] = workload_bytes
+        gpu["display_only"] = bool(entries) and workload_count == 0
+        gpu["activity_valid"] = True
+    except (ValueError, KeyError, OverflowError):
+        # Preserve any known capacity fields, but never turn unknown activity
+        # into a successful empty inventory.
+        pass
+    return gpu
 
 
 def get_gpu_info() -> dict[str, Any]:
-    """Collect GPU capacity and workload state via nvidia-smi."""
-    try:
-        # nvidia-smi may not be on PATH; try common locations.
-        for command in ("nvidia-smi", "/usr/bin/nvidia-smi", "/usr/local/nvidia/bin/nvidia-smi"):
-            try:
-                out = subprocess.check_output(
-                    [
-                        command,
-                        "--query-gpu=index,uuid,name,memory.total,memory.used",
-                        "--format=csv,noheader,nounits",
-                    ],
-                    stderr=subprocess.DEVNULL,
-                    timeout=5,
-                ).decode()
-                break
-            except (FileNotFoundError, subprocess.CalledProcessError):
-                continue
-        else:
-            log.debug("nvidia-smi not found in any known location")
-            return {"gpu_count": 0, "gpus": []}
-
-        significant_processes, ignored_memory = _gpu_process_usage(command)
-        gpus = []
-        for line in out.strip().splitlines():
-            if not line:
-                continue
-            idx, gpu_uuid, name, total_mb_text, used_mb_text = line.split(", ", 4)
-            total_mb = int(total_mb_text.strip())
-            used_mb = int(used_mb_text.strip())
-            relevant_used_mb = max(0, used_mb - ignored_memory.get(gpu_uuid.strip(), 0))
-            mostly_free_limit_mb = max(
-                GPU_PROCESS_IGNORE_MB,
-                round(total_mb * (1.0 - GPU_MOSTLY_FREE_FRACTION)),
+    """Collect complete GPU/process XML in one coherent nvidia-smi sample."""
+    for command in ("nvidia-smi", "/usr/bin/nvidia-smi", "/usr/local/nvidia/bin/nvidia-smi"):
+        try:
+            out = subprocess.check_output(
+                [command, "-q", "-x"], stderr=subprocess.DEVNULL, timeout=5,
             )
-            gpus.append({
-                "index": int(idx.strip()),
-                "name": name.strip(),
-                "vram_total_gb": round(total_mb / 1024, 1),
-                "vram_used_gb": round(used_mb / 1024, 1),
-                "busy": (
-                    gpu_uuid.strip() in significant_processes
-                    or relevant_used_mb > mostly_free_limit_mb
-                ),
-            })
-        return {"gpu_count": len(gpus), "gpus": gpus}
-    except Exception as e:
-        log.debug(f"nvidia-smi not available: {e}")
-        return {"gpu_count": 0, "gpus": []}
+            root = ET.fromstring(out)
+            if root.tag != "nvidia_smi_log":
+                raise ValueError("Unexpected nvidia-smi XML")
+            gpus = [_parse_gpu(node) for node in root.findall("gpu")]
+            # Duplicate devices or a truncated inventory cannot establish a
+            # complete assignment, even when the XML itself is well-formed.
+            if (
+                len({gpu["index"] for gpu in gpus}) != len(gpus)
+                or len({gpu["uuid"] for gpu in gpus}) != len(gpus)
+                or int(_required_text(root, "attached_gpus")) != len(gpus)
+            ):
+                for gpu in gpus:
+                    gpu["activity_valid"] = False
+                    gpu["display_only"] = False
+            return {"gpu_count": len(gpus), "gpus": gpus}
+        except (OSError, subprocess.SubprocessError, ET.ParseError, ValueError) as exc:
+            log.debug("GPU telemetry unavailable via %s: %s", command, exc)
+    return {"gpu_count": 0, "gpus": []}
 
 
 def get_tailscale_identity() -> tuple[str, str]:
@@ -340,11 +384,18 @@ def build_payload(
     dns_name: str,
 ) -> dict[str, Any]:
     gpu_info = get_gpu_info()
+    sample_ns = time.monotonic_ns()
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        boot_id = ""
     sys_info = get_system_info()
     return {
         "worker_id": worker_id, "name": WORKER_NAME, "worker_ip": tailscale_ip,
         "dns_name": dns_name, "ssh_user": SSH_USER, "harness_dir": str(HARNESS_DIR),
         "gpu_count": gpu_info.get("gpu_count", 0), "gpus": gpu_info.get("gpus", []),
+        "gpu_sample_id": str(uuid.uuid4()), "gpu_sample_monotonic_ns": sample_ns,
+        "worker_boot_id": boot_id, "daemon_instance_id": DAEMON_INSTANCE_ID,
         "cpu_cores": sys_info.get("cpu_cores", 0), "total_ram_gb": sys_info.get("total_ram_gb", 0.0),
         "used_ram_gb": sys_info.get("used_ram_gb", 0.0), "total_disk_gb": sys_info.get("total_disk_gb", 0.0),
         "used_disk_gb": sys_info.get("used_disk_gb", 0.0), "active_jobs": get_active_jobs(),

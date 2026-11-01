@@ -10,7 +10,10 @@ services:
     env_file:
       - ${WH_TAILNET_ENV_FILE:?set WH_TAILNET_ENV_FILE to the existing private Tailnet environment file}
     environment:
-      WH_OPERATOR_TOKEN_FILE: /run/secrets/wh_operator_token
+      # Exact external browser origin; terminate HTTPS before the web edge.
+      WH_WEB_ORIGIN: ${WH_WEB_ORIGIN:?set WH_WEB_ORIGIN to one exact external HTTPS origin}
+      # Web-edge address(es) whose X-Forwarded-For identifies browsers for login rate limiting.
+      WH_TRUSTED_PROXIES: ${WH_TRUSTED_PROXIES:?set WH_TRUSTED_PROXIES to the web edge IP or private network CIDR}
       WH_MACHINES_PATH: /etc/worker-harness/machines.toml
       WH_PROJECTS_PATH: /opt/agent-orchestrator/projects.toml
       WH_ORCHESTRATOR_REPO: /opt/agent-orchestrator
@@ -24,8 +27,6 @@ services:
       - ${WH_MACHINES_FILE:?set WH_MACHINES_FILE}:/etc/worker-harness/machines.toml:ro
       - ${WH_AGENT_ORCHESTRATOR_DIR:?set WH_AGENT_ORCHESTRATOR_DIR}:/opt/agent-orchestrator:ro
       - ${WH_HERDR_SSH_DIR:?set WH_HERDR_SSH_DIR}:/root/.ssh:ro
-    secrets:
-      - wh_operator_token
     networks:
       wh-internal:
         aliases:
@@ -37,13 +38,10 @@ volumes:
     name: ${WH_TAILSCALE_VOLUME:?set WH_TAILSCALE_VOLUME to the existing volume name}
   registry:
     external: true
-    name: ${WH_REGISTRY_VOLUME:?set WH_REGISTRY_VOLUME to the newly created empty registry volume}
+    name: ${WH_REGISTRY_VOLUME:?set WH_REGISTRY_VOLUME to the preserved registry volume name}
 
 networks:
   wh-internal:
     external: true
     name: ${WH_DOCKER_NETWORK:-wh-internal}
 
-secrets:
-  wh_operator_token:
-    file: ${WH_OPERATOR_TOKEN_FILE:?set WH_OPERATOR_TOKEN_FILE to the private server token file}

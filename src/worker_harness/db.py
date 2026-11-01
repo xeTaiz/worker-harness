@@ -6,15 +6,22 @@ import asyncio
 import aiosqlite
 import json
 import time
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic_ns
+from typing import AsyncIterator
 from uuid import uuid4
 
 from .models import (
+    ExecutionState,
     Failure,
+    GPUInfo,
     Job,
     JobKind,
+    JobPriority,
     JobStatus,
+    MarimoSession,
     PiBridgeEventBatch,
     PiBridgeRegister,
     PiSession,
@@ -23,12 +30,44 @@ from .models import (
     PiSessionState,
     PiSessionType,
     PortForward,
-    MarimoSession,
+    TerminationReason,
     Worker,
     WorkerJobReport,
     WorkerRegistration,
     WorkerStatus,
 )
+from .queue_board import forecast_worker
+from .scheduling import delays
+
+
+@dataclass(frozen=True)
+class AuditActor:
+    """Nonsecret identity recorded on queue audit events."""
+
+    user_id: str
+    display_name: str
+    actor_id: str
+
+
+class QueueConflict(Exception):
+    """Stale or lifecycle-incompatible queue operation (HTTP 409)."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class QueueValidationError(ValueError):
+    """Malformed queue move target (HTTP 422)."""
+
+
+class IdentityConflict(Exception):
+    """Identity state conflict (duplicate username, bootstrap protections)."""
+
+
+class ListenerConflict(Exception):
+    """A forward's orchestrator listener port is already reserved."""
 
 
 class Database:
@@ -42,7 +81,11 @@ class Database:
         # their conditional UPSERTs on this process's single SQLite writer.
         self._worker_job_report_lock = asyncio.Lock()
         self._pi_bridge_lock = asyncio.Lock()
-        self._queue_lock = asyncio.Lock()
+        # Identifies this control process for monotonic GPU sample stamps.
+        self.instance_id = str(uuid4())
+        # Admits this process's scheduling transactions in arrival (FIFO)
+        # order; SQLite's write lock still serializes other connections.
+        self._tx_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self._db = await aiosqlite.connect(str(self.path))
@@ -128,6 +171,17 @@ class Database:
             await self._db.execute("ALTER TABLE workers ADD COLUMN harness_dir TEXT NOT NULL DEFAULT '/harness'")
         if "data_paths" not in colnames:
             await self._db.execute("ALTER TABLE workers ADD COLUMN data_paths TEXT DEFAULT '[]'")
+        for column, declaration in {
+            "gpu_telemetry": "TEXT NOT NULL DEFAULT '[]'",
+            "gpu_sample_id": "TEXT NOT NULL DEFAULT ''",
+            "gpu_sample_monotonic_ns": "INTEGER NOT NULL DEFAULT 0",
+            "worker_boot_id": "TEXT NOT NULL DEFAULT ''",
+            "daemon_instance_id": "TEXT NOT NULL DEFAULT ''",
+            "gpu_sample_received_ns": "INTEGER NOT NULL DEFAULT 0",
+            "gpu_sample_server_instance": "TEXT NOT NULL DEFAULT ''",
+        }.items():
+            if column not in colnames:
+                await self._db.execute(f"ALTER TABLE workers ADD COLUMN {column} {declaration}")
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
@@ -180,12 +234,53 @@ class Database:
             await self._db.execute(
                 "ALTER TABLE jobs ADD COLUMN queue_order INTEGER NOT NULL DEFAULT 0"
             )
+        for column, declaration in {
+            "owner_user_id": "TEXT NOT NULL DEFAULT ''",
+            "submitted_by_actor_id": "TEXT NOT NULL DEFAULT ''",
+            "submitted_at": "INTEGER NOT NULL DEFAULT 0",
+            "submission_sequence": "INTEGER NOT NULL DEFAULT 0",
+            "priority": "TEXT NOT NULL DEFAULT 'normal'",
+            "priority_note": "TEXT NOT NULL DEFAULT ''",
+            "deadline_at": "INTEGER",
+            "termination_reason": "TEXT",
+            "worker_name_at_submission": "TEXT NOT NULL DEFAULT ''",
+            "execution_state": "TEXT NOT NULL DEFAULT 'active'",
+            "stop_requested_at": "INTEGER NOT NULL DEFAULT 0",
+            "stop_reason": "TEXT",
+            "stop_confirmed_at": "INTEGER NOT NULL DEFAULT 0",
+        }.items():
+            if column not in job_cols:
+                await self._db.execute(f"ALTER TABLE jobs ADD COLUMN {column} {declaration}")
+        # Legacy rows get an immutable submission time/sequence in insertion
+        # order and a worker-name snapshot; ownership is assigned at bootstrap.
+        await self._db.execute(
+            "UPDATE jobs SET submitted_at=COALESCE(NULLIF(started_at, 0), unixepoch()) WHERE submitted_at=0"
+        )
+        unsequenced = await self._db.execute_fetchall(
+            "SELECT rowid FROM jobs WHERE submission_sequence=0 ORDER BY rowid"
+        )
+        if unsequenced:
+            base = (await self._db.execute_fetchall(
+                "SELECT COALESCE(MAX(submission_sequence), 0) FROM jobs"
+            ))[0][0]
+            await self._db.executemany(
+                "UPDATE jobs SET submission_sequence=? WHERE rowid=?",
+                [(base + index, row[0]) for index, row in enumerate(unsequenced, 1)],
+            )
+        await self._db.execute("""
+            UPDATE jobs SET worker_name_at_submission=COALESCE(
+                (SELECT name FROM workers WHERE workers.id=jobs.worker_id), ''
+            ) WHERE worker_name_at_submission=''
+        """)
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_jobs_origin_session_id ON jobs(origin_session_id)"
         )
         await self._db.execute(
             """CREATE INDEX IF NOT EXISTS idx_jobs_queue_active
                ON jobs(queue_managed, worker_id, status, queue_order)"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_owner ON jobs(owner_user_id, status)"
         )
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS port_forwards (
@@ -198,6 +293,23 @@ class Database:
                 created_at INTEGER DEFAULT 0
             )
         """)
+        cursor = await self._db.execute("PRAGMA table_info(port_forwards)")
+        forward_cols = {row[1] for row in await cursor.fetchall()}
+        for column, declaration in {
+            "owner_user_id": "TEXT NOT NULL DEFAULT ''",
+            "created_by_actor_id": "TEXT NOT NULL DEFAULT ''",
+            "bind_host": "TEXT NOT NULL DEFAULT ''",
+            "marimo_session_id": "TEXT",
+        }.items():
+            if column not in forward_cols:
+                await self._db.execute(f"ALTER TABLE port_forwards ADD COLUMN {column} {declaration}")
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_port_forwards_owner ON port_forwards(owner_user_id)"
+        )
+        # Listener ports are reserved atomically by the database.
+        await self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_port_forwards_listener ON port_forwards(bind_host, local_port)"
+        )
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS marimo_sessions (
                 id TEXT PRIMARY KEY,
@@ -214,6 +326,18 @@ class Database:
                 created_at INTEGER DEFAULT 0
             )
         """)
+        cursor = await self._db.execute("PRAGMA table_info(marimo_sessions)")
+        marimo_cols = {row[1] for row in await cursor.fetchall()}
+        for column, declaration in {
+            "owner_user_id": "TEXT NOT NULL DEFAULT ''",
+            "created_by_actor_id": "TEXT NOT NULL DEFAULT ''",
+            "upstream_token_path": "TEXT NOT NULL DEFAULT ''",
+        }.items():
+            if column not in marimo_cols:
+                await self._db.execute(f"ALTER TABLE marimo_sessions ADD COLUMN {column} {declaration}")
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_marimo_owner ON marimo_sessions(owner_user_id)"
+        )
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS failures (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -270,6 +394,7 @@ class Database:
             "token_hash": "TEXT DEFAULT ''",
             "question": "TEXT DEFAULT ''",
             "meta": "TEXT DEFAULT '{}'",
+            "owner_user_id": "TEXT NOT NULL DEFAULT ''",
         }.items():
             if column not in pi_session_cols:
                 await self._db.execute(f"ALTER TABLE pi_sessions ADD COLUMN {column} {declaration}")
@@ -348,20 +473,152 @@ class Database:
                  (SELECT id FROM pi_sessions WHERE session_type='delegated')"""
         )
         await self._db.execute("DELETE FROM pi_sessions WHERE session_type='delegated'")
+        await self._init_identity_schema()
+        await self._init_queue_audit_schema()
         await self._db.commit()
+
+    async def _init_identity_schema(self) -> None:
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                disabled INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                label TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                prefix TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER,
+                revoked_at INTEGER
+            )
+        """)
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)")
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS web_sessions (
+                id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                csrf_token TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )
+        """)
+        await self._db.execute("CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions(user_id)")
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS identity_settings (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                bootstrap_user_id TEXT NOT NULL REFERENCES users(id),
+                created_at INTEGER NOT NULL
+            )
+        """)
+
+    async def _init_queue_audit_schema(self) -> None:
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS queue_revisions (
+                worker_id TEXT PRIMARY KEY,
+                revision INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS queue_previews (
+                id TEXT PRIMARY KEY,
+                actor_id TEXT NOT NULL,
+                actor_user_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                before_job_id TEXT,
+                reason TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                before_order TEXT NOT NULL,
+                after_order TEXT NOT NULL,
+                impacts TEXT NOT NULL,
+                committed_event_id INTEGER
+            )
+        """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS queue_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                job_name TEXT NOT NULL,
+                job_owner_user_id TEXT NOT NULL,
+                job_owner_display_name TEXT NOT NULL,
+                actor_user_id TEXT NOT NULL,
+                actor_display_name TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                old_revision INTEGER NOT NULL,
+                new_revision INTEGER NOT NULL,
+                old_order TEXT NOT NULL DEFAULT '[]',
+                new_order TEXT NOT NULL DEFAULT '[]',
+                preview_id TEXT UNIQUE
+            )
+        """)
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_queue_events_worker ON queue_events(worker_id, id)"
+        )
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS queue_event_impacts (
+                event_id INTEGER NOT NULL REFERENCES queue_events(id),
+                job_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL,
+                owner_display_name TEXT NOT NULL,
+                before_position INTEGER,
+                after_position INTEGER,
+                before_start_at INTEGER,
+                after_start_at INTEGER,
+                delay_seconds INTEGER,
+                PRIMARY KEY (event_id, job_id)
+            )
+        """)
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_queue_impacts_job ON queue_event_impacts(job_id, event_id)"
+        )
 
     # ── Workers ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _prediction_inputs(worker: Worker | None) -> tuple:
+        if worker is None:
+            return ()
+        return (worker.status.value, worker.gpu_count, tuple(worker.gpu_busy))
+
     async def upsert_worker(self, reg: WorkerRegistration) -> Worker:
         existing = await self.get_worker(reg.worker_id)
+        before = self._prediction_inputs(existing)
+        previous_sample = existing.gpu_sample_id if existing else ""
         if existing:
-            existing.update_from_registration(reg)
-            await self._update_worker(existing)
-            return existing
+            worker = existing
+            worker.update_from_registration(reg)
         else:
             worker = Worker.from_registration(reg)
-            await self._insert_worker(worker)
-            return worker
+        if worker.gpu_sample_id and worker.gpu_sample_id != previous_sample:
+            # Only a new sample receives a fresh control-process stamp; a
+            # resent sample keeps its original receipt time.
+            worker.gpu_sample_received_ns = monotonic_ns()
+            worker.gpu_sample_server_instance = self.instance_id
+        if existing:
+            await self._write_worker(worker, insert=False)
+        else:
+            await self._write_worker(worker, insert=True)
+        if self._prediction_inputs(worker) != before:
+            await self.bump_queue_revision(worker.id)
+        return worker
 
     async def get_worker(self, worker_id: str) -> Worker | None:
         cursor = await self._db.execute(
@@ -377,11 +634,17 @@ class Database:
         return [self._row_to_worker(r) for r in rows]
 
     async def mark_workers_offline(self, cutoff_ts: int) -> int:
+        rows = await self._db.execute_fetchall(
+            "SELECT id FROM workers WHERE last_heartbeat_ts < ? AND status != ?",
+            (cutoff_ts, WorkerStatus.OFFLINE.value),
+        )
         cursor = await self._db.execute(
             "UPDATE workers SET status = ? WHERE last_heartbeat_ts < ? AND status != ?",
             (WorkerStatus.OFFLINE.value, cutoff_ts, WorkerStatus.OFFLINE.value),
         )
         await self._db.commit()
+        for row in rows:
+            await self.bump_queue_revision(row["id"])
         return cursor.rowcount
 
     async def set_worker_status(self, worker_id: str, status: WorkerStatus) -> None:
@@ -390,43 +653,39 @@ class Database:
             (status.value, worker_id),
         )
         await self._db.commit()
+        await self.bump_queue_revision(worker_id)
 
-    async def _insert_worker(self, w: Worker) -> None:
-        await self._db.execute(
-            """INSERT INTO workers
-               (id, name, worker_ip, dns_name, ssh_user, harness_dir, gpu_count, gpu_names, gpu_vram_gb,
-                gpu_used_vram_gb, gpu_busy, cpu_cores, total_ram_gb, used_ram_gb, total_disk_gb,
-                used_disk_gb, data_paths, status, last_heartbeat_ts, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                w.id, w.name, w.worker_ip, w.dns_name, w.ssh_user, w.harness_dir, w.gpu_count,
-                json.dumps(w.gpu_names), json.dumps(w.gpu_vram_gb),
-                json.dumps(w.gpu_used_vram_gb),
-                json.dumps(w.gpu_busy),
-                w.cpu_cores, w.total_ram_gb, w.used_ram_gb,
-                w.total_disk_gb, w.used_disk_gb, json.dumps(w.data_paths),
-                w.status.value, w.last_heartbeat_ts, w.created_at,
-            ),
-        )
-        await self._db.commit()
+    _WORKER_COLUMNS = (
+        "name", "worker_ip", "dns_name", "ssh_user", "harness_dir", "gpu_count", "gpu_names",
+        "gpu_vram_gb", "gpu_used_vram_gb", "gpu_busy", "cpu_cores", "total_ram_gb",
+        "used_ram_gb", "total_disk_gb", "used_disk_gb", "data_paths", "status",
+        "last_heartbeat_ts", "gpu_telemetry", "gpu_sample_id", "gpu_sample_monotonic_ns",
+        "worker_boot_id", "daemon_instance_id", "gpu_sample_received_ns",
+        "gpu_sample_server_instance",
+    )
 
-    async def _update_worker(self, w: Worker) -> None:
-        await self._db.execute(
-            """UPDATE workers SET
-               name=?, worker_ip=?, dns_name=?, ssh_user=?, harness_dir=?, gpu_count=?, gpu_names=?,
-               gpu_vram_gb=?, gpu_used_vram_gb=?, gpu_busy=?, cpu_cores=?, total_ram_gb=?,
-               used_ram_gb=?, total_disk_gb=?, used_disk_gb=?, data_paths=?,
-               status=?, last_heartbeat_ts=? WHERE id=?""",
-            (
-                w.name, w.worker_ip, w.dns_name, w.ssh_user, w.harness_dir, w.gpu_count,
-                json.dumps(w.gpu_names), json.dumps(w.gpu_vram_gb),
-                json.dumps(w.gpu_used_vram_gb),
-                json.dumps(w.gpu_busy),
-                w.cpu_cores, w.total_ram_gb, w.used_ram_gb,
-                w.total_disk_gb, w.used_disk_gb, json.dumps(w.data_paths),
-                w.status.value, w.last_heartbeat_ts, w.id,
-            ),
+    async def _write_worker(self, w: Worker, *, insert: bool) -> None:
+        values = (
+            w.name, w.worker_ip, w.dns_name, w.ssh_user, w.harness_dir, w.gpu_count,
+            json.dumps(w.gpu_names), json.dumps(w.gpu_vram_gb), json.dumps(w.gpu_used_vram_gb),
+            json.dumps(w.gpu_busy), w.cpu_cores, w.total_ram_gb, w.used_ram_gb,
+            w.total_disk_gb, w.used_disk_gb, json.dumps(w.data_paths), w.status.value,
+            w.last_heartbeat_ts,
+            json.dumps([gpu.model_dump(mode="json") for gpu in w.gpu_telemetry]),
+            w.gpu_sample_id, w.gpu_sample_monotonic_ns, w.worker_boot_id,
+            w.daemon_instance_id, w.gpu_sample_received_ns, w.gpu_sample_server_instance,
         )
+        if insert:
+            columns = ("id", *self._WORKER_COLUMNS, "created_at")
+            await self._db.execute(
+                f"INSERT INTO workers ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+                (w.id, *values, w.created_at),
+            )
+        else:
+            assignments = ", ".join(f"{column}=?" for column in self._WORKER_COLUMNS)
+            await self._db.execute(
+                f"UPDATE workers SET {assignments} WHERE id=?", (*values, w.id),
+            )
         await self._db.commit()
 
     def _row_to_worker(self, row: aiosqlite.Row) -> Worker:
@@ -451,6 +710,13 @@ class Database:
             status=WorkerStatus(row["status"]),
             last_heartbeat_ts=row["last_heartbeat_ts"],
             created_at=row["created_at"],
+            gpu_telemetry=[GPUInfo(**item) for item in json.loads(row["gpu_telemetry"] or "[]")],
+            gpu_sample_id=row["gpu_sample_id"],
+            gpu_sample_monotonic_ns=row["gpu_sample_monotonic_ns"],
+            worker_boot_id=row["worker_boot_id"],
+            daemon_instance_id=row["daemon_instance_id"],
+            gpu_sample_received_ns=row["gpu_sample_received_ns"],
+            gpu_sample_server_instance=row["gpu_sample_server_instance"],
         )
 
     # ── Pi sessions ──────────────────────────────────────────────────
@@ -484,16 +750,19 @@ class Database:
             ),
             last_seen=row["last_seen"] if "last_seen" in row.keys() else 0,
             created_at=row["created_at"], updated_at=row["updated_at"],
+            owner_user_id=row["owner_user_id"] if "owner_user_id" in row.keys() else "",
         )
 
     async def insert_pi_session(self, session: PiSession) -> None:
+        if not session.owner_user_id:
+            raise ValueError("Pi session requires a verified owner_user_id")
         await self._db.execute(
             """INSERT INTO pi_sessions
                (id, worker_id, parent_session_id, session_type, state, task, cwd, tmux_session, detail,
                 role, token_hash, question, meta, name, host, agent, bridge_incarnation,
                 terminal_attachable, terminal_host, terminal_port, terminal_protocol_version,
-                has_pending_messages, last_seen, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                has_pending_messages, last_seen, created_at, updated_at, owner_user_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session.id, session.worker_id, session.parent_session_id, session.session_type.value,
                 session.state.value, session.task, session.cwd, session.tmux_session, session.detail,
@@ -501,7 +770,7 @@ class Database:
                 session.name, session.host, session.agent, session.bridge_incarnation,
                 int(session.terminal_attachable), session.terminal_host, session.terminal_port,
                 session.terminal_protocol_version, int(session.has_pending_messages),
-                session.last_seen, session.created_at, session.updated_at,
+                session.last_seen, session.created_at, session.updated_at, session.owner_user_id,
             ),
         )
         await self._db.commit()
@@ -618,20 +887,31 @@ class Database:
             rows = await self._db.execute_fetchall("SELECT * FROM pi_sessions ORDER BY updated_at DESC")
         return [self._row_to_pi_session(row) for row in rows]
 
-    async def register_interactive_pi_session(self, payload: PiBridgeRegister, now: int | None = None) -> PiSession:
-        """Create or replace one plain-Pi bridge incarnation."""
+    async def register_interactive_pi_session(
+        self, payload: PiBridgeRegister, *, owner_user_id: str, now: int | None = None,
+    ) -> PiSession:
+        """Create or replace one plain-Pi bridge incarnation.
+
+        ``owner_user_id`` comes from the verified caller; an existing row's
+        owner is immutable and a mismatching registration is refused.
+        """
+        if not owner_user_id:
+            raise ValueError("bridge registration requires a verified owner")
         now = now if now is not None else int(time.time())
         async with self._pi_bridge_lock:
             existing = await self.get_pi_session(payload.session_id)
             if existing and not existing.session_type.bridge_backed:
                 raise ValueError("session id does not belong to a bridge-backed session")
+            if existing and existing.owner_user_id and existing.owner_user_id != owner_user_id:
+                raise PermissionError("bridge registration cannot change the session owner")
             created_at = existing.created_at if existing else now
             await self._db.execute(
                 """INSERT INTO pi_sessions
                    (id, worker_id, parent_session_id, session_type, state, task, cwd, tmux_session,
                     detail, name, host, agent, bridge_incarnation, terminal_attachable, terminal_host,
-                    terminal_port, terminal_protocol_version, has_pending_messages, last_seen, created_at, updated_at)
-                   VALUES (?, NULL, NULL, ?, ?, '', ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    terminal_port, terminal_protocol_version, has_pending_messages, last_seen, created_at, updated_at,
+                    owner_user_id)
+                   VALUES (?, NULL, NULL, ?, ?, '', ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                      state=CASE
                          WHEN pi_sessions.state='blocked' THEN pi_sessions.state
@@ -659,6 +939,7 @@ class Database:
                     payload.cwd, payload.name, payload.host, payload.agent, payload.incarnation,
                     int(payload.terminal_attachable), payload.terminal_host, payload.terminal_port,
                     payload.terminal_protocol_version, int(payload.has_pending_messages), now, created_at, now,
+                    owner_user_id,
                 ),
             )
             if payload.resume_path:
@@ -944,44 +1225,110 @@ class Database:
         ]
 
 
+    # ── Scheduling transactions ───────────────────────────────────────
+
+    @asynccontextmanager
+    async def scheduling_tx(self) -> AsyncIterator[aiosqlite.Connection]:
+        """One short-lived connection holding BEGIN IMMEDIATE for snapshot+write.
+
+        Every update of scheduling-relevant job fields goes through here so
+        reads and conditional writes are atomic across connections/processes.
+        No SSH or other network I/O may happen inside the transaction.
+        Within one process transactions are admitted in arrival order, so
+        concurrent submissions keep their request order.
+        """
+        async with self._tx_lock:
+            conn = await aiosqlite.connect(str(self.path), isolation_level=None)
+            conn.row_factory = aiosqlite.Row
+            try:
+                await conn.execute("PRAGMA busy_timeout=5000")
+                await conn.execute("BEGIN IMMEDIATE")
+                try:
+                    yield conn
+                except BaseException:
+                    await conn.execute("ROLLBACK")
+                    raise
+                await conn.execute("COMMIT")
+            finally:
+                await conn.close()
+
+    @staticmethod
+    async def _revision_tx(conn: aiosqlite.Connection, worker_id: str) -> int:
+        row = await (await conn.execute(
+            "SELECT revision FROM queue_revisions WHERE worker_id=?", (worker_id,),
+        )).fetchone()
+        return int(row[0]) if row else 0
+
+    @staticmethod
+    async def _bump_revision_tx(conn: aiosqlite.Connection, worker_id: str) -> int:
+        cursor = await conn.execute(
+            """INSERT INTO queue_revisions (worker_id, revision) VALUES (?, 1)
+               ON CONFLICT(worker_id) DO UPDATE SET revision=revision+1
+               RETURNING revision""",
+            (worker_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return int(row[0])
+
+    async def bump_queue_revision(self, worker_id: str) -> int:
+        async with self.scheduling_tx() as conn:
+            return await self._bump_revision_tx(conn, worker_id)
+
+    async def queue_revisions(self) -> dict[str, int]:
+        rows = await self._db.execute_fetchall("SELECT worker_id, revision FROM queue_revisions")
+        return {row["worker_id"]: int(row["revision"]) for row in rows}
+
     # ── Jobs ──────────────────────────────────────────────────────────
 
-    async def insert_job(self, job: Job) -> None:
-        await self._db.execute(
-            """INSERT INTO jobs
-               (id, worker_id, name, tmux_session, command, status, queue_managed,
-                exit_code, pty_enabled, kind, origin_session_id, report_revision,
-                expected_seconds, gpu_count, gpu_indices, queue_order, started_at, finished_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                job.id, job.worker_id, job.name, job.tmux_session, job.command,
-                job.status.value, int(job.queue_managed), job.exit_code,
-                int(job.pty_enabled), job.kind.value, job.origin_session_id,
-                job.report_revision, job.expected_seconds, job.gpu_count,
-                json.dumps(job.gpu_indices), job.queue_order, job.started_at,
-                job.finished_at,
-            ),
-        )
-        await self._db.commit()
+    _JOB_COLUMNS = (
+        "id", "worker_id", "name", "tmux_session", "command", "status", "queue_managed",
+        "exit_code", "pty_enabled", "kind", "origin_session_id", "report_revision",
+        "expected_seconds", "gpu_count", "gpu_indices", "queue_order", "started_at",
+        "finished_at", "owner_user_id", "submitted_by_actor_id", "submitted_at",
+        "submission_sequence", "priority", "priority_note", "deadline_at",
+        "termination_reason", "worker_name_at_submission", "execution_state",
+        "stop_requested_at", "stop_reason", "stop_confirmed_at",
+    )
 
-    async def update_job(self, job: Job) -> None:
-        await self._db.execute(
-            """UPDATE jobs
-               SET worker_id=?, name=?, tmux_session=?, command=?, status=?,
-                   queue_managed=?, exit_code=?, pty_enabled=?, kind=?,
-                   origin_session_id=?, report_revision=?, expected_seconds=?,
-                   gpu_count=?, gpu_indices=?, queue_order=?, started_at=?, finished_at=?
-               WHERE id=?""",
-            (
-                job.worker_id, job.name, job.tmux_session, job.command,
-                job.status.value, int(job.queue_managed), job.exit_code,
-                int(job.pty_enabled), job.kind.value, job.origin_session_id,
-                job.report_revision, job.expected_seconds, job.gpu_count,
-                json.dumps(job.gpu_indices), job.queue_order, job.started_at,
-                job.finished_at, job.id,
-            ),
+    @staticmethod
+    def _job_values(job: Job) -> tuple:
+        return (
+            job.id, job.worker_id, job.name, job.tmux_session, job.command, job.status.value,
+            int(job.queue_managed), job.exit_code, int(job.pty_enabled), job.kind.value,
+            job.origin_session_id, job.report_revision, job.expected_seconds, job.gpu_count,
+            json.dumps(job.gpu_indices), job.queue_order, job.started_at, job.finished_at,
+            job.owner_user_id, job.submitted_by_actor_id, job.submitted_at,
+            job.submission_sequence, job.priority.value, job.priority_note, job.deadline_at,
+            job.termination_reason.value if job.termination_reason else None,
+            job.worker_name_at_submission, job.execution_state.value, job.stop_requested_at,
+            job.stop_reason.value if job.stop_reason else None, job.stop_confirmed_at,
         )
-        await self._db.commit()
+
+    async def _insert_new_job_tx(self, conn: aiosqlite.Connection, job: Job) -> Job:
+        if not job.owner_user_id or not job.submitted_by_actor_id:
+            raise ValueError("job requires owner_user_id and submitted_by_actor_id")
+        job.submitted_at = job.submitted_at or int(time.time())
+        row = await (await conn.execute(
+            "SELECT COALESCE(MAX(submission_sequence), 0) + 1 FROM jobs",
+        )).fetchone()
+        job.submission_sequence = int(row[0])
+        if job.worker_id and not job.worker_name_at_submission:
+            worker_row = await (await conn.execute(
+                "SELECT name FROM workers WHERE id=?", (job.worker_id,),
+            )).fetchone()
+            job.worker_name_at_submission = worker_row["name"] if worker_row else ""
+        await conn.execute(
+            f"INSERT INTO jobs ({', '.join(self._JOB_COLUMNS)}) "
+            f"VALUES ({', '.join('?' for _ in self._JOB_COLUMNS)})",
+            self._job_values(job),
+        )
+        return job
+
+    async def insert_job(self, job: Job) -> Job:
+        """Persist an immediately launched (CPU/setup) job before its launch."""
+        async with self.scheduling_tx() as conn:
+            return await self._insert_new_job_tx(conn, job)
 
     async def get_job(self, job_id: str) -> Job | None:
         cursor = await self._db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
@@ -995,6 +1342,7 @@ class Database:
         worker_id: str | None = None,
         status: JobStatus | None = None,
         origin_session_id: str | None = None,
+        owner_user_id: str | None = None,
     ) -> list[Job]:
         query = "SELECT * FROM jobs WHERE 1=1"
         params: list = []
@@ -1007,37 +1355,28 @@ class Database:
         if origin_session_id:
             query += " AND origin_session_id = ?"
             params.append(origin_session_id)
-        query += " ORDER BY started_at DESC"
+        if owner_user_id is not None:
+            query += " AND owner_user_id = ?"
+            params.append(owner_user_id)
+        query += " ORDER BY submission_sequence DESC"
         rows = await self._db.execute_fetchall(query, params)
         return [self._row_to_job(r) for r in rows]
+
     async def insert_queued_job(self, job: Job) -> Job:
-        async with self._queue_lock:
-            cursor = await self._db.execute(
-                """SELECT COALESCE(MAX(queue_order), 0)
-                   FROM jobs
+        async with self.scheduling_tx() as conn:
+            row = await (await conn.execute(
+                """SELECT COALESCE(MAX(queue_order), 0) FROM jobs
                    WHERE queue_managed = 1 AND worker_id = ? AND status IN (?, ?, ?)""",
                 (job.worker_id, JobStatus.PENDING.value, JobStatus.STARTING.value, JobStatus.RUNNING.value),
-            )
+            )).fetchone()
             job.queue_managed = True
             job.status = JobStatus.PENDING
             job.gpu_indices = []
-            job.queue_order = (await cursor.fetchone())[0] + 1
+            job.queue_order = int(row[0]) + 1
             job.started_at = 0
             job.finished_at = 0
-            await self._db.execute(
-                """INSERT INTO jobs
-                   (id, worker_id, name, tmux_session, command, status, queue_managed,
-                    exit_code, pty_enabled, kind, origin_session_id, report_revision,
-                    expected_seconds, gpu_count, gpu_indices, queue_order, started_at, finished_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    job.id, job.worker_id, job.name, job.tmux_session, job.command,
-                    job.status.value, 1, job.exit_code, int(job.pty_enabled),
-                    job.kind.value, job.origin_session_id, job.report_revision,
-                    job.expected_seconds, job.gpu_count, "[]", job.queue_order, 0, 0,
-                ),
-            )
-            await self._db.commit()
+            await self._insert_new_job_tx(conn, job)
+            await self._bump_revision_tx(conn, job.worker_id or "")
             return job
 
     async def list_queued_jobs(self, worker_id: str | None = None) -> list[Job]:
@@ -1068,6 +1407,24 @@ class Database:
         rows = await self._db.execute_fetchall(query, params)
         return [self._row_to_job(row) for row in rows]
 
+    async def list_active_cpu_jobs(self, worker_id: str | None = None) -> list[Job]:
+        query = """SELECT * FROM jobs WHERE queue_managed = 0 AND kind = ?
+                   AND status IN (?, ?)"""
+        params: list[object] = [JobKind.SSH.value, JobStatus.STARTING.value, JobStatus.RUNNING.value]
+        if worker_id is not None:
+            query += " AND worker_id = ?"
+            params.append(worker_id)
+        query += " ORDER BY worker_id, started_at, submission_sequence"
+        rows = await self._db.execute_fetchall(query, params)
+        return [self._row_to_job(row) for row in rows]
+
+    async def list_active_jobs(self) -> list[Job]:
+        rows = await self._db.execute_fetchall(
+            "SELECT * FROM jobs WHERE kind = ? AND status IN (?, ?) ORDER BY started_at",
+            (JobKind.SSH.value, JobStatus.STARTING.value, JobStatus.RUNNING.value),
+        )
+        return [self._row_to_job(row) for row in rows]
+
     async def claim_queued_job(
         self,
         job_id: str,
@@ -1076,8 +1433,8 @@ class Database:
         *,
         worker_id: str,
     ) -> Job | None:
-        async with self._queue_lock:
-            cursor = await self._db.execute(
+        async with self.scheduling_tx() as conn:
+            cursor = await conn.execute(
                 """UPDATE jobs
                    SET status = ?, gpu_indices = ?, started_at = ?
                    WHERE id = ? AND queue_managed = 1 AND status = ?
@@ -1094,164 +1451,211 @@ class Database:
                          AND assigned.value IN (SELECT value FROM json_each(?))
                      )""",
                 (
-                    JobStatus.STARTING.value,
-                    json.dumps(gpu_indices),
-                    started_at,
-                    job_id,
-                    JobStatus.PENDING.value,
-                    worker_id,
-                    len(gpu_indices),
-                    worker_id,
-                    JobStatus.PENDING.value,
-                    worker_id,
-                    JobStatus.STARTING.value,
-                    JobStatus.RUNNING.value,
+                    JobStatus.STARTING.value, json.dumps(gpu_indices), started_at,
+                    job_id, JobStatus.PENDING.value, worker_id, len(gpu_indices),
+                    worker_id, JobStatus.PENDING.value,
+                    worker_id, JobStatus.STARTING.value, JobStatus.RUNNING.value,
                     json.dumps(gpu_indices),
                 ),
             )
             if not cursor.rowcount:
-                await self._db.rollback()
                 return None
-            await self._db.commit()
-            return await self.get_job(job_id)
+            await self._bump_revision_tx(conn, worker_id)
+        return await self.get_job(job_id)
 
-    async def update_pending_job(
+    async def _transition_tx(
+        self,
+        conn: aiosqlite.Connection,
+        job_id: str,
+        assignments: str,
+        params: tuple,
+        *,
+        expected_statuses: tuple[JobStatus, ...],
+        extra_condition: str = "",
+    ) -> aiosqlite.Row | None:
+        """Conditionally update one job; return the prior row when applied."""
+        row = await (await conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,))).fetchone()
+        if row is None or row["status"] not in {status.value for status in expected_statuses}:
+            return None
+        placeholders = ", ".join("?" for _ in expected_statuses)
+        cursor = await conn.execute(
+            f"UPDATE jobs SET {assignments} WHERE id=? AND status IN ({placeholders}) {extra_condition}",
+            (*params, job_id, *(status.value for status in expected_statuses)),
+        )
+        if not cursor.rowcount:
+            return None
+        if row["queue_managed"]:
+            await self._bump_revision_tx(conn, row["worker_id"])
+        return row
+
+    async def mark_job_running(self, job_id: str) -> Job | None:
+        async with self.scheduling_tx() as conn:
+            applied = await self._transition_tx(
+                conn, job_id, "status=?", (JobStatus.RUNNING.value,),
+                expected_statuses=(JobStatus.STARTING,),
+            )
+        return await self.get_job(job_id) if applied else None
+
+    async def fail_job_launch(self, job_id: str, *, finished_at: int) -> Job | None:
+        async with self.scheduling_tx() as conn:
+            applied = await self._transition_tx(
+                conn, job_id, "status=?, exit_code=-1, finished_at=?",
+                (JobStatus.FAILED.value, finished_at),
+                expected_statuses=(JobStatus.STARTING,),
+            )
+        return await self.get_job(job_id) if applied else None
+
+    async def reconcile_starting_job(
         self,
         job_id: str,
         *,
-        worker_id: str | None,
-        position: int | None,
-        name: str | None,
-        expected_seconds: int | None,
-        gpu_count: int | None,
-    ) -> Job:
-        async with self._queue_lock:
-            row = await (
-                await self._db.execute(
-                    "SELECT * FROM jobs WHERE id = ? AND queue_managed = 1",
-                    (job_id,),
-                )
-            ).fetchone()
+        launch_observed: bool,
+    ) -> Job | None:
+        async with self.scheduling_tx() as conn:
+            row = await (await conn.execute(
+                "SELECT worker_id, queue_managed FROM jobs WHERE id = ? AND status = ?",
+                (job_id, JobStatus.STARTING.value),
+            )).fetchone()
             if row is None:
-                raise KeyError(job_id)
-            if row["status"] != JobStatus.PENDING.value:
-                raise ValueError("queued job is not pending")
-
-            source_worker_id = row["worker_id"]
-            destination_worker_id = worker_id if worker_id is not None else source_worker_id
-            destination_worker = await self.get_worker(destination_worker_id)
-            requested_gpu_count = gpu_count if gpu_count is not None else row["gpu_count"]
-            if destination_worker is None:
-                raise ValueError("destination worker no longer exists")
-            if requested_gpu_count > destination_worker.gpu_count:
-                raise ValueError("gpu_count exceeds destination worker capacity")
-            source_rows = await self._db.execute_fetchall(
-                """SELECT id FROM jobs
-                   WHERE queue_managed = 1 AND worker_id = ? AND status = ? AND id != ?
-                   ORDER BY queue_order, id""",
-                (source_worker_id, JobStatus.PENDING.value, job_id),
-            )
-            source_ids = [item["id"] for item in source_rows]
-
-            if destination_worker_id == source_worker_id:
-                destination_ids = source_ids
-                if position is None:
-                    original_rows = await self._db.execute_fetchall(
-                        """SELECT id FROM jobs
-                           WHERE queue_managed = 1 AND worker_id = ? AND status = ?
-                           ORDER BY queue_order, id""",
-                        (source_worker_id, JobStatus.PENDING.value),
-                    )
-                    insertion_index = next(
-                        index for index, item in enumerate(original_rows) if item["id"] == job_id
-                    )
-                else:
-                    insertion_index = min(position - 1, len(destination_ids))
-                destination_ids.insert(insertion_index, job_id)
-            else:
-                destination_rows = await self._db.execute_fetchall(
-                    """SELECT id FROM jobs
-                       WHERE queue_managed = 1 AND worker_id = ? AND status = ?
-                       ORDER BY queue_order, id""",
-                    (destination_worker_id, JobStatus.PENDING.value),
+                return None
+            if launch_observed:
+                cursor = await conn.execute(
+                    "UPDATE jobs SET status = ? WHERE id = ? AND status = ?",
+                    (JobStatus.RUNNING.value, job_id, JobStatus.STARTING.value),
                 )
-                destination_ids = [item["id"] for item in destination_rows]
-                insertion_index = (
-                    len(destination_ids)
-                    if position is None
-                    else min(position - 1, len(destination_ids))
+            elif row["queue_managed"]:
+                # A launch never observed returns to the head of its queue.
+                await conn.execute(
+                    """UPDATE jobs SET queue_order = queue_order + 1
+                       WHERE queue_managed = 1 AND worker_id = ? AND status = ?""",
+                    (row["worker_id"], JobStatus.PENDING.value),
                 )
-                destination_ids.insert(insertion_index, job_id)
-
-            cursor = await self._db.execute(
-                """UPDATE jobs
-                   SET worker_id = ?, name = ?, expected_seconds = ?, gpu_count = ?
-                   WHERE id = ? AND queue_managed = 1 AND status = ?""",
-                (
-                    destination_worker_id,
-                    name if name is not None else row["name"],
-                    expected_seconds if expected_seconds is not None else row["expected_seconds"],
-                    gpu_count if gpu_count is not None else row["gpu_count"],
-                    job_id,
-                    JobStatus.PENDING.value,
-                ),
-            )
-            if not cursor.rowcount:
-                await self._db.rollback()
-                raise ValueError("queued job is not pending")
-
-            if destination_worker_id != source_worker_id:
-                await self._db.executemany(
-                    "UPDATE jobs SET queue_order = ? WHERE id = ?",
-                    [(index, queued_id) for index, queued_id in enumerate(source_ids, 1)],
-                )
-            await self._db.executemany(
-                "UPDATE jobs SET queue_order = ? WHERE id = ?",
-                [(index, queued_id) for index, queued_id in enumerate(destination_ids, 1)],
-            )
-            await self._db.commit()
-            updated = await self.get_job(job_id)
-            if updated is None:
-                raise RuntimeError("queued job disappeared after update")
-            return updated
-
-    async def fail_pending_job(self, job_id: str, finished_at: int) -> Job | None:
-        async with self._queue_lock:
-            row = await (
-                await self._db.execute(
-                    """SELECT worker_id FROM jobs
+                cursor = await conn.execute(
+                    """UPDATE jobs
+                       SET status = ?, gpu_indices = '[]', started_at = 0, queue_order = 1
                        WHERE id = ? AND queue_managed = 1 AND status = ?""",
-                    (job_id, JobStatus.PENDING.value),
+                    (JobStatus.PENDING.value, job_id, JobStatus.STARTING.value),
                 )
-            ).fetchone()
+            else:
+                cursor = await conn.execute(
+                    """UPDATE jobs SET status = ?, exit_code = -1, finished_at = unixepoch()
+                       WHERE id = ? AND status = ?""",
+                    (JobStatus.FAILED.value, job_id, JobStatus.STARTING.value),
+                )
+            if not cursor.rowcount:
+                return None
+            if row["queue_managed"]:
+                await self._bump_revision_tx(conn, row["worker_id"])
+        return await self.get_job(job_id)
+
+    async def _renumber_pending_tx(self, conn: aiosqlite.Connection, worker_id: str) -> list[str]:
+        ids = await self._pending_order_tx(conn, worker_id)
+        await conn.executemany(
+            "UPDATE jobs SET queue_order = ? WHERE id = ?",
+            [(index, job_id) for index, job_id in enumerate(ids, 1)],
+        )
+        return ids
+
+    async def cancel_pending_job(
+        self, job_id: str, *, reason: TerminationReason, finished_at: int,
+    ) -> Job | None:
+        async with self.scheduling_tx() as conn:
+            row = await (await conn.execute(
+                "SELECT worker_id FROM jobs WHERE id = ? AND queue_managed = 1 AND status = ?",
+                (job_id, JobStatus.PENDING.value),
+            )).fetchone()
             if row is None:
                 return None
-            cursor = await self._db.execute(
-                """UPDATE jobs
-                   SET status = ?, exit_code = -1, finished_at = ?, queue_order = 0
-                   WHERE id = ? AND queue_managed = 1 AND status = ?""",
+            await conn.execute(
+                """UPDATE jobs SET status = ?, exit_code = -1, finished_at = ?, queue_order = 0,
+                   termination_reason = ? WHERE id = ? AND status = ?""",
+                (JobStatus.FAILED.value, finished_at, reason.value, job_id, JobStatus.PENDING.value),
+            )
+            await self._renumber_pending_tx(conn, row["worker_id"])
+            await self._bump_revision_tx(conn, row["worker_id"])
+        return await self.get_job(job_id)
+
+    async def cancel_pending_jobs_for_user(self, user_id: str, *, finished_at: int) -> list[str]:
+        async with self.scheduling_tx() as conn:
+            rows = await conn.execute_fetchall(
+                "SELECT id, worker_id FROM jobs WHERE owner_user_id = ? AND status = ?",
+                (user_id, JobStatus.PENDING.value),
+            )
+            if not rows:
+                return []
+            await conn.execute(
+                """UPDATE jobs SET status = ?, exit_code = -1, finished_at = ?, queue_order = 0,
+                   termination_reason = ? WHERE owner_user_id = ? AND status = ?""",
                 (
-                    JobStatus.FAILED.value,
-                    finished_at,
-                    job_id,
-                    JobStatus.PENDING.value,
+                    JobStatus.FAILED.value, finished_at, TerminationReason.USER_DISABLED.value,
+                    user_id, JobStatus.PENDING.value,
                 ),
             )
-            if not cursor.rowcount:
-                await self._db.rollback()
-                return None
-            pending = await self._db.execute_fetchall(
-                """SELECT id FROM jobs
-                   WHERE queue_managed = 1 AND worker_id = ? AND status = ?
-                   ORDER BY queue_order, id""",
-                (row["worker_id"], JobStatus.PENDING.value),
+            for worker_id in sorted({row["worker_id"] for row in rows if row["worker_id"]}):
+                await self._renumber_pending_tx(conn, worker_id)
+                await self._bump_revision_tx(conn, worker_id)
+            return [row["id"] for row in rows]
+
+    async def request_job_stop(
+        self, job_id: str, *, reason: TerminationReason, now: int,
+    ) -> Job | None:
+        """Durably record a stop request before contacting the runner.
+
+        The first request's reason wins; repeated requests are idempotent.
+        """
+        async with self.scheduling_tx() as conn:
+            await self._transition_tx(
+                conn, job_id,
+                "stop_requested_at=?, stop_reason=?, execution_state=?",
+                (now, reason.value, ExecutionState.STOPPING.value),
+                expected_statuses=(JobStatus.STARTING, JobStatus.RUNNING),
+                extra_condition="AND stop_requested_at = 0",
             )
-            await self._db.executemany(
-                "UPDATE jobs SET queue_order = ? WHERE id = ?",
-                [(index, item["id"]) for index, item in enumerate(pending, 1)],
+        return await self.get_job(job_id)
+
+    async def mark_termination_unknown(self, job_id: str) -> Job | None:
+        async with self.scheduling_tx() as conn:
+            await self._transition_tx(
+                conn, job_id, "execution_state=?", (ExecutionState.TERMINATION_UNKNOWN.value,),
+                expected_statuses=(JobStatus.STARTING, JobStatus.RUNNING),
+                extra_condition="AND execution_state != 'termination_unknown'",
             )
-            await self._db.commit()
-            return await self.get_job(job_id)
+        return await self.get_job(job_id)
+
+    async def record_stop_confirmed(self, job_id: str, *, exit_code: int, confirmed_at: int) -> Job | None:
+        """Persist a confirmed runner result while the allocation stays held."""
+        async with self.scheduling_tx() as conn:
+            await conn.execute(
+                """UPDATE jobs SET stop_confirmed_at = ?, exit_code = ?
+                   WHERE id = ? AND status IN (?, ?) AND stop_confirmed_at = 0""",
+                (confirmed_at, exit_code, job_id, JobStatus.STARTING.value, JobStatus.RUNNING.value),
+            )
+        return await self.get_job(job_id)
+
+    async def finish_job(
+        self,
+        job_id: str,
+        *,
+        exit_code: int,
+        termination_reason: TerminationReason | None,
+        finished_at: int,
+    ) -> Job | None:
+        """Atomically record confirmed termination and release the allocation."""
+        status = (
+            JobStatus.FAILED if termination_reason is not None or exit_code != 0 else JobStatus.DONE
+        )
+        async with self.scheduling_tx() as conn:
+            applied = await self._transition_tx(
+                conn, job_id,
+                "status=?, exit_code=?, finished_at=?, termination_reason=?, execution_state=?",
+                (
+                    status.value, exit_code, finished_at,
+                    termination_reason.value if termination_reason else None,
+                    ExecutionState.ACTIVE.value,
+                ),
+                expected_statuses=(JobStatus.STARTING, JobStatus.RUNNING),
+            )
+        return await self.get_job(job_id) if applied else None
 
     async def running_queue_gpu_indices(self, worker_id: str) -> set[int]:
         rows = await self._db.execute_fetchall(
@@ -1265,68 +1669,517 @@ class Database:
             for index in json.loads(row["gpu_indices"])
         }
 
-    async def reconcile_starting_job(
+    # ── Owner metadata edits, previews, moves and audit ───────────────
+
+    @staticmethod
+    async def _pending_order_tx(conn: aiosqlite.Connection, worker_id: str) -> list[str]:
+        rows = await conn.execute_fetchall(
+            """SELECT id FROM jobs WHERE queue_managed = 1 AND worker_id = ? AND status = ?
+               ORDER BY queue_order, id""",
+            (worker_id, JobStatus.PENDING.value),
+        )
+        return [row["id"] for row in rows]
+
+    @staticmethod
+    async def _display_names_tx(conn: aiosqlite.Connection, user_ids: set[str]) -> dict[str, str]:
+        if not user_ids:
+            return {}
+        ids = sorted(user_ids)
+        rows = await conn.execute_fetchall(
+            f"SELECT id, display_name FROM users WHERE id IN ({', '.join('?' for _ in ids)})", ids,
+        )
+        return {row["id"]: row["display_name"] for row in rows}
+
+    async def user_display_names(self, user_ids: set[str]) -> dict[str, str]:
+        return await self._display_names_tx(self._db, user_ids)
+
+    async def _insert_event_tx(
+        self,
+        conn: aiosqlite.Connection,
+        *,
+        event_type: str,
+        worker_id: str,
+        job: Job,
+        actor: AuditActor,
+        reason: str,
+        now: int,
+        old_revision: int,
+        new_revision: int,
+        old_order: list[str],
+        new_order: list[str],
+        impacts: list[dict],
+        preview_id: str | None = None,
+    ) -> int:
+        names = await self._display_names_tx(conn, {job.owner_user_id})
+        cursor = await conn.execute(
+            """INSERT INTO queue_events
+               (event_type, worker_id, job_id, job_name, job_owner_user_id, job_owner_display_name,
+                actor_user_id, actor_display_name, actor_id, reason, created_at, old_revision,
+                new_revision, old_order, new_order, preview_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                event_type, worker_id, job.id, job.name, job.owner_user_id,
+                names.get(job.owner_user_id, ""), actor.user_id, actor.display_name,
+                actor.actor_id, reason, now, old_revision, new_revision,
+                json.dumps(old_order), json.dumps(new_order), preview_id,
+            ),
+        )
+        event_id = int(cursor.lastrowid)
+        await conn.executemany(
+            """INSERT INTO queue_event_impacts
+               (event_id, job_id, name, owner_user_id, owner_display_name, before_position,
+                after_position, before_start_at, after_start_at, delay_seconds)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    event_id, impact["job_id"], impact["name"], impact["owner_user_id"],
+                    impact["owner_display_name"], impact["before_position"],
+                    impact["after_position"], impact["before_start_at"],
+                    impact["after_start_at"], impact["delay_seconds"],
+                )
+                for impact in impacts
+            ],
+        )
+        return event_id
+
+    async def update_job_metadata(
         self,
         job_id: str,
         *,
-        launch_observed: bool,
-    ) -> Job | None:
-        async with self._queue_lock:
-            row = await (
-                await self._db.execute(
-                    """SELECT worker_id, queue_managed FROM jobs
-                       WHERE id = ? AND status = ?""",
-                    (job_id, JobStatus.STARTING.value),
-                )
-            ).fetchone()
-            if row is None:
-                return None
-            if launch_observed:
-                cursor = await self._db.execute(
-                    """UPDATE jobs SET status = ?
-                       WHERE id = ? AND status = ?""",
-                    (JobStatus.RUNNING.value, job_id, JobStatus.STARTING.value),
-                )
-            elif row["queue_managed"]:
-                await self._db.execute(
-                    """UPDATE jobs SET queue_order = queue_order + 1
-                       WHERE queue_managed = 1 AND worker_id = ? AND status = ?""",
-                    (row["worker_id"], JobStatus.PENDING.value),
-                )
-                cursor = await self._db.execute(
-                    """UPDATE jobs
-                       SET status = ?, gpu_indices = '[]', started_at = 0, queue_order = 1
-                       WHERE id = ? AND queue_managed = 1 AND status = ?""",
-                    (JobStatus.PENDING.value, job_id, JobStatus.STARTING.value),
-                )
-            else:
-                cursor = await self._db.execute(
-                    """UPDATE jobs
-                       SET status = ?, exit_code = -1, finished_at = unixepoch()
-                       WHERE id = ? AND status = ?""",
-                    (JobStatus.FAILED.value, job_id, JobStatus.STARTING.value),
-                )
-            if not cursor.rowcount:
-                await self._db.rollback()
-                return None
-            await self._db.commit()
-            return await self.get_job(job_id)
+        owner_user_id: str,
+        actor: AuditActor,
+        changes: dict,
+        pending: bool,
+        destination_worker_id: str | None = None,
+        now: int,
+    ) -> Job:
+        """Owner-only edit of a pending (``pending=True``) or active job.
 
-    async def get_running_job_count_for_worker(self, worker_id: str) -> int:
-        cursor = await self._db.execute(
-            "SELECT COUNT(*) FROM jobs WHERE worker_id = ? AND status IN (?, ?)",
-            (worker_id, JobStatus.STARTING.value, JobStatus.RUNNING.value),
+        Raises KeyError for missing/foreign jobs and ValueError for lifecycle
+        or validation conflicts. Worker transfers append to the destination
+        queue and record a ``worker_move`` event; other edits ``job_updated``.
+        """
+        allowed = (
+            {"name", "expected_seconds", "gpu_count", "priority", "priority_note", "deadline_at"}
+            if pending else {"expected_seconds", "priority", "priority_note", "deadline_at"}
         )
-        row = await cursor.__aenter__()
-        count = (await row.fetchone())[0]
-        await cursor.close()
-        return count
+        if set(changes) - allowed:
+            raise ValueError("field cannot be changed in this job state")
+        async with self.scheduling_tx() as conn:
+            row = await (await conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,))).fetchone()
+            if row is None or row["owner_user_id"] != owner_user_id:
+                raise KeyError(job_id)
+            job = self._row_to_job(row)
+            if pending:
+                if not job.queue_managed or job.status != JobStatus.PENDING:
+                    raise ValueError("only pending queued jobs can be updated")
+            elif job.status not in (JobStatus.STARTING, JobStatus.RUNNING):
+                raise ValueError("only starting or running jobs can be updated")
+            source_worker_id = job.worker_id or ""
+            destination = destination_worker_id or source_worker_id
+            updated = job.model_copy(update=changes)
+            if updated.priority == JobPriority.TIME_CRITICAL and not updated.priority_note.strip():
+                raise ValueError("time_critical priority requires a priority_note")
+            if pending:
+                worker_row = await (await conn.execute(
+                    "SELECT gpu_count FROM workers WHERE id=?", (destination,),
+                )).fetchone()
+                if worker_row is None:
+                    raise ValueError("destination worker no longer exists")
+                if updated.gpu_count > worker_row["gpu_count"]:
+                    raise ValueError("gpu_count exceeds destination worker capacity")
+            old_order = await self._pending_order_tx(conn, source_worker_id)
+            old_revision = await self._revision_tx(conn, source_worker_id)
+            await conn.execute(
+                """UPDATE jobs SET name=?, expected_seconds=?, gpu_count=?, priority=?,
+                   priority_note=?, deadline_at=? WHERE id=?""",
+                (
+                    updated.name, updated.expected_seconds, updated.gpu_count,
+                    updated.priority.value, updated.priority_note, updated.deadline_at, job_id,
+                ),
+            )
+            moved = pending and destination != source_worker_id
+            if moved:
+                tail = await (await conn.execute(
+                    """SELECT COALESCE(MAX(queue_order), 0) FROM jobs
+                       WHERE queue_managed = 1 AND worker_id = ? AND status IN (?, ?, ?)""",
+                    (destination, JobStatus.PENDING.value, JobStatus.STARTING.value, JobStatus.RUNNING.value),
+                )).fetchone()
+                await conn.execute(
+                    "UPDATE jobs SET worker_id=?, queue_order=? WHERE id=?",
+                    (destination, int(tail[0]) + 1, job_id),
+                )
+                await self._renumber_pending_tx(conn, source_worker_id)
+                await self._renumber_pending_tx(conn, destination)
+                await self._bump_revision_tx(conn, destination)
+            prediction_changed = moved or (
+                job.queue_managed
+                and (updated.expected_seconds, updated.gpu_count) != (job.expected_seconds, job.gpu_count)
+            )
+            new_revision = (
+                await self._bump_revision_tx(conn, source_worker_id)
+                if prediction_changed else old_revision
+            )
+            new_order = await self._pending_order_tx(conn, source_worker_id)
+            changed_fields = sorted(key for key in changes if getattr(job, key) != getattr(updated, key))
+            if moved or changed_fields:
+                await self._insert_event_tx(
+                    conn, event_type="worker_move" if moved else "job_updated",
+                    worker_id=source_worker_id, job=updated, actor=actor,
+                    reason=(
+                        "moved to another worker by its owner" if moved
+                        else "owner updated " + ", ".join(changed_fields)
+                    ),
+                    now=now, old_revision=old_revision, new_revision=new_revision,
+                    old_order=old_order, new_order=new_order, impacts=[],
+                )
+        persisted = await self.get_job(job_id)
+        assert persisted is not None
+        return persisted
+
+    async def _worker_snapshot_tx(
+        self, conn: aiosqlite.Connection, worker_id: str,
+    ) -> tuple[Worker | None, list[Job]]:
+        worker_row = await (await conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,))).fetchone()
+        rows = await conn.execute_fetchall(
+            "SELECT * FROM jobs WHERE queue_managed = 1 AND worker_id = ? AND status IN (?, ?, ?)",
+            (worker_id, JobStatus.PENDING.value, JobStatus.STARTING.value, JobStatus.RUNNING.value),
+        )
+        worker = self._row_to_worker(worker_row) if worker_row else None
+        return worker, [self._row_to_job(row) for row in rows]
+
+    async def create_queue_preview(
+        self,
+        job_id: str,
+        *,
+        before_job_id: str | None,
+        expected_revision: int,
+        reason: str,
+        actor: AuditActor,
+        now: int,
+        ttl_seconds: int = 60,
+    ) -> dict:
+        """Compute (never apply) a shared reorder and its estimated impacts."""
+        async with self.scheduling_tx() as conn:
+            row = await (await conn.execute(
+                "SELECT * FROM jobs WHERE id=? AND queue_managed=1", (job_id,),
+            )).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            job = self._row_to_job(row)
+            if job.status != JobStatus.PENDING:
+                raise QueueConflict("NOT_PENDING", "only pending queued jobs can be moved")
+            worker_id = job.worker_id or ""
+            revision = await self._revision_tx(conn, worker_id)
+            if revision != expected_revision:
+                raise QueueConflict("QUEUE_CHANGED", "the queue changed; refresh and preview again")
+            if before_job_id == job_id:
+                raise QueueValidationError("a job cannot be moved before itself")
+            before_order = await self._pending_order_tx(conn, worker_id)
+            if before_job_id is not None and before_job_id not in before_order:
+                raise QueueValidationError("target must be a pending job on the same worker")
+            after_order = [item for item in before_order if item != job_id]
+            if before_job_id is None:
+                after_order.append(job_id)
+            else:
+                after_order.insert(after_order.index(before_job_id), job_id)
+            if after_order == before_order:
+                return {"changed": False}
+            worker, jobs = await self._worker_snapshot_tx(conn, worker_id)
+            before_estimates = forecast_worker(worker, jobs, now, pending_order=before_order)
+            after_estimates = forecast_worker(worker, jobs, now, pending_order=after_order)
+            shifts = delays(before_estimates, after_estimates, before_order)
+            by_id = {item.id: item for item in jobs}
+            names = await self._display_names_tx(conn, {item.owner_user_id for item in jobs})
+            impacts = []
+            for pending_id in before_order:
+                old_position = before_order.index(pending_id) + 1
+                new_position = after_order.index(pending_id) + 1
+                before_start = before_estimates[pending_id].estimated_start_at
+                after_start = after_estimates[pending_id].estimated_start_at
+                if old_position == new_position and before_start == after_start:
+                    continue
+                item = by_id[pending_id]
+                impacts.append({
+                    "job_id": pending_id,
+                    "name": item.name,
+                    "owner_user_id": item.owner_user_id,
+                    "owner_display_name": names.get(item.owner_user_id, ""),
+                    "before_position": old_position,
+                    "after_position": new_position,
+                    "before_start_at": before_start,
+                    "after_start_at": after_start,
+                    "delay_seconds": shifts[pending_id],
+                })
+            preview_id = str(uuid4())
+            expires_at = now + ttl_seconds
+            await conn.execute(
+                """INSERT INTO queue_previews
+                   (id, actor_id, actor_user_id, worker_id, job_id, before_job_id, reason, revision,
+                    created_at, expires_at, before_order, after_order, impacts)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    preview_id, actor.actor_id, actor.user_id, worker_id, job_id, before_job_id,
+                    reason, revision, now, expires_at, json.dumps(before_order),
+                    json.dumps(after_order), json.dumps(impacts),
+                ),
+            )
+            # Expired, uncommitted previews carry no authority; prune them.
+            await conn.execute(
+                "DELETE FROM queue_previews WHERE committed_event_id IS NULL AND expires_at < ?",
+                (now - 3600,),
+            )
+        return {
+            "changed": True,
+            "preview_id": preview_id,
+            "revision": revision,
+            "expires_at": expires_at,
+            "before_order": before_order,
+            "after_order": after_order,
+            "impacts": impacts,
+        }
+
+    async def commit_queue_move(
+        self,
+        job_id: str,
+        *,
+        preview_id: str,
+        expected_revision: int,
+        actor: AuditActor,
+        now: int,
+    ) -> dict:
+        """Apply exactly one previewed reorder with its audit record."""
+        async with self.scheduling_tx() as conn:
+            preview = await (await conn.execute(
+                "SELECT * FROM queue_previews WHERE id=?", (preview_id,),
+            )).fetchone()
+            if (
+                preview is None
+                or preview["job_id"] != job_id
+                or preview["actor_id"] != actor.actor_id
+                or preview["actor_user_id"] != actor.user_id
+            ):
+                raise KeyError(preview_id)
+            if preview["committed_event_id"] is not None:
+                event_id = int(preview["committed_event_id"])
+                revision = await self._revision_tx(conn, preview["worker_id"])
+            else:
+                if now > preview["expires_at"]:
+                    raise QueueConflict("PREVIEW_EXPIRED", "the preview expired; preview again")
+                worker_id = preview["worker_id"]
+                current_revision = await self._revision_tx(conn, worker_id)
+                current_order = await self._pending_order_tx(conn, worker_id)
+                job_row = await (await conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,))).fetchone()
+                if (
+                    expected_revision != preview["revision"]
+                    or current_revision != preview["revision"]
+                    or current_order != json.loads(preview["before_order"])
+                    or job_row is None
+                    or job_row["status"] != JobStatus.PENDING.value
+                    or job_row["worker_id"] != worker_id
+                ):
+                    raise QueueConflict("QUEUE_CHANGED", "the queue changed; refresh and preview again")
+                after_order = json.loads(preview["after_order"])
+                await conn.executemany(
+                    "UPDATE jobs SET queue_order=? WHERE id=? AND status=?",
+                    [
+                        (index, pending_id, JobStatus.PENDING.value)
+                        for index, pending_id in enumerate(after_order, 1)
+                    ],
+                )
+                revision = await self._bump_revision_tx(conn, worker_id)
+                event_id = await self._insert_event_tx(
+                    conn, event_type="reorder", worker_id=worker_id,
+                    job=self._row_to_job(job_row), actor=actor, reason=preview["reason"],
+                    now=now, old_revision=current_revision, new_revision=revision,
+                    old_order=current_order, new_order=after_order,
+                    impacts=json.loads(preview["impacts"]), preview_id=preview_id,
+                )
+                await conn.execute(
+                    "UPDATE queue_previews SET committed_event_id=? WHERE id=?",
+                    (event_id, preview_id),
+                )
+            events = await self._load_events(conn, "WHERE e.id = ?", [event_id], 1)
+        return {"event": events[0], "revision": revision}
+
+    @staticmethod
+    async def _load_events(
+        conn: aiosqlite.Connection, where: str, params: list, limit: int,
+    ) -> list[dict]:
+        rows = await conn.execute_fetchall(
+            f"SELECT e.* FROM queue_events AS e {where} ORDER BY e.id DESC LIMIT ?",
+            [*params, limit],
+        )
+        if not rows:
+            return []
+        ids = [row["id"] for row in rows]
+        impact_rows = await conn.execute_fetchall(
+            f"""SELECT * FROM queue_event_impacts WHERE event_id IN ({', '.join('?' for _ in ids)})
+                ORDER BY event_id, after_position""",
+            ids,
+        )
+        impacts: dict[int, list[dict]] = {}
+        for impact in impact_rows:
+            impacts.setdefault(impact["event_id"], []).append({
+                "job_id": impact["job_id"],
+                "name": impact["name"],
+                "owner_user_id": impact["owner_user_id"],
+                "owner_display_name": impact["owner_display_name"],
+                "before_position": impact["before_position"],
+                "after_position": impact["after_position"],
+                "before_start_at": impact["before_start_at"],
+                "after_start_at": impact["after_start_at"],
+                "delay_seconds": impact["delay_seconds"],
+            })
+        return [
+            {
+                "id": row["id"],
+                "event_type": row["event_type"],
+                "worker_id": row["worker_id"],
+                "job_id": row["job_id"],
+                "job_name": row["job_name"],
+                "job_owner_user_id": row["job_owner_user_id"],
+                "job_owner_display_name": row["job_owner_display_name"],
+                "actor_user_id": row["actor_user_id"],
+                "actor_display_name": row["actor_display_name"],
+                "actor_id": row["actor_id"],
+                "reason": row["reason"],
+                "created_at": row["created_at"],
+                "old_revision": row["old_revision"],
+                "new_revision": row["new_revision"],
+                "old_order": json.loads(row["old_order"]),
+                "new_order": json.loads(row["new_order"]),
+                "impacts": impacts.get(row["id"], []),
+            }
+            for row in rows
+        ]
+
+    async def list_queue_events(
+        self,
+        *,
+        worker_id: str | None = None,
+        job_id: str | None = None,
+        before_event_id: int | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list = []
+        if worker_id:
+            clauses.append("e.worker_id = ?")
+            params.append(worker_id)
+        if job_id:
+            clauses.append(
+                "(e.job_id = ? OR EXISTS (SELECT 1 FROM queue_event_impacts AS i "
+                "WHERE i.event_id = e.id AND i.job_id = ?))"
+            )
+            params.extend([job_id, job_id])
+        if before_event_id is not None:
+            clauses.append("e.id < ?")
+            params.append(before_event_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return await self._load_events(self._db, where, params, limit)
+
+    async def delay_history(
+        self, job_ids: list[str], *, limit_per_job: int | None = None,
+    ) -> dict[str, list[dict]]:
+        """Estimated delays that reorders of other jobs caused each job."""
+        if not job_ids:
+            return {}
+        rows = await self._db.execute_fetchall(
+            f"""SELECT i.*, e.job_id AS moved_job_id, e.job_name AS moved_job_name,
+                       e.job_owner_display_name AS moved_owner, e.actor_user_id,
+                       e.actor_display_name, e.reason, e.created_at
+                FROM queue_event_impacts AS i JOIN queue_events AS e ON e.id = i.event_id
+                WHERE i.job_id IN ({', '.join('?' for _ in job_ids)})
+                  AND e.event_type = 'reorder' AND e.job_id != i.job_id
+                  AND (i.delay_seconds > 0
+                       OR (i.delay_seconds IS NULL AND i.after_position > i.before_position))
+                ORDER BY i.event_id DESC""",
+            job_ids,
+        )
+        history: dict[str, list[dict]] = {}
+        for row in rows:
+            entries = history.setdefault(row["job_id"], [])
+            if limit_per_job is not None and len(entries) >= limit_per_job:
+                continue
+            entries.append({
+                "event_id": row["event_id"],
+                "created_at": row["created_at"],
+                "delay_seconds": row["delay_seconds"],
+                "moved_job_id": row["moved_job_id"],
+                "moved_job_name": row["moved_job_name"],
+                "moved_job_owner_display_name": row["moved_owner"],
+                "actor_user_id": row["actor_user_id"],
+                "actor_display_name": row["actor_display_name"],
+                "reason": row["reason"],
+            })
+        return history
+
+    # ── Usage ─────────────────────────────────────────────────────────
+
+    async def usage(
+        self, *, now: int, worker_id: str | None = None, user_id: str | None = None,
+    ) -> list[dict]:
+        """Allocated wall/GPU time per owner and worker, derived from jobs.
+
+        Totals are recomputed from durable start/finish times, never
+        incremented, so restarts and repeated reconciliation cannot double
+        count. Waiting jobs contribute nothing; active ones are provisional.
+        """
+        query = """SELECT j.owner_user_id, j.worker_id, j.worker_name_at_submission,
+                          j.gpu_count, j.started_at, j.finished_at, j.status,
+                          j.submitted_by_actor_id, w.name AS current_worker_name,
+                          u.display_name AS owner_display_name
+                   FROM jobs AS j
+                   LEFT JOIN workers AS w ON w.id = j.worker_id
+                   LEFT JOIN users AS u ON u.id = j.owner_user_id
+                   WHERE j.started_at > 0"""
+        params: list = []
+        if worker_id:
+            query += " AND j.worker_id = ?"
+            params.append(worker_id)
+        if user_id:
+            query += " AND j.owner_user_id = ?"
+            params.append(user_id)
+        rows = await self._db.execute_fetchall(query, params)
+        totals: dict[tuple[str, str], dict] = {}
+        for row in rows:
+            key = (row["owner_user_id"], row["worker_id"] or "")
+            entry = totals.setdefault(key, {
+                "owner_user_id": row["owner_user_id"],
+                "owner_display_name": row["owner_display_name"] or "",
+                "worker_id": row["worker_id"],
+                "worker_name": row["current_worker_name"] or row["worker_name_at_submission"] or None,
+                "job_seconds": 0,
+                "cpu_job_seconds": 0,
+                "allocated_gpu_seconds": 0,
+                "running_jobs": 0,
+                "provisional": False,
+                "historical_estimate": False,
+            })
+            active = row["status"] in (JobStatus.STARTING.value, JobStatus.RUNNING.value)
+            end = now if active or not row["finished_at"] else row["finished_at"]
+            seconds = max(0, end - row["started_at"])
+            entry["job_seconds"] += seconds
+            if row["gpu_count"] == 0:
+                entry["cpu_job_seconds"] += seconds
+            entry["allocated_gpu_seconds"] += seconds * row["gpu_count"]
+            if active:
+                entry["running_jobs"] += 1
+                entry["provisional"] = True
+            if str(row["submitted_by_actor_id"]).startswith("migration:"):
+                entry["historical_estimate"] = True
+        return sorted(
+            totals.values(),
+            key=lambda item: (item["owner_display_name"], item["worker_name"] or "", item["worker_id"] or ""),
+        )
 
     async def upsert_reported_worker_job(self, worker_id: str, report: WorkerJobReport) -> tuple[Job, bool]:
         """Apply a worker-owned delegated-job report exactly once per revision.
 
         The conditional UPSERT prevents a retry race from inserting duplicates
-        or letting an older report overwrite a newer worker projection.
+        or letting an older report overwrite a newer worker projection. The
+        human owner derives from the verified origin session, never the report.
         """
         async with self._worker_job_report_lock:
             session = await self.get_pi_session(report.origin_session_id)
@@ -1334,25 +2187,26 @@ class Database:
                 raise KeyError(report.origin_session_id)
             if session.worker_id != worker_id:
                 raise ValueError("origin session not found for worker")
+            if not session.owner_user_id:
+                raise ValueError("origin session has no verified owner")
+            now = int(time.time())
             cursor = await self._db.execute(
                 """INSERT INTO jobs
                    (id, worker_id, name, tmux_session, command, status, queue_managed,
                     exit_code, pty_enabled, kind, origin_session_id, report_revision,
-                    expected_seconds, gpu_count, gpu_indices, queue_order, started_at, finished_at)
-                   VALUES (?, ?, '', ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, 0, '[]', 0, ?, ?)
+                    expected_seconds, gpu_count, gpu_indices, queue_order, started_at, finished_at,
+                    owner_user_id, submitted_by_actor_id, submitted_at, submission_sequence,
+                    worker_name_at_submission)
+                   VALUES (?, ?, 'Setup job', ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, 0, '[]', 0, ?, ?, ?, ?, ?,
+                           (SELECT COALESCE(MAX(submission_sequence), 0) + 1 FROM jobs),
+                           COALESCE((SELECT name FROM workers WHERE id = ?), ''))
                    ON CONFLICT(id) DO UPDATE SET
-                     name=excluded.name,
                      tmux_session=excluded.tmux_session,
                      command=excluded.command,
                      status=excluded.status,
-                     queue_managed=excluded.queue_managed,
                      exit_code=excluded.exit_code,
                      pty_enabled=excluded.pty_enabled,
                      report_revision=excluded.report_revision,
-                     expected_seconds=excluded.expected_seconds,
-                     gpu_count=excluded.gpu_count,
-                     gpu_indices=excluded.gpu_indices,
-                     queue_order=excluded.queue_order,
                      started_at=excluded.started_at,
                      finished_at=excluded.finished_at
                    WHERE jobs.worker_id=excluded.worker_id
@@ -1364,6 +2218,7 @@ class Database:
                     report.status.value, report.exit_code, int(report.pty_enabled),
                     JobKind.DELEGATED.value, report.origin_session_id,
                     report.report_revision, report.started_at, report.finished_at,
+                    session.owner_user_id, f"pi_session:{session.id}", now, worker_id,
                 ),
             )
             changed = bool(cursor.rowcount)
@@ -1383,36 +2238,60 @@ class Database:
         return Job(
             id=row["id"],
             worker_id=row["worker_id"],
-            name=row["name"] if "name" in row.keys() else "",
-            tmux_session=row["tmux_session"],
+            name=row["name"],
+            tmux_session=row["tmux_session"] or "",
             command=row["command"],
             status=JobStatus(row["status"]),
-            queue_managed=bool(row["queue_managed"]) if "queue_managed" in row.keys() else False,
+            queue_managed=bool(row["queue_managed"]),
             exit_code=row["exit_code"],
             pty_enabled=bool(row["pty_enabled"]),
-            kind=JobKind(row["kind"]) if "kind" in row.keys() else JobKind.SSH,
-            origin_session_id=row["origin_session_id"] if "origin_session_id" in row.keys() else None,
-            report_revision=row["report_revision"] if "report_revision" in row.keys() else 0,
-            expected_seconds=row["expected_seconds"] if "expected_seconds" in row.keys() else 0,
-            gpu_count=row["gpu_count"] if "gpu_count" in row.keys() else 0,
-            gpu_indices=json.loads(row["gpu_indices"]) if "gpu_indices" in row.keys() else [],
-            queue_order=row["queue_order"] if "queue_order" in row.keys() else 0,
-            started_at=row["started_at"],
-            finished_at=row["finished_at"],
+            kind=JobKind(row["kind"]),
+            origin_session_id=row["origin_session_id"],
+            report_revision=row["report_revision"],
+            expected_seconds=row["expected_seconds"],
+            gpu_count=row["gpu_count"],
+            gpu_indices=json.loads(row["gpu_indices"]),
+            queue_order=row["queue_order"],
+            started_at=row["started_at"] or 0,
+            finished_at=row["finished_at"] or 0,
+            owner_user_id=row["owner_user_id"],
+            submitted_by_actor_id=row["submitted_by_actor_id"],
+            submitted_at=row["submitted_at"],
+            submission_sequence=row["submission_sequence"],
+            priority=JobPriority(row["priority"]),
+            priority_note=row["priority_note"],
+            deadline_at=row["deadline_at"],
+            termination_reason=(
+                TerminationReason(row["termination_reason"]) if row["termination_reason"] else None
+            ),
+            worker_name_at_submission=row["worker_name_at_submission"],
+            execution_state=ExecutionState(row["execution_state"]),
+            stop_requested_at=row["stop_requested_at"],
+            stop_reason=TerminationReason(row["stop_reason"]) if row["stop_reason"] else None,
+            stop_confirmed_at=row["stop_confirmed_at"],
         )
 
     # ── Port Forwards ─────────────────────────────────────────────────
 
     async def insert_port_forward(self, pf: PortForward) -> None:
-        await self._db.execute(
-            """INSERT INTO port_forwards
-               (id, worker_id, local_port, remote_port, service_name, pid, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                pf.id, pf.worker_id, pf.local_port, pf.remote_port,
-                pf.service_name, pf.pid, pf.created_at,
-            ),
-        )
+        """Insert (reserve) a forward; the listener (bind_host, local_port) is unique."""
+        if not pf.owner_user_id:
+            raise ValueError("port forward requires an owner")
+        try:
+            await self._db.execute(
+                """INSERT INTO port_forwards
+                   (id, worker_id, local_port, remote_port, service_name, pid, created_at,
+                    owner_user_id, created_by_actor_id, bind_host, marimo_session_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    pf.id, pf.worker_id, pf.local_port, pf.remote_port, pf.service_name,
+                    pf.pid, pf.created_at, pf.owner_user_id, pf.created_by_actor_id,
+                    pf.bind_host, pf.marimo_session_id,
+                ),
+            )
+        except aiosqlite.IntegrityError as exc:
+            await self._db.rollback()
+            raise ListenerConflict("listener port is already reserved") from exc
         await self._db.commit()
 
     async def update_port_forward_pid(self, pf_id: str, pid: int) -> None:
@@ -1421,14 +2300,24 @@ class Database:
         )
         await self._db.commit()
 
-    async def list_port_forwards(self, worker_id: str | None = None) -> list[PortForward]:
-        query = "SELECT * FROM port_forwards"
+    async def list_port_forwards(
+        self, worker_id: str | None = None, *, owner_user_id: str | None = None,
+    ) -> list[PortForward]:
+        query = "SELECT * FROM port_forwards WHERE 1=1"
         params: list = []
         if worker_id:
-            query += " WHERE worker_id = ?"
+            query += " AND worker_id = ?"
             params.append(worker_id)
+        if owner_user_id is not None:
+            query += " AND owner_user_id = ?"
+            params.append(owner_user_id)
+        query += " ORDER BY created_at, id"
         rows = await self._db.execute_fetchall(query, params)
         return [self._row_to_pf(r) for r in rows]
+
+    async def get_port_forward(self, pf_id: str) -> PortForward | None:
+        rows = await self._db.execute_fetchall("SELECT * FROM port_forwards WHERE id = ?", (pf_id,))
+        return self._row_to_pf(rows[0]) if rows else None
 
     async def delete_port_forward(self, pf_id: str) -> None:
         await self._db.execute("DELETE FROM port_forwards WHERE id = ?", (pf_id,))
@@ -1443,21 +2332,29 @@ class Database:
             service_name=row["service_name"],
             pid=row["pid"],
             created_at=row["created_at"],
+            owner_user_id=row["owner_user_id"],
+            created_by_actor_id=row["created_by_actor_id"],
+            bind_host=row["bind_host"],
+            marimo_session_id=row["marimo_session_id"],
         )
 
     # ── Marimo Sessions ────────────────────────────────────────────────
 
     async def insert_marimo_session(self, session: MarimoSession) -> None:
+        if not session.owner_user_id:
+            raise ValueError("marimo session requires an owner")
         await self._db.execute(
             """INSERT INTO marimo_sessions
                (id, worker_id, notebook_path, environment, job_id, tunnel_id,
-                local_port, remote_port, bind_host, url, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                local_port, remote_port, bind_host, url, status, created_at,
+                owner_user_id, created_by_actor_id, upstream_token_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session.id, session.worker_id, session.notebook_path,
                 session.environment, session.job_id, session.tunnel_id,
                 session.local_port, session.remote_port, session.bind_host,
                 session.url, session.status, session.created_at,
+                session.owner_user_id, session.created_by_actor_id, session.upstream_token_path,
             ),
         )
         await self._db.commit()
@@ -1468,12 +2365,23 @@ class Database:
         )
         return self._row_to_marimo(row[0]) if row else None
 
-    async def list_marimo_sessions(self, worker_id: str | None = None) -> list[MarimoSession]:
-        query = "SELECT * FROM marimo_sessions"
+    async def get_marimo_session_for_job(self, job_id: str) -> MarimoSession | None:
+        row = await self._db.execute_fetchall(
+            "SELECT * FROM marimo_sessions WHERE job_id = ?", (job_id,)
+        )
+        return self._row_to_marimo(row[0]) if row else None
+
+    async def list_marimo_sessions(
+        self, worker_id: str | None = None, *, owner_user_id: str | None = None,
+    ) -> list[MarimoSession]:
+        query = "SELECT * FROM marimo_sessions WHERE 1=1"
         params: list = []
         if worker_id:
-            query += " WHERE worker_id = ?"
+            query += " AND worker_id = ?"
             params.append(worker_id)
+        if owner_user_id is not None:
+            query += " AND owner_user_id = ?"
+            params.append(owner_user_id)
         query += " ORDER BY created_at DESC"
         rows = await self._db.execute_fetchall(query, params)
         return [self._row_to_marimo(row) for row in rows]
@@ -1485,6 +2393,263 @@ class Database:
     @staticmethod
     def _row_to_marimo(row: aiosqlite.Row) -> MarimoSession:
         return MarimoSession(**dict(row))
+
+    # ── Identity ───────────────────────────────────────────────────────
+
+    _USER_FIELDS = ("id", "username", "display_name", "is_admin", "disabled", "created_at", "updated_at")
+
+    @staticmethod
+    def _user(row: aiosqlite.Row | None) -> dict | None:
+        if row is None:
+            return None
+        user = dict(row)
+        user["is_admin"] = bool(user["is_admin"])
+        user["disabled"] = bool(user["disabled"])
+        return user
+
+    async def bootstrap_user_id(self) -> str | None:
+        rows = await self._db.execute_fetchall("SELECT bootstrap_user_id FROM identity_settings")
+        return rows[0]["bootstrap_user_id"] if rows else None
+
+    async def bootstrap_admin(
+        self, *, username: str, display_name: str, password_hash: str, now: int,
+    ) -> dict:
+        """Atomically create the first administrator and assign legacy owners."""
+        user_id = str(uuid4())
+        actor = f"migration:{user_id}"
+        async with self.scheduling_tx() as conn:
+            existing = await (await conn.execute("SELECT 1 FROM identity_settings")).fetchone()
+            if existing:
+                raise IdentityConflict("bootstrap administrator already exists")
+            try:
+                await conn.execute(
+                    """INSERT INTO users (id, username, display_name, password_hash, is_admin,
+                       disabled, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 0, ?, ?)""",
+                    (user_id, username, display_name, password_hash, now, now),
+                )
+            except aiosqlite.IntegrityError as exc:
+                raise IdentityConflict("username already exists") from exc
+            await conn.execute(
+                "INSERT INTO identity_settings (singleton, bootstrap_user_id, created_at) VALUES (1, ?, ?)",
+                (user_id, now),
+            )
+            await conn.execute(
+                """UPDATE jobs SET owner_user_id=?, submitted_by_actor_id=CASE
+                     WHEN submitted_by_actor_id='' THEN ? ELSE submitted_by_actor_id END
+                   WHERE owner_user_id=''""",
+                (user_id, actor),
+            )
+            await conn.execute("UPDATE pi_sessions SET owner_user_id=? WHERE owner_user_id=''", (user_id,))
+            for table in ("port_forwards", "marimo_sessions"):
+                await conn.execute(
+                    f"""UPDATE {table} SET owner_user_id=?, created_by_actor_id=CASE
+                          WHEN created_by_actor_id='' THEN ? ELSE created_by_actor_id END
+                        WHERE owner_user_id=''""",
+                    (user_id, actor),
+                )
+            row = await (await conn.execute("SELECT * FROM users WHERE id=?", (user_id,))).fetchone()
+        return self._safe_user(self._user(row))
+
+    @classmethod
+    def _safe_user(cls, user: dict | None) -> dict | None:
+        if user is None:
+            return None
+        return {field: user[field] for field in cls._USER_FIELDS}
+
+    async def get_user(self, user_id: str) -> dict | None:
+        rows = await self._db.execute_fetchall("SELECT * FROM users WHERE id=?", (user_id,))
+        return self._user(rows[0] if rows else None)
+
+    async def get_user_by_username(self, username: str) -> dict | None:
+        rows = await self._db.execute_fetchall("SELECT * FROM users WHERE username=?", (username,))
+        return self._user(rows[0] if rows else None)
+
+    async def list_users(self) -> list[dict]:
+        rows = await self._db.execute_fetchall("SELECT * FROM users ORDER BY username")
+        return [self._safe_user(self._user(row)) for row in rows]
+
+    async def create_user(
+        self, *, username: str, display_name: str, password_hash: str, is_admin: bool, now: int,
+    ) -> dict:
+        user_id = str(uuid4())
+        try:
+            await self._db.execute(
+                """INSERT INTO users (id, username, display_name, password_hash, is_admin,
+                   disabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)""",
+                (user_id, username, display_name, password_hash, int(is_admin), now, now),
+            )
+        except aiosqlite.IntegrityError as exc:
+            await self._db.rollback()
+            raise IdentityConflict("username already exists") from exc
+        await self._db.commit()
+        return self._safe_user(await self.get_user(user_id))
+
+    async def update_user(
+        self,
+        user_id: str,
+        *,
+        display_name: str | None = None,
+        disabled: bool | None = None,
+        is_admin: bool | None = None,
+        now: int,
+    ) -> tuple[dict, bool]:
+        """Update a user; returns (user, newly_disabled).
+
+        Disabling revokes every key and browser session in the same
+        transaction. The bootstrap user cannot be disabled or demoted and the
+        last enabled administrator cannot be removed.
+        """
+        async with self.scheduling_tx() as conn:
+            row = await (await conn.execute("SELECT * FROM users WHERE id=?", (user_id,))).fetchone()
+            if row is None:
+                raise KeyError(user_id)
+            user = self._user(row)
+            settings = await (await conn.execute("SELECT bootstrap_user_id FROM identity_settings")).fetchone()
+            is_bootstrap = settings is not None and settings[0] == user_id
+            new_disabled = user["disabled"] if disabled is None else disabled
+            new_admin = user["is_admin"] if is_admin is None else is_admin
+            if is_bootstrap and (new_disabled or not new_admin):
+                raise IdentityConflict("the bootstrap administrator cannot be disabled or demoted")
+            if user["is_admin"] and not user["disabled"] and (new_disabled or not new_admin):
+                remaining = await (await conn.execute(
+                    "SELECT COUNT(*) FROM users WHERE is_admin=1 AND disabled=0 AND id!=?", (user_id,),
+                )).fetchone()
+                if remaining[0] == 0:
+                    raise IdentityConflict("cannot remove the last enabled administrator")
+            await conn.execute(
+                "UPDATE users SET display_name=?, disabled=?, is_admin=?, updated_at=? WHERE id=?",
+                (
+                    display_name if display_name is not None else user["display_name"],
+                    int(new_disabled), int(new_admin), now, user_id,
+                ),
+            )
+            newly_disabled = new_disabled and not user["disabled"]
+            if newly_disabled:
+                await conn.execute(
+                    "UPDATE api_keys SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", (now, user_id),
+                )
+                await conn.execute("DELETE FROM web_sessions WHERE user_id=?", (user_id,))
+            updated = await (await conn.execute("SELECT * FROM users WHERE id=?", (user_id,))).fetchone()
+        return self._safe_user(self._user(updated)), newly_disabled
+
+    async def set_password_hash(self, user_id: str, password_hash: str, *, now: int) -> None:
+        """Replace a password hash and revoke every browser session of the user."""
+        async with self.scheduling_tx() as conn:
+            cursor = await conn.execute(
+                "UPDATE users SET password_hash=?, updated_at=? WHERE id=?", (password_hash, now, user_id),
+            )
+            if not cursor.rowcount:
+                raise KeyError(user_id)
+            await conn.execute("DELETE FROM web_sessions WHERE user_id=?", (user_id,))
+
+    async def rehash_password(self, user_id: str, password_hash: str, *, expected_hash: str) -> bool:
+        """Compare-and-swap rehash; a concurrent reset/change always wins."""
+        cursor = await self._db.execute(
+            "UPDATE users SET password_hash=? WHERE id=? AND password_hash=?",
+            (password_hash, user_id, expected_hash),
+        )
+        await self._db.commit()
+        return bool(cursor.rowcount)
+
+    _KEY_FIELDS = ("id", "user_id", "label", "prefix", "created_at", "last_used_at", "revoked_at")
+
+    async def create_api_key(
+        self, *, user_id: str, label: str, token_hash: str, prefix: str, now: int,
+    ) -> dict:
+        key_id = str(uuid4())
+        async with self.scheduling_tx() as conn:
+            user = await (await conn.execute("SELECT disabled FROM users WHERE id=?", (user_id,))).fetchone()
+            if user is None:
+                raise KeyError(user_id)
+            if user["disabled"]:
+                raise IdentityConflict("disabled users cannot receive API keys")
+            await conn.execute(
+                """INSERT INTO api_keys (id, user_id, label, token_hash, prefix, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (key_id, user_id, label, token_hash, prefix, now),
+            )
+            row = await (await conn.execute("SELECT * FROM api_keys WHERE id=?", (key_id,))).fetchone()
+        return {field: row[field] for field in self._KEY_FIELDS}
+
+    async def list_api_keys(self, user_id: str) -> list[dict]:
+        rows = await self._db.execute_fetchall(
+            "SELECT * FROM api_keys WHERE user_id=? ORDER BY created_at, id", (user_id,),
+        )
+        return [{field: row[field] for field in self._KEY_FIELDS} for row in rows]
+
+    async def revoke_api_key(self, user_id: str, key_id: str, *, now: int) -> bool:
+        rows = await self._db.execute_fetchall(
+            "SELECT revoked_at FROM api_keys WHERE id=? AND user_id=?", (key_id, user_id),
+        )
+        if not rows:
+            return False
+        if rows[0]["revoked_at"] is None:
+            await self._db.execute("UPDATE api_keys SET revoked_at=? WHERE id=?", (now, key_id))
+            await self._db.commit()
+        return True
+
+    async def resolve_api_key(self, token_hash: str, *, now: int) -> tuple[dict, dict] | None:
+        """Return (key, user) for an active key of an enabled user."""
+        rows = await self._db.execute_fetchall(
+            """SELECT k.id AS key_id, k.last_used_at, u.* FROM api_keys AS k
+               JOIN users AS u ON u.id = k.user_id
+               WHERE k.token_hash=? AND k.revoked_at IS NULL AND u.disabled=0""",
+            (token_hash,),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        if row["last_used_at"] is None or now - row["last_used_at"] >= 60:
+            await self._db.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (now, row["key_id"]))
+            await self._db.commit()
+        user = self._user(row)
+        user.pop("key_id", None)
+        user.pop("last_used_at", None)
+        return {"id": row["key_id"]}, user
+
+    async def create_web_session(
+        self, *, user_id: str, token_hash: str, csrf_token: str, now: int, expires_at: int,
+        password_hash: str,
+    ) -> str | None:
+        """Issue a session only while ``password_hash`` is current and the user enabled.
+
+        The single conditional INSERT makes a login that verified a password
+        lose against a reset/disable committed before it; resets committed
+        afterwards delete the new session along with the others.
+        """
+        session_id = str(uuid4())
+        cursor = await self._db.execute(
+            """INSERT INTO web_sessions (id, token_hash, user_id, csrf_token, created_at, expires_at)
+               SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (
+                 SELECT 1 FROM users WHERE id=? AND password_hash=? AND disabled=0
+               )""",
+            (session_id, token_hash, user_id, csrf_token, now, expires_at, user_id, password_hash),
+        )
+        await self._db.execute("DELETE FROM web_sessions WHERE expires_at <= ?", (now,))
+        await self._db.commit()
+        return session_id if cursor.rowcount else None
+
+    async def resolve_web_session(self, token_hash: str, *, now: int) -> tuple[dict, dict] | None:
+        rows = await self._db.execute_fetchall(
+            """SELECT s.id AS session_id, s.csrf_token, s.expires_at, u.* FROM web_sessions AS s
+               JOIN users AS u ON u.id = s.user_id
+               WHERE s.token_hash=? AND s.expires_at > ? AND u.disabled=0""",
+            (token_hash, now),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        user = self._user(row)
+        session = {
+            "id": user.pop("session_id"),
+            "csrf_token": user.pop("csrf_token"),
+            "expires_at": user.pop("expires_at"),
+        }
+        return session, user
+
+    async def delete_web_session(self, session_id: str) -> None:
+        await self._db.execute("DELETE FROM web_sessions WHERE id=?", (session_id,))
+        await self._db.commit()
 
     # ── Failures ───────────────────────────────────────────────────────
 
@@ -1515,14 +2680,15 @@ class Database:
     # ── Admin ─────────────────────────────────────────────────────────
 
     async def delete_worker(self, worker_id: str) -> bool:
-        """Delete a worker and all its associated records."""
-        cursor = await self._db.execute(
-            "DELETE FROM jobs WHERE worker_id = ?", (worker_id,)
-        )
-        cursor = await self._db.execute(
+        """Delete a worker registration and its live service records.
+
+        Jobs are retained: usage accounting and history keep the worker-name
+        snapshot and left-join absent workers.
+        """
+        await self._db.execute(
             "DELETE FROM port_forwards WHERE worker_id = ?", (worker_id,)
         )
-        cursor = await self._db.execute(
+        await self._db.execute(
             "DELETE FROM marimo_sessions WHERE worker_id = ?", (worker_id,)
         )
         cursor = await self._db.execute(

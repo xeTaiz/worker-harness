@@ -8,8 +8,9 @@ This repository targets **Tailscale + Headscale**.
 
 The control service coordinates one orchestrator, one PM per configured project,
 and disposable task worktrees on Herdr client machines. GPU workers remain the
-compute plane. Role-scoped bearer tokens protect agent APIs; operator clients
-and the Tailnet-only web edge use a separate operator secret.
+compute plane. Internal role-scoped bearer tokens protect agent workflows.
+Humans sign in through browser accounts; ordinary native clients use per-user
+API keys. Only the bootstrap administrator's web session controls human Pi.
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for the paired server/client rollout, pinned
 plugin artifacts, credential placement, acceptance gates, and database rollback.
@@ -17,10 +18,12 @@ The old router and delegated-container Pi launch paths are removed.
 
 ## GPU job queue
 
-PM/task agents and operators can enqueue named jobs through `POST /api/v1/jobs/queue`,
-inspect them with `GET /api/v1/jobs/queue`, and update pending jobs through
-`PATCH /api/v1/jobs/{job_id}/queue`. The plugin exposes `enqueue`,
-`update_queued_job`, and `list_queue`.
+Authenticated users and PM/task agents can enqueue named GPU jobs through
+`POST /api/v1/jobs/queue` and inspect the shared sanitized board with
+`GET /api/v1/jobs/queue`. Owners edit their pending metadata through
+`PATCH /api/v1/jobs/{job_id}/queue`. Shared reordering requires a reason, a
+revision-bound preview and explicit commit; priority/deadlines never sort FIFO.
+Commands/logs and resource controls remain owner-private, including from admins.
 
 Queues are durable and FIFO per worker: a multi-GPU head job waits until its
 requested capacity is available rather than allowing smaller jobs to bypass it.
@@ -28,9 +31,14 @@ Claimed jobs receive explicit `CUDA_VISIBLE_DEVICES` assignments. Ambiguous SSH
 launch results keep those GPUs reserved while recovery checks durable worker
 artifacts; they are not immediately retried or treated as free capacity.
 
-Run one control process against the registry. Immediate jobs are outside queue
-reservations, and external GPU use is detected through worker telemetry. Do not
-delete worker job artifacts while recovering an interrupted launch.
+Run one control process against the registry. Immediate CPU/setup jobs use
+`POST /api/v1/jobs`, run with an empty `CUDA_VISIBLE_DEVICES`, and never wait
+behind GPU work. External GPU use is detected through worker telemetry. Do not
+delete worker job artifacts while recovering interrupted launches or stops.
+
+This is a trusted-team shared runtime: users share the OS account, code and data.
+API privacy is enforced, but arbitrary shell jobs can access shared files and
+processes. `CUDA_VISIBLE_DEVICES` is cooperative assignment, not isolation.
 
 ## Networking model
 
@@ -42,17 +50,18 @@ Required ACL directions:
 
 1. `tag:wh-worker` -> `tag:wh-orchestrator:12888` (heartbeat/register API only)
 2. `tag:wh-orchestrator` -> `tag:wh-worker:*` (worker control traffic)
-3. Operator/client Tailnet members -> `tag:wh-orchestrator:12889` (privileged control API, including agent fleet control)
+3. Trusted team/client Tailnet members -> harness HTTPS edge (authenticated web/API)
+4. Internal Pi clients -> `tag:wh-orchestrator:12889` (role-scoped control API)
 
 `tag:wh-worker` must not be granted access to port `12889`; worker registration
-and the operator control plane are deliberately separate services. In
-production, the mobile Pi-session webapp is served by the standalone `wh-web`
-container on the VPS host's Tailscale IP. `wh-web` proxies only the session UI's
-HTTP, SSE, and WebSocket routes to `wh-orch:12889` over a private Docker network.
-It uses the existing Tailnet trust boundary—there is no separate browser
-credential. The orchestrator can still serve an explicitly configured
-`WH_WEB_DIR` for local development, but its production image does not bundle the
-web assets. Interactive session terminals continue through the host relay.
+and the human control plane are separate services. The standalone `wh-web`
+container serves the browser UI and allowlisted HTTP/SSE/WebSocket API routes
+over a private Docker network to `wh-orch:12889`. It forwards each client's
+Cookie/Authorization unchanged, with no shared identity injection. Unrelated
+`/api/` routes are 404; API responses are no-store. Place production `wh-web`
+behind HTTPS on the trusted Tailnet. The orchestrator can serve `WH_WEB_DIR`
+for explicit loopback development; its production image does not bundle assets.
+The existing direct native terminal relay remains a separate trusted Pi workflow.
 
 ## Build images
 
@@ -84,9 +93,9 @@ caches, Git history, and deployment data.
 
 ## Run the standalone web UI
 
-`docker-compose.web.example.yml` manages only `wh-web`. This is intentional: you
-can deploy and test it against the currently running orchestrator before
-replacing the orchestrator image.
+`docker-compose.web.example.yml` manages only `wh-web`. Deploy it together with
+the matching multi-user control API and clients; an older anonymous/shared-bearer
+backend is not compatible. Preserve all host-managed storage and state mounts.
 
 The existing orchestrator must be attached to a user-defined Docker network and
 be resolvable there as `wh-orch`:
@@ -101,8 +110,13 @@ argument while retaining the `wh-orch` alias. Connecting a container that is
 already on the network is unnecessary.
 
 Start the web container with an explicit host Tailscale address. There is no
-`0.0.0.0` default, and the web container needs no persistent volume because its
-assets are baked into the image.
+`0.0.0.0` default; assets are baked in and it holds no shared authentication
+secret. Configure the control service with `WH_WEB_ORIGIN`, one exact external
+HTTPS origin such as `https://harness.example.net`, with no path or trailing
+slash. Only `localhost`, `127.0.0.1` and `[::1]` may use HTTP for development.
+Provide HTTPS at the existing ingress in front of the internal HTTP web listener;
+preserve Host and Origin. Do not expose its Tailnet HTTP port as the production
+browser URL.
 
 ```bash
 export WH_WEB_BIND_IP="$(tailscale ip -4 | head -n1)"
@@ -112,35 +126,53 @@ export WH_DOCKER_NETWORK=wh-internal
 docker compose -f docker-compose.web.example.yml up -d --build
 ```
 
-Verify the separate path before changing the orchestrator deployment:
+On first installation, run against the control service's configured `WH_DB_PATH`
+and environment (inside that container when containerized):
 
 ```bash
-curl -fsS "http://${WH_WEB_BIND_IP}:${WH_WEB_PORT}/healthz"
-curl -fsS "http://${WH_WEB_BIND_IP}:${WH_WEB_PORT}/"
-curl -fsS "http://${WH_WEB_BIND_IP}:${WH_WEB_PORT}/api/v1/pi/sessions"
+uv run python -m worker_harness.orchestrator bootstrap-admin --username admin
 ```
 
-Then open `http://<VPS-TAILSCALE-IP>:18080/` from an authorized Tailnet client
-and verify session updates, prompting/configuration, and terminal attachment.
-The old orchestrator-served UI remains available during this test, so stopping
-`wh-web` is a complete rollback.
+The command prompts twice for a password without echo; never pass passwords in
+arguments/environment. There are no default credentials. Repeating bootstrap
+fails, and no protected requests or dispatch are allowed until it completes.
+Sign in at `https://harness.example.net/#login`; the job board is the default
+view, and bootstrap alone has the separate Pi item.
 
-Only after that test passes should the no-web orchestrator image be deployed.
-The replacement `wh-orch` must join `wh-internal` with the same alias. Restart
-`wh-web` after replacing `wh-orch`, because Nginx resolves the upstream container
-address when it starts:
+Create users in `#admin/users` and ordinary per-user API keys in `#keys`. Keys are
+revealed once. Native CLI/extension clients set `WH_ORCHESTRATOR_URL` to the
+harness URL and use `WH_API_KEY_FILE` pointing to a private mode-0600 file, or
+`WH_API_KEY` (env wins over file only when `WH_SESSION_ROLE` is absent). Internal
+Pi agents use only `WH_SESSION_TOKEN` with their role, never a human-key fallback.
+Old shared-bearer environment settings and edge secrets are removed and no
+longer authenticate. Do not put keys in URLs, Git, browser storage or workloads.
+
+For upgrades, drain running jobs before activation, stop the control service and
+back up SQLite with its journals. Start the new release against the preserved
+database to migrate, then bootstrap/backfill historical ownership as needed.
+Recreate legacy unauthenticated Marimo listeners before exposing the new UI;
+only newly token-protected, owner-proxied notebooks are secure managed sessions.
+Never auto-stop legacy work to migrate. See [DEPLOYMENT.md](DEPLOYMENT.md) for the
+full activation/rollback procedure.
+
+After login, verify the job board, key issuance/revocation, private filtering,
+and owned Tunnels/Marimo views. Generic raw TCP tunnels need their service's own
+authentication and are reachable by trusted Tailnet users; managed Marimo uses
+the owner-authenticated proxy instead. Verify bootstrap's Pi SSE/terminal flow
+separately. `/healthz` is the edge's public probe; `/health` is the control probe.
+Restart `wh-web` after replacing `wh-orch`, since Nginx resolves its container
+address at startup:
 
 ```bash
 docker compose -f docker-compose.web.example.yml restart wh-web
 ```
 
-Do not change or share the orchestrator's SQLite or Tailscale state mounts as
-part of this web cutover, and never run two orchestrators against the same
-Tailscale state directory.
+Do not change/share SQLite or Tailscale state mounts as part of this cutover,
+and never run two control processes against the same state directories.
 
 ## Start containers with Docker or Podman (ephemeral runtime)
 
-Run orchestrator (required env: `TS_AUTHKEY`):
+Run orchestrator (required env: `TS_AUTHKEY`, `WH_WEB_ORIGIN`):
 
 ### Docker
 
@@ -153,6 +185,7 @@ docker run -d \
   -v worker-harness-orchestrator-tailscale:/var/lib/tailscale \
   -v worker-harness-orchestrator-data:/root/.config/worker-harness \
   -e TS_AUTHKEY='<ORCH_TS_AUTHKEY>' \
+  -e WH_WEB_ORIGIN='https://harness.example.net' \
   xetaiz/wh-orch:latest
 ```
 
@@ -167,6 +200,7 @@ podman run -d \
   -v worker-harness-orchestrator-tailscale:/var/lib/tailscale \
   -v worker-harness-orchestrator-data:/root/.config/worker-harness \
   -e TS_AUTHKEY='<ORCH_TS_AUTHKEY>' \
+  -e WH_WEB_ORIGIN='https://harness.example.net' \
   xetaiz/wh-orch:latest
 ```
 
@@ -397,6 +431,9 @@ Data namespace identity:
 Required:
 
 - `TS_AUTHKEY` - Headscale/Tailscale auth key
+- `WH_WEB_ORIGIN` - one exact external HTTPS browser origin (no path/trailing slash);
+  HTTP is permitted only for localhost/127.0.0.1/[::1] development. Use the same
+  configured `WH_DB_PATH` for first-run interactive `bootstrap-admin`.
 
 Defaults (if unset):
 
@@ -408,6 +445,14 @@ Defaults (if unset):
 - `WH_HB_PORT=12888`
 - `WH_DB_PATH=~/.config/worker-harness/db.sqlite`
 - `WH_COMMAND=serve`
+
+Optional:
+
+- `WH_TAILSCALE_SOCKET` - tailscaled local API socket used for `tailscale ssh`
+  to workers and `tailscale ip`. Unset uses the CLI default socket (correct in
+  the container). Set it when the orchestrator runs directly on a host with
+  several tailscaleds, e.g. a userspace headscale node beside the host's own
+  Tailscale: `/run/tailscale-guest-dominik/tailscaled.sock`.
 
 ## Worker registration fields
 

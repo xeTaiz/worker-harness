@@ -28,31 +28,19 @@ _ACTIVE_STATES = {"working", "idle", "blocked"}
 
 
 def _base_url() -> str:
-    from worker_harness.cli.app import get_config
-
-    configured_url = os.environ.get("WH_ORCHESTRATOR_URL")
-    if configured_url:
-        return configured_url.rstrip("/")
-    bridge_config = Path.home() / ".pi" / "worker-harness" / "config.json"
-    try:
-        configured_url = str(
-            json.loads(bridge_config.read_text(encoding="utf8")).get("orchestratorUrl") or ""
-        )
-        if configured_url.startswith(("http://", "https://")):
-            return configured_url.rstrip("/")
-    except (OSError, json.JSONDecodeError):
-        pass
-    return get_config().control.url.rstrip("/")
+    from worker_harness.client import base_url
+    return base_url()
 
 
 def _headers() -> dict[str, str]:
+    role = os.environ.get("WH_SESSION_ROLE", "")
     token = os.environ.get("WH_SESSION_TOKEN", "").strip()
-    if not token and not os.environ.get("WH_SESSION_ROLE", "").strip():
-        token = os.environ.get("WH_OPERATOR_TOKEN", "").strip()
-        token_file = os.environ.get("WH_OPERATOR_TOKEN_FILE", "").strip()
-        if not token and token_file:
-            token = Path(token_file).expanduser().read_text(encoding="utf8").strip()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    if role not in {"orchestrator", "pm", "task"} or not token:
+        raise RuntimeError(
+            "Pi CLI requires an internal WH_SESSION_ROLE and WH_SESSION_TOKEN; "
+            "use the bootstrap administrator's web Pi view for human access"
+        )
+    return {"Authorization": f"Bearer {token}"}
 
 
 async def _request(

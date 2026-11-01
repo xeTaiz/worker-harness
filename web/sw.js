@@ -1,6 +1,6 @@
-const CACHE = "wh-pi-shell-v22";
+const CACHE = "wh-multi-user-shell-v24";
 const SHELL = [
-  "/", "/index.html", "/app.css?v=22", "/app.js?v=22", "/manifest.webmanifest", "/icon.svg", "/icon-maskable.svg",
+  "/", "/index.html", "/app.css?v=24", "/app.js?v=24", "/manifest.webmanifest", "/icon.svg", "/icon-maskable.svg",
   "/vendor/marked/marked.umd.js", "/vendor/dompurify/purify.min.js",
   "/vendor/katex/katex.min.js", "/vendor/katex/auto-render.min.js", "/vendor/katex/katex.min.css",
 ];
@@ -19,7 +19,9 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
-  if (event.request.method !== "GET" || url.origin !== self.location.origin || url.pathname.startsWith("/api/")) return;
+  // Only static shell assets are cacheable. Auth, API, notebook and health
+  // responses always use the network, including unknown future endpoints.
+  if (event.request.method !== "GET" || url.origin !== self.location.origin || url.pathname.startsWith("/api/") || !SHELL.includes(url.pathname + url.search)) return;
   event.respondWith(
     caches.match(event.request).then((cached) => cached || fetch(event.request).then((response) => {
       if (response.ok && response.type === "basic") {

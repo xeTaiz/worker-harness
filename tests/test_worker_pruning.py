@@ -3,8 +3,10 @@ import unittest
 from pathlib import Path
 
 from worker_harness.db import Database
-from worker_harness.models import Job, WorkerRegistration
+from worker_harness.models import Job, JobStatus, WorkerRegistration
 from worker_harness.orchestrator import prune_stale_workers_once
+
+from identity_support import bootstrap
 
 
 class AutomaticWorkerPruningTests(unittest.IsolatedAsyncioTestCase):
@@ -12,6 +14,7 @@ class AutomaticWorkerPruningTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.db = Database(Path(self.tmp.name) / "worker-harness.db")
         await self.db.connect()
+        self.owner = await bootstrap(self.db)
 
     async def asyncTearDown(self) -> None:
         await self.db.close()
@@ -32,7 +35,11 @@ class AutomaticWorkerPruningTests(unittest.IsolatedAsyncioTestCase):
         await self.db.upsert_worker(stale)
         await self.db.upsert_worker(fresh)
         await self.db.insert_job(
-            Job(id="historical-job", worker_id=stale.worker_id, command="true")
+            Job(
+                id="historical-job", worker_id=stale.worker_id, command="true",
+                owner_user_id=self.owner["id"],
+                submitted_by_actor_id=f"migration:{self.owner['id']}",
+            )
         )
         await self.db._db.execute(
             "UPDATE workers SET last_heartbeat_ts = ? WHERE id = ?",
@@ -57,6 +64,30 @@ class AutomaticWorkerPruningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.id, stale.worker_id)
         self.assertIsNotNone(await self.db.get_worker(stale.worker_id))
         self.assertIsNotNone(await self.db.get_job("historical-job"))
+
+    async def test_delete_worker_retains_owned_history_and_allocated_usage(self) -> None:
+        worker = await self.db.upsert_worker(self.registration("deleted-worker"))
+        job = Job(
+            id="completed-job", worker_id=worker.id, command="private command",
+            owner_user_id=self.owner["id"],
+            submitted_by_actor_id=f"migration:{self.owner['id']}",
+            status=JobStatus.DONE, started_at=100, finished_at=220,
+            gpu_count=2, gpu_indices=[0, 1],
+            worker_name_at_submission=worker.name,
+        )
+        await self.db.insert_job(job)
+        before = await self.db.usage(now=300)
+
+        self.assertTrue(await self.db.delete_worker(worker.id))
+
+        self.assertIsNone(await self.db.get_worker(worker.id))
+        historical = await self.db.get_job(job.id)
+        self.assertIsNotNone(historical)
+        self.assertEqual(historical.owner_user_id, self.owner["id"])
+        self.assertEqual(historical.worker_name_at_submission, worker.name)
+        after = await self.db.usage(now=400)
+        self.assertEqual(after, before)
+        self.assertEqual(after[0]["allocated_gpu_seconds"], 240)
 
 
 if __name__ == "__main__":

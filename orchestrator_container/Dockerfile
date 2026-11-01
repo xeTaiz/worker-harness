@@ -27,7 +27,9 @@ RUN pip install --no-cache-dir .
 COPY orchestrator_container/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Probe the configured control address (it may be a single docker-network IP).
 HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=12 \
-    CMD curl -fsS "http://127.0.0.1:${WH_CONTROL_PORT:-12889}/health" || exit 1
+    CMD host="${WH_CONTROL_HOST:-127.0.0.1}"; [ "$host" = 0.0.0.0 ] && host=127.0.0.1; \
+        curl -fsS "http://${host}:${WH_CONTROL_PORT:-12889}/health" || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "-s", "-g", "--", "/entrypoint.sh"]

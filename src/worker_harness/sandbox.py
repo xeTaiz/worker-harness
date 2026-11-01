@@ -93,7 +93,7 @@ def launch_command(
 
     assignments = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
     return (
-        f"exec env -u WH_PI_SESSION_ID -u WH_OPERATOR_TOKEN -u WH_OPERATOR_TOKEN_FILE "
+        f"exec env -u WH_PI_SESSION_ID -u WH_API_KEY -u WH_API_KEY_FILE "
         f"{assignments} {shlex.join(argv)}"
     )
 

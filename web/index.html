@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#090d14">
   <meta name="color-scheme" content="dark">
-  <meta name="description" content="Mobile control surface for Worker Harness Pi sessions">
+  <meta name="description" content="Worker Harness shared job board, owned services, and account controls">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/icon-maskable.svg">
   <link rel="stylesheet" href="/vendor/katex/katex.min.css">
-  <link rel="stylesheet" href="/app.css?v=22">
-  <title>Pi Sessions</title>
+  <link rel="stylesheet" href="/app.css?v=24">
+  <title>Worker Harness</title>
 </head>
 <body>
   <div id="app" class="app-shell">
@@ -19,23 +19,25 @@
       <button id="sidebar-toggle" class="icon-button sidebar-toggle" type="button" aria-label="Show agents" aria-controls="agent-sidebar" aria-expanded="false">☰</button>
       <div class="brand-mark" aria-hidden="true">π</div>
       <div class="title-wrap">
-        <h1 id="page-title">Pi sessions</h1>
+        <h1 id="page-title">Worker Harness</h1>
         <p id="page-subtitle">Worker Harness</p>
       </div>
       <span id="connection-dot" class="connection-dot" title="Disconnected"></span>
       <button id="install" class="install-button hidden">Install</button>
-      <button id="refresh" class="icon-button" aria-label="Refresh agents">↻</button>
+      <button id="refresh" class="icon-button" aria-label="Refresh current view">↻</button>
     </header>
 
     <div class="workspace">
-      <aside id="agent-sidebar" class="agent-sidebar" aria-label="Agents">
+      <aside id="agent-sidebar" class="agent-sidebar" aria-label="Navigation">
         <div class="sidebar-header">
           <div>
-            <p class="eyebrow">TAILNET</p>
-            <h2>Agents</h2>
+            <p class="eyebrow">WORKER HARNESS</p>
+            <h2>Workspace</h2>
           </div>
           <button id="sidebar-close" class="icon-button sidebar-close" type="button" aria-label="Hide agents">×</button>
         </div>
+        <nav id="workspace-nav" class="workspace-nav" aria-label="Workspace"></nav>
+        <div id="pi-navigation" class="hidden">
         <button id="global-button" class="global-nav" type="button">
           <span class="global-nav-mark" aria-hidden="true">⌁</span>
           <span><strong>Global</strong><small>Orchestrator and fleet</small></span>
@@ -48,10 +50,15 @@
           <h2>No agents found</h2>
           <p>Start Pi with the Worker Harness bridge, then refresh.</p>
         </div>
+        </div>
       </aside>
       <button id="sidebar-backdrop" class="sidebar-backdrop hidden" type="button" aria-label="Hide agents"></button>
 
-      <main id="session-list-view" class="view welcome-view">
+      <main id="workspace-view" class="view workspace-view hidden" tabindex="-1">
+        <p id="workspace-notice" class="notice hidden" role="status"></p>
+        <div id="workspace-content"></div>
+      </main>
+      <main id="session-list-view" class="view welcome-view hidden">
         <section class="hero">
           <p class="eyebrow">TAILNET SESSION FABRIC</p>
           <h2>Continue anywhere.</h2>
@@ -128,6 +135,6 @@
   <script src="/vendor/dompurify/purify.min.js"></script>
   <script src="/vendor/katex/katex.min.js"></script>
   <script src="/vendor/katex/auto-render.min.js"></script>
-  <script type="module" src="/app.js?v=22"></script>
+  <script type="module" src="/app.js?v=24"></script>
 </body>
 </html>

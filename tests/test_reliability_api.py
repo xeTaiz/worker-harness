@@ -9,6 +9,8 @@ from worker_harness.db import Database
 from worker_harness.heartbeat import create_app
 from worker_harness.models import GPUInfo, WorkerRegistration
 
+from identity_support import bootstrap, login
+
 
 class ReliabilityApiTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -16,6 +18,7 @@ class ReliabilityApiTests(unittest.TestCase):
         self.tmp.close()
         self.db = Database(self.tmp.name)
         asyncio.run(self.db.connect())
+        asyncio.run(bootstrap(self.db))
         asyncio.run(self.db.upsert_worker(WorkerRegistration(
             worker_id="worker-a",
             name="worker-a",
@@ -41,41 +44,51 @@ class ReliabilityApiTests(unittest.TestCase):
         # Context manager starts/shuts down lifespan, exercising reaper/lane
         # cleanup as well as normal request handlers.
         with TestClient(self.app) as client:
+            client.headers.update(login(client, "admin"))
+            other_key = client.post("/api/v1/auth/keys", json={"label": "other"}).json()["token"]
             headers = {"X-Agent-Name": "cache-agent"}
             self.assertEqual(client.get("/api/v1/workers", headers=headers).status_code, 200)
             self.assertEqual(client.get("/api/v1/workers", headers=headers).status_code, 200)
 
-            # A per-agent bucket permits its burst then responds 429, without
-            # impacting another agent's bucket.
-            limited_headers = {"X-Agent-Name": "limited-agent"}
-            for _ in range(50):
-                self.assertEqual(client.get("/api/v1/workers", headers=limited_headers).status_code, 200)
-            limited = client.get("/api/v1/workers", headers=limited_headers)
+            # A per-credential bucket permits its burst then responds 429.
+            # Only SSH-backed reads and mutations consume tokens; polled
+            # database reads never do.
+            for _ in range(60):
+                self.assertEqual(client.get("/api/v1/workers").status_code, 200)
+            for _ in range(49):
+                self.assertEqual(client.get("/api/v1/jobs/missing/logs").status_code, 404)
+            limited = client.get("/api/v1/jobs/missing/logs")
             self.assertEqual(limited.status_code, 429)
             self.assertIn("Retry-After", limited.headers)
+            # A caller-chosen agent name cannot mint a fresh bucket...
+            evading = client.get("/api/v1/jobs/missing/logs", headers={"X-Agent-Name": "fresh-agent-123"})
+            self.assertEqual(evading.status_code, 429)
+            # ...while a different credential from the same peer is unaffected.
+            other = TestClient(self.app).get(
+                "/api/v1/jobs/missing/logs", headers={"Authorization": f"Bearer {other_key}"},
+            )
+            self.assertEqual(other.status_code, 404)
 
             # Pi bridge traffic is incarnation-scoped infrastructure, not an
-            # operator/agent request. It must not share the source-IP bucket:
-            # transcript batching alone can exceed 60 requests per minute.
+            # operator/agent request: it never consumes the limited bucket.
             for _ in range(20):
                 bridge = client.get(
                     "/api/v1/pi/bridge/missing/commands",
                     params={"incarnation": "inc", "wait_seconds": 0},
-                    headers=limited_headers,
                 )
                 self.assertEqual(bridge.status_code, 404, bridge.text)
 
-            stats = client.get("/api/v1/_stats", headers={"X-Agent-Name": "operator"})
+            stats = client.get("/api/v1/_stats")
             self.assertEqual(stats.status_code, 200)
             body = stats.json()
             self.assertGreaterEqual(body["cache"]["hits"], 1)
             self.assertGreaterEqual(body["cache"]["misses"], 1)
             self.assertIn("workers", body["lanes"])
-            self.assertIn("agents", body["rate_limit"])
-            self.assertEqual(
-                body["rate_limit"]["agents"]["limited-agent"]["capacity"],
-                50,
-            )
+            agents = body["rate_limit"]["agents"]
+            self.assertNotIn("fresh-agent-123", agents)
+            # Two credential buckets; the credential-less login request is keyed by peer.
+            self.assertEqual(len([name for name in agents if name.startswith("credential:")]), 2)
+            self.assertEqual({agent["capacity"] for agent in agents.values()}, {50})
             self.assertIn("tunnels", body)
             self.assertEqual(body["http"]["in_flight"], 1)  # this stats request itself
 

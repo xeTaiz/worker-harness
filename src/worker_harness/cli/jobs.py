@@ -1,251 +1,190 @@
-"""job subcommand group."""
+"""Owner-authorized jobs and the shared public FIFO board."""
 
 from __future__ import annotations
 
 import asyncio
+import json
+import math
+from datetime import datetime, timezone
+from enum import Enum
+from urllib.parse import quote
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-console = Console()
+from worker_harness.client import request
+
+console = Console(markup=False)
 
 
-def _config():
-    from worker_harness.config import Config
-    return Config.load()
+class Priority(str, Enum):
+    flexible = "flexible"
+    normal = "normal"
+    blocking = "blocking"
+    time_critical = "time_critical"
 
 
-def _db():
-    from worker_harness.db import Database
-    return Database(_config().db_path)
+def _output_mode():
+    from worker_harness.cli.app import _state
+    return _state.get("output", "text")
 
 
-def _job_manager():
-    from worker_harness.job import JobManager
-    return _job_manager._instance  # type: ignore
-_job_manager._instance = None  # type: ignore
+def _run(coroutine):
+    try:
+        return asyncio.run(coroutine)
+    except RuntimeError as exc:
+        console.print(str(exc), markup=False)
+        raise typer.Exit(1) from exc
 
 
-def _get_jm():
-    from worker_harness.job import JobManager
-    if _job_manager._instance is None:  # type: ignore
-        _job_manager._instance = JobManager(_db())
-    return _job_manager._instance  # type: ignore
+def _format_timestamp(ts: int | None) -> str:
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m-%d %H:%M")
 
 
-async def _db_connect():
-    db = _db()
-    await db.connect()
-    return db
+def delay_messages(entries: list[dict]) -> list[str]:
+    """Render individual estimate-at-move events, never sum historic delays."""
+    messages = []
+    for entry in entries:
+        delay = entry.get("delay_seconds")
+        if delay is None:
+            message = "Moved later; delay estimate unavailable"
+        elif delay > 0:
+            message = (f"+{math.ceil(delay / 60)} minutes estimated delay because of "
+                       f"{entry['moved_job_name']} by {entry['moved_job_owner_display_name']}")
+        else:
+            continue
+        messages.append(f"{message}; Moved by {entry['actor_display_name']}; "
+                        f"{entry['reason']} ({_format_timestamp(entry.get('created_at'))})")
+    return messages
 
 
 def _job_start_impl(
     worker_id: str,
     command: str,
-    name: str | None = None,
+    name: str = typer.Option(..., "--name", help="Public queue label (not a private command)"),
+    expected_seconds: int = typer.Option(..., "--expected-seconds", min=1),
+    gpu_count: int = typer.Option(0, "--gpu-count", min=0, help="0: immediate CPU setup; positive: FIFO GPU queue"),
+    priority: Priority = typer.Option(Priority.normal, "--priority"),
+    priority_note: str = typer.Option("", "--priority-note"),
+    deadline_at: int | None = typer.Option(None, "--deadline-at"),
     no_pty: bool = False,
 ):
+    if not name.strip():
+        raise typer.BadParameter("name must not be blank", param_hint="--name")
+    if priority == Priority.time_critical and not priority_note.strip():
+        raise typer.BadParameter("time_critical requires --priority-note")
+
     async def run():
-        db = await _db_connect()
-        async with db:
-            jm = _get_jm()
-            jm.db = db
-            from worker_harness.cli.app import _state
-            output_mode = _state.get("output", "text")
-
-            worker = await db.get_worker(worker_id)
-            if not worker:
-                workers = await db.list_workers()
-                worker = next((w for w in workers if w.name == worker_id), None)
-            if not worker:
-                console.print(f"[red]Worker not found: {worker_id}[/]")
-                raise typer.Exit(1)
-
-            job = await jm.start_job(worker, command, name=name, pty_enabled=not no_pty)
-
-            if output_mode == "json":
-                import json
-                console.print(json.dumps({
-                    "job_id": job.id,
-                    "tmux_session": job.tmux_session,
-                    "status": job.status.value
-                }))
-            else:
-                from worker_harness.models import JobStatus
-                if job.status == JobStatus.FAILED:
-                    console.print(f"[red]Failed to start job on {worker.name}[/]")
-                    raise typer.Exit(1)
-                console.print(f"[green]Job started[/]: {job.id}")
-                console.print(f"  Worker:  {worker.name} ({worker.ssh_host})")
-                console.print(f"  Session: {job.tmux_session}")
-                short_cmd = command[:80] + ("..." if len(command) > 80 else "")
-                console.print(f"  Command: {short_cmd}")
-    asyncio.run(run())
+        payload = dict(worker_id=worker_id, command=command, name=name,
+                       expected_seconds=expected_seconds, priority=priority.value,
+                       priority_note=priority_note, deadline_at=deadline_at, no_pty=no_pty)
+        path = "/api/v1/jobs"
+        if gpu_count:
+            payload["gpu_count"] = gpu_count
+            path += "/queue"
+        job = await request("POST", path, json=payload)
+        if _output_mode() == "json":
+            console.print(json.dumps(job))
+        else:
+            console.print(f"Job {job['status']}: {job['id']}", markup=False)
+        if job["status"] == "failed":
+            raise typer.Exit(1)
+    _run(run())
 
 
 def _job_list_impl(
     worker_id: str | None = typer.Option(None, "--worker", help="Filter by worker ID or name"),
-    status_val: str | None = typer.Option(None, "--status", help="Filter by status: pending, running, done, failed"),
+    status_val: str | None = typer.Option(None, "--status", help="Filter by status"),
 ):
     async def run():
-        db = await _db_connect()
-        async with db:
-            from worker_harness.cli.app import _state
-            from worker_harness.models import JobStatus
-            output_mode = _state.get("output", "text")
-
-            job_status = None
-            if status_val is not None:
-                try:
-                    job_status = JobStatus(status_val)
-                except ValueError:
-                    console.print(f"[red]Invalid status: {status_val}[/]")
-                    raise typer.Exit(1)
-
-            jobs_list = await db.list_jobs(worker_id=worker_id, status=job_status)
-            all_workers = {w.id: w for w in await db.list_workers()}
-
-            # Refresh status for jobs that appear to be running
-            from worker_harness.job import JobManager
-            jm = JobManager(db)
-            updated = []
-            for j in jobs_list:
-                if j.status in (JobStatus.STARTING, JobStatus.RUNNING, JobStatus.PENDING):
-                    w = all_workers.get(j.worker_id)
-                    if w:
-                        j = await jm.refresh_job_status(w, j)
-                updated.append(j)
-            jobs_list = updated
-
-            if output_mode == "json":
-                import json
-                data = [
-                    {
-                        **j.model_dump(mode="json"),
-                        "worker_name": getattr(all_workers.get(j.worker_id), "name", None),
-                    }
-                    for j in jobs_list
-                ]
-                console.print(json.dumps(data, indent=2))
-            else:
-                table = Table(title="Jobs")
-                table.add_column("ID")
-                table.add_column("Status")
-                table.add_column("Worker")
-                table.add_column("Command")
-                table.add_column("Exit")
-                table.add_column("Started")
-
-                for j in jobs_list:
-                    worker = all_workers.get(j.worker_id)
-                    status_color = {
-                        JobStatus.STARTING: "yellow",
-                        JobStatus.RUNNING: "yellow",
-                        JobStatus.DONE: "green",
-                        JobStatus.FAILED: "red",
-                        JobStatus.PENDING: "dim",
-                    }.get(j.status, "")
-                    short_cmd = j.command[:40] + ("..." if len(j.command) > 40 else "")
-                    table.add_row(
-                        j.id[:12],
-                        f"[{status_color}]{j.status.value}[/]",
-                        (worker.name if worker else (j.worker_id or "-"))[:15],
-                        short_cmd,
-                        str(j.exit_code) if j.exit_code is not None else "-",
-                        _format_timestamp(j.started_at),
-                    )
-                console.print(table)
-    asyncio.run(run())
+        params = {k: v for k, v in {"worker_id": worker_id, "status": status_val}.items() if v is not None}
+        jobs = await request("GET", "/api/v1/jobs", params=params)
+        if _output_mode() == "json":
+            console.print(json.dumps(jobs, indent=2))
+            return
+        table = Table(title="Your Jobs")
+        for column in ("ID", "Status", "Worker", "Name", "Command", "Exit", "Started", "Stop reason"):
+            table.add_column(column)
+        for job in jobs:
+            table.add_row(job["id"][:12], job.get("execution_state") if job.get("stop_requested_at") else job["status"],
+                          job.get("worker_name") or job["worker_id"], job.get("name") or "-",
+                          job["command"][:40], str(job.get("exit_code")),
+                          _format_timestamp(job.get("started_at")), job.get("termination_reason") or "-")
+        console.print(table)
+    _run(run())
 
 
-def _job_logs_impl(
-    job_id: str,
-    tail: int | None = None,
-    head: int | None = None,
-    follow: bool = False,
-):
+def _job_queue_impl(worker_id: str | None = typer.Option(None, "--worker")):
     async def run():
-        db = await _db_connect()
-        async with db:
-            job = await db.get_job(job_id)
-            if not job or not job.worker_id:
-                console.print(f"[red]Job not found: {job_id}[/]")
-                raise typer.Exit(1)
+        board = await request("GET", "/api/v1/jobs/queue", params={"worker_id": worker_id} if worker_id else {})
+        if _output_mode() == "json":
+            console.print(json.dumps(board, indent=2))
+            return
+        for worker in board["workers"]:
+            table = Table(title=f"{worker['worker_name']} — FIFO revision {worker['revision']}")
+            for column in ("Position", "ID", "Owner", "Name", "GPU", "Priority", "Status", "Estimate", "Delay history"):
+                table.add_column(column)
+            for job in worker["jobs"] + worker["cpu_jobs"]:
+                eta = (f"{_format_timestamp(job.get('estimated_start_at'))} → "
+                       f"{_format_timestamp(job.get('estimated_finish_at'))}") if job["estimate_status"] == "known" else (
+                           "unknown: " + job.get("estimate_explanation", ""))
+                duration = f"{job['expected_seconds']}s" if job.get("expected_seconds") else "unknown runtime"
+                table.add_row(str(job["position"]), job["id"][:12], job["owner_display_name"], job["name"],
+                              str(job["gpu_count"]), job["priority"],
+                              job.get("execution_state") if job.get("stop_requested_at") else job["status"],
+                              f"{duration}; {eta}", "\n".join(delay_messages(job.get("delay_history", []))))
+            console.print(table)
+    _run(run())
 
-            worker = await db.get_worker(job.worker_id)
-            if not worker:
-                console.print(f"[red]Worker not found for job: {job.worker_id}[/]")
-                raise typer.Exit(1)
 
-            jm = _get_jm()
-            jm.db = db
-
+def _job_logs_impl(job_id: str, tail: int | None = None, head: int | None = None, follow: bool = False):
+    async def run():
+        path = f"/api/v1/jobs/{quote(job_id, safe='')}/logs"
+        params = {}
+        if tail is not None:
+            params["tail"] = tail
+        elif head is None and not follow:
+            params["tail"] = 10
+        if head is not None:
+            params["head"] = head
+        previous = ""
+        while True:
+            data = await request("GET", path, params=params)
+            logs = data["logs"]
             if follow:
-                # Poll logs every second until Ctrl+C
-                last_len = 0
-                try:
-                    while True:
-                        logs = await jm.get_logs(worker, job_id, tail=50)
-                        lines = logs.splitlines()
-                        for line in lines[last_len:]:
-                            console.print(line)
-                        last_len = len(lines)
-                        await asyncio.sleep(1)
-                except asyncio.CancelledError:
-                    pass
-            else:
-                t = tail if tail is not None else (None if head is not None else 10)
-                h = head
-                logs = await jm.get_logs(worker, job_id, tail=t, head=h)
-                if logs:
-                    console.print(logs, end="")
+                # Poll the whole selected log, not a sliding tail whose length stays constant.
+                common = min(len(previous), len(logs))
+                if logs[:common] == previous[:common]:
+                    console.print(logs[common:], end="", markup=False, highlight=False)
                 else:
-                    console.print("[dim]No log output yet.[/]")
-    asyncio.run(run())
+                    console.print(logs, end="", markup=False, highlight=False)
+                previous = logs
+                await asyncio.sleep(1)
+            else:
+                console.print(logs or "No log output yet.\n", end="", markup=False, highlight=False)
+                return
+    try:
+        _run(run())
+    except KeyboardInterrupt:
+        pass
 
 
 def _job_stop_impl(job_id: str):
     async def run():
-        db = await _db_connect()
-        async with db:
-            jm = _get_jm()
-            jm.db = db
-            from worker_harness.cli.app import _state
-            output_mode = _state.get("output", "text")
-
-            job = await db.get_job(job_id)
-            if not job or not job.worker_id:
-                console.print(f"[red]Job not found: {job_id}[/]")
-                raise typer.Exit(1)
-
-            worker = await db.get_worker(job.worker_id)
-            if not worker:
-                console.print(f"[red]Worker not found for job: {job.worker_id}[/]")
-                raise typer.Exit(1)
-
-            success = await jm.stop_job(worker, job_id)
-            if output_mode == "json":
-                import json
-                console.print(json.dumps({"job_id": job_id, "stopped": success}))
-            elif success:
-                console.print(f"[green]Job stopped: {job_id}[/]")
-            else:
-                console.print(f"[red]Failed to stop job: {job_id}[/]")
-                raise typer.Exit(1)
-    asyncio.run(run())
+        result = await request("DELETE", f"/api/v1/jobs/{quote(job_id, safe='')}")
+        if _output_mode() == "json":
+            console.print(json.dumps(result))
+        else:
+            console.print(f"Job stopped: {result['job_id']}", markup=False)
+    _run(run())
 
 
-def _format_timestamp(ts: int) -> str:
-    if not ts:
-        return "-"
-    from datetime import datetime, timezone
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m-%d %H:%M")
-
-
-# Build the typer app
-app = typer.Typer(name="job", help="Manage jobs on workers.")
+app = typer.Typer(name="job", help="Manage owned jobs and view the shared FIFO board.")
 app.command(name="start")(_job_start_impl)
 app.command(name="list")(_job_list_impl)
+app.command(name="queue")(_job_queue_impl)
 app.command(name="logs")(_job_logs_impl)
 app.command(name="stop")(_job_stop_impl)

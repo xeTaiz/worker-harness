@@ -4,6 +4,14 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+from worker_harness.marimo import (
+    build_launch_command, delete_local_token, local_token_path, proxy_base_path,
+    remote_token_path, upload_remote_token, write_local_token,
+)
+from worker_harness.models import Worker
+from worker_harness.ssh import SSHResult
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +42,9 @@ class MarimoLauncherTests(unittest.TestCase):
 
         self.project = self.root / "project"
         self.project.mkdir()
+        self.token_file = self.root / "native.token"
+        self.token_file.write_text("secret-native-token")
+        self.base_url = "/api/v1/marimo/test-session/proxy"
         self.env = os.environ.copy()
         self.env.update(
             PATH=f"{self.bin_dir}:{self.env['PATH']}",
@@ -60,6 +71,10 @@ class MarimoLauncherTests(unittest.TestCase):
             environment or self.venv,
             "--port",
             port,
+            "--token-file",
+            self.token_file,
+            "--base-url",
+            self.base_url,
         )
 
     def test_uses_overlay_and_required_loopback_server_options(self):
@@ -79,14 +94,19 @@ class MarimoLauncherTests(unittest.TestCase):
                 "--with",
                 "marimo==0.23.16",
                 "marimo",
+                "-q",
                 "edit",
                 str(notebook),
+                "--token",
+                "--token-password-file",
+                str(self.token_file),
+                "--base-url",
+                self.base_url,
                 "--host",
                 "127.0.0.1",
                 "--port",
                 "43123",
                 "--headless",
-                "--no-token",
             ],
         )
 
@@ -127,6 +147,21 @@ class MarimoLauncherTests(unittest.TestCase):
         result = self.run_launcher(*self.launch_args(self.project / "analysis.py", self.python))
         self.assertEqual(result.returncode, 2)
 
+    def test_rejects_missing_token_and_invalid_proxy_paths(self):
+        for option, value in (
+            ("--token-file", self.root / "missing.token"),
+            ("--token-file", "relative.token"),
+            ("--token-file", f"{self.root}/../native.token"),
+            ("--base-url", "/api/v1/marimo/other/session/proxy"),
+            ("--base-url", "https://example.test/proxy"),
+        ):
+            args = list(self.launch_args(self.project / "analysis.py"))
+            args[args.index(option) + 1] = value
+            with self.subTest(option=option, value=value):
+                result = self.run_launcher(*args)
+                self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.argv_file.exists())
+
     def test_does_not_create_missing_project_roots(self):
         notebook = self.root / "missing-project" / "notebooks" / "analysis.py"
         result = self.run_launcher(*self.launch_args(notebook))
@@ -134,6 +169,53 @@ class MarimoLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertFalse((self.root / "missing-project").exists())
         self.assertFalse(self.argv_file.exists())
+
+
+class MarimoTokenTests(unittest.IsolatedAsyncioTestCase):
+    def test_local_token_permissions_and_exclusive_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = local_token_path(Path(directory) / "db.sqlite", "test-session")
+            write_local_token(path, "private-token")
+            self.assertEqual(path.read_text(), "private-token")
+            for parent in (path.parent, path.parent.parent):
+                self.assertEqual(parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            with self.assertRaises(FileExistsError):
+                write_local_token(path, "replacement")
+            delete_local_token(path)
+            path.parent.mkdir(mode=0o700)
+            path.symlink_to(Path(directory) / "victim")
+            with self.assertRaises(FileExistsError):
+                write_local_token(path, "replacement")
+
+    def test_command_has_paths_not_secrets_and_validates_prefix(self):
+        command = build_launch_command(
+            notebook_path="/project/analysis.py", environment="/project/.venv", port=1234,
+            token_file="/private/native.token", base_url=proxy_base_path("test-session"),
+        )
+        self.assertIn("--token-file /private/native.token", command)
+        self.assertNotIn("private-token", command)
+        for token_file, base_url in (
+            ("relative", proxy_base_path("test-session")),
+            ("/private/../native.token", proxy_base_path("test-session")),
+            ("/private//native.token", proxy_base_path("test-session")),
+            ("/private/native.token", "/foreign/proxy"),
+        ):
+            with self.assertRaises(ValueError):
+                build_launch_command(
+                    notebook_path="/project/analysis.py", environment="/project/.venv",
+                    port=1234, token_file=token_file, base_url=base_url,
+                )
+
+    async def test_upload_secrets_only_in_stdin(self):
+        worker = Worker(id="worker", name="worker", worker_ip="127.0.0.1", harness_dir="/private/harness")
+        result = SSHResult(returncode=0, stdout="", stderr="")
+        with patch("worker_harness.marimo.async_ssh_run", new=AsyncMock(return_value=result)) as prepare:
+            with patch("worker_harness.marimo.ssh_upload_bytes", new=AsyncMock(return_value=result)) as upload:
+                self.assertEqual(await upload_remote_token(worker, "test-session", "private-token"), result)
+        self.assertNotIn("private-token", prepare.call_args.args[1])
+        self.assertIn("umask 077", prepare.call_args.args[1])
+        upload.assert_awaited_once_with(worker, b"private-token", remote_token_path(worker, "test-session"))
 
 
 if __name__ == "__main__":

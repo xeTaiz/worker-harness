@@ -31,6 +31,29 @@ class JobKind(str, Enum):
     DELEGATED = "delegated"
 
 
+class JobPriority(str, Enum):
+    """Advisory urgency shown on the shared board; it never reorders FIFO."""
+
+    FLEXIBLE = "flexible"
+    NORMAL = "normal"
+    BLOCKING = "blocking"
+    TIME_CRITICAL = "time_critical"
+
+
+class ExecutionState(str, Enum):
+    """Supervisor lifecycle refinement of a starting/running job."""
+
+    ACTIVE = "active"
+    STOPPING = "stopping"
+    TERMINATION_UNKNOWN = "termination_unknown"
+
+
+class TerminationReason(str, Enum):
+    USER_CANCELLED = "user_cancelled"
+    GPU_IDLE_TIMEOUT = "gpu_idle_timeout"
+    USER_DISABLED = "user_disabled"
+
+
 class PiSessionType(str, Enum):
     INTERACTIVE = "interactive"
     GLOBAL_ROUTER = "global-router"
@@ -60,6 +83,20 @@ class GPUInfo(BaseModel):
     vram_total_gb: float
     vram_used_gb: float
     busy: bool | None = None
+    # Raw activity telemetry for idle detection. These are deliberately
+    # separate from the display-rounded VRAM values and availability flag.
+    uuid: str = ""
+    utilization_percent: float | None = None
+    memory_used_bytes: int | None = None
+    process_count: int | None = None
+    # Counts/memory of processes that are NOT recognized display-server
+    # graphics processes (xorg, xwayland, gnome-shell, kwin_wayland as type G).
+    workload_process_count: int | None = None
+    workload_memory_bytes: int | None = None
+    # True only for a nonempty complete inventory of exempt display processes.
+    display_only: bool = False
+    # False whenever telemetry is failed, incomplete, unsupported or unknown.
+    activity_valid: bool = False
 
 
 # ── Resources ─────────────────────────────────────────────────────────
@@ -96,6 +133,12 @@ class WorkerRegistration(BaseModel):
     # destinations. This is a shallow discovery hint, not a recursive inventory.
     data_paths: list[str] = Field(default_factory=list)
     timestamp: str = ""
+    # GPU sample identity. A new random sample ID accompanies each GPU query;
+    # monotonic time is the daemon's clock, boot/daemon IDs scope it.
+    gpu_sample_id: str = ""
+    gpu_sample_monotonic_ns: int = 0
+    worker_boot_id: str = ""
+    daemon_instance_id: str = ""
 
 
 class Worker(BaseModel):
@@ -121,6 +164,16 @@ class Worker(BaseModel):
     status: WorkerStatus = WorkerStatus.OFFLINE
     last_heartbeat_ts: int = 0
     created_at: int = 0
+    # Latest raw GPU sample (complete GPUInfo incl. activity telemetry) and
+    # its identity. Received fields are stamped by the control process with
+    # its monotonic clock and per-process instance ID.
+    gpu_telemetry: list[GPUInfo] = Field(default_factory=list)
+    gpu_sample_id: str = ""
+    gpu_sample_monotonic_ns: int = 0
+    worker_boot_id: str = ""
+    daemon_instance_id: str = ""
+    gpu_sample_received_ns: int = 0
+    gpu_sample_server_instance: str = ""
 
     @property
     def ssh_host(self) -> str:
@@ -150,6 +203,11 @@ class Worker(BaseModel):
             status=WorkerStatus.ONLINE,
             last_heartbeat_ts=now,
             created_at=now,
+            gpu_telemetry=list(reg.gpus),
+            gpu_sample_id=reg.gpu_sample_id,
+            gpu_sample_monotonic_ns=reg.gpu_sample_monotonic_ns,
+            worker_boot_id=reg.worker_boot_id,
+            daemon_instance_id=reg.daemon_instance_id,
         )
 
     def update_from_registration(self, reg: WorkerRegistration) -> None:
@@ -171,6 +229,11 @@ class Worker(BaseModel):
         self.data_paths = reg.data_paths
         self.status = WorkerStatus.ONLINE
         self.last_heartbeat_ts = int(datetime.now(timezone.utc).timestamp())
+        self.gpu_telemetry = list(reg.gpus)
+        self.gpu_sample_id = reg.gpu_sample_id
+        self.gpu_sample_monotonic_ns = reg.gpu_sample_monotonic_ns
+        self.worker_boot_id = reg.worker_boot_id
+        self.daemon_instance_id = reg.daemon_instance_id
 
 
 # ── Pi sessions ───────────────────────────────────────────────────────
@@ -202,6 +265,8 @@ class PiSession(BaseModel):
     last_seen: int = 0
     created_at: int = 0
     updated_at: int = 0
+    # Human owner (always the bootstrap administrator for fleet sessions).
+    owner_user_id: str = ""
 
 
 class PiSessionEvent(BaseModel):
@@ -292,6 +357,23 @@ class Job(BaseModel):
     queue_order: int = 0
     started_at: int = 0
     finished_at: int = 0
+    # ── Multi-user ownership and shared-board metadata ──
+    owner_user_id: str = ""
+    submitted_by_actor_id: str = ""
+    submitted_at: int = 0
+    submission_sequence: int = 0
+    priority: JobPriority = JobPriority.NORMAL
+    priority_note: str = ""
+    deadline_at: int | None = None
+    termination_reason: TerminationReason | None = None
+    worker_name_at_submission: str = ""
+    # ── Supervisor lifecycle ──
+    execution_state: ExecutionState = ExecutionState.ACTIVE
+    stop_requested_at: int = 0
+    stop_reason: TerminationReason | None = None
+    # Runner confirmed all descendants exited; allocation may still be held
+    # pending the post-stop GPU sample (idle-timeout handoff).
+    stop_confirmed_at: int = 0
 
 
 class WorkerJobReport(BaseModel):
@@ -323,6 +405,11 @@ class PortForward(BaseModel):
     service_name: str = ""
     pid: int = 0
     created_at: int = 0
+    owner_user_id: str = ""
+    created_by_actor_id: str = ""
+    bind_host: str = ""
+    # Set for the internal forward owned by a managed Marimo session.
+    marimo_session_id: str | None = None
 
 
 # ── Marimo Service ────────────────────────────────────────────────────
@@ -340,6 +427,10 @@ class MarimoSession(BaseModel):
     url: str
     status: str = "ready"
     created_at: int = 0
+    owner_user_id: str = ""
+    created_by_actor_id: str = ""
+    # Private orchestrator-side path of the native Marimo token file.
+    upstream_token_path: str = Field(default="", exclude=True, repr=False)
 
 
 # ── Failure ───────────────────────────────────────────────────────────

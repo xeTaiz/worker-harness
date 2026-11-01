@@ -1,4 +1,4 @@
-# Hierarchical agent fleet rollout
+# Multi-user Worker Harness and agent fleet rollout
 
 ## D1. Release boundaries
 
@@ -22,24 +22,30 @@ from a clean checkout and record the resulting image digest for rollout.
 The agent-orchestrator repository still needs its GitHub remote created; until
 then, transfer a `git archive` of its committed `main` to the server and desktop.
 
-The backend and plugins are a coordinated API cutover. Restart existing OMP
-sessions to load the new plugins. The web container is optional: leave the old
-one stopped and install the matching version when needed.
+The backend, native clients, plugins and web assets are a coordinated API cutover.
+Restart existing OMP sessions to load the matching plugins. Browser users need
+the matching web edge for login, key management and the shared job board.
 No production deployment is implied by publication or a successful local test.
 
 ## D2. Before changing services
 
-1. Drain agent turns and record active worktrees, pending commands and PRs.
-   Stop the old router and delegated-agent runtimes after saving any work.
-2. Stop the control service. This rollout intentionally starts with a fresh
-   SQLite registry: existing session/job history may be discarded. Use a new
-   empty registry volume rather than reusing the old database and its journals.
-   Workers and restarted bridges will register again; queued jobs are not restored.
-3. Preserve the existing `/var/lib/tailscale` mount and Tailnet settings exactly.
-   A fresh database must not create a new Tailnet identity.
-4. Keep old image digests for application rollback. Keeping the old registry
-   volume is optional, not a migration requirement. Never delete project
-   branches/worktrees or the Tailscale state as part of the database reset.
+1. Drain running CPU/GPU jobs and agent turns before activation; save active
+   worktrees, pending commands and PRs. Do not auto-stop legacy work to migrate.
+   The new job supervisor cannot retroactively supervise existing processes.
+2. Stop the control service, then back up the existing SQLite registry with
+   SQLite's backup facility (or copy the database and its journals together while
+   stopped). Keep a verified backup and the old image/plugin digests for rollback.
+   Do not discard history or create a replacement empty registry for an upgrade.
+3. Preserve the existing registry and `/var/lib/tailscale` mounts and Tailnet
+   settings exactly. Keep all host-managed code/data/storage mounts unchanged;
+   this rollout does not provision user homes or change network-storage mounts.
+4. Start only one new control process against the preserved registry. Schema
+   migration runs on startup; bootstrap below assigns historical resources to
+   the first administrator without dropping jobs or resetting pending order.
+5. Drain and recreate all legacy unauthenticated Marimo listeners and forwards
+   before granting users access. Existing tokenless listeners are not adopted
+   as secure managed sessions. New managed notebooks use native tokens and the
+   owner-authenticated HTTP/SSE/WebSocket proxy, not a direct notebook URL.
 
 `~/worker-harness` is the installed GPU-worker payload. It is NOT the source
 checkout `~/Work/worker-harness`. Do not commit or overwrite source in the
@@ -59,26 +65,43 @@ Populate a dedicated SSH directory with `wh_herdr` (mode 0600) and `known_hosts`
 containing independently verified host keys for all three machine destinations.
 The transport must fail on changed host keys; do not disable verification.
 
-Generate an operator secret with 32 random bytes encoded as base64url. Store it
-in a private file, not Git, a project workspace, shell history or a browser.
-Both the control container and the web edge mount the same file. Human OMP/CLI
-clients receive a protected copy at `~/.config/worker-harness/operator.token`,
-which is outside the fleet sandbox binds. Set `WH_OPERATOR_TOKEN_FILE` for
-ordinary human clients, not for fleet agents. Fleet launches remove inherited
-operator credential environment variables and use their own session token.
+Set `WH_WEB_ORIGIN` in the control-service environment to one exact external
+origin, for example `https://harness.example.net` (scheme, host and optional port,
+no path or trailing slash). HTTPS is required except explicit development on
+`localhost`, `127.0.0.1` or `[::1]`, such as `http://127.0.0.1:12889`.
+Terminate HTTPS at the existing trusted ingress in front of `wh-web`; its
+internal HTTP listener is not a production browser origin. Preserve Host and
+Origin through that ingress. Browser cookies are Secure on HTTPS, HttpOnly and
+SameSite=Strict. Harness mutations require the exact Origin and CSRF token.
+
+There is no shared edge credential or default account. On first activation,
+run this from the installed release, with the SAME `WH_DB_PATH` and service
+environment as the control process (inside the container when containerized):
+
+```sh
+uv run python -m worker_harness.orchestrator bootstrap-admin --username admin
+```
+
+Enter the password twice at the interactive, no-echo prompt; never pass it in
+arguments or environment variables. Bootstrap refuses a second initialization.
+Until bootstrap completes, login/health/static assets may be served but protected
+requests and dispatch remain denied. The immutable bootstrap administrator owns
+migrated resources and alone retains the human Pi workflow.
+
+Sign in to the web UI, create team accounts under `#admin/users`, and issue each
+user's ordinary API keys from `#keys` (administrators may issue keys on behalf of
+a user). Full keys are shown once. Store them outside Git, project workspaces,
+browser storage and sandbox binds in a private file with mode 0600. Native clients
+use `WH_ORCHESTRATOR_URL` plus `WH_API_KEY_FILE=/private/path/harness.key`, or
+`WH_API_KEY`; the environment value wins over the file only outside internal Pi
+roles. Internal agents use only `WH_SESSION_ROLE` and `WH_SESSION_TOKEN`, never
+a human-key fallback. Remove old shared-bearer settings and secret mounts from
+all services and clients; they no longer authenticate.
 
 C1
 ```sh
-python -c 'import secrets; print(secrets.token_urlsafe(32))' > operator.token
-chmod 600 operator.token
 ssh-keygen -t ed25519 -f ssh/wh_herdr -N '' -C wh-service
 ```
-
-`wh-web` runs as UID 101. Arrange a read-only secret file mount readable by UID
-101 but protected from other host users (for example a root-owned 0700 parent
-directory containing the mounted 0444 secret file). Plain Compose bind secrets
-do not reliably honor secret `uid`/`mode` overrides; verify file readability
-inside the container. The backend runs as root and uses the same token file.
 
 Write the server inventory:
 
@@ -129,9 +152,10 @@ For each client, as its intended Unix user:
 5. Install the shim, forced PUBLIC key and Herdr user unit with the reviewed
    bootstrap script. Run it locally on each client; privileged linger setup may
    require an administrator. It restarts the `wh` session, not `default`.
-6. Set the ordinary client `WH_ORCHESTRATOR_URL` to the control Tailnet URL and
-   `WH_OPERATOR_TOKEN_FILE` to its protected token file. Do not put the token
-   in the vault token directory, `~/Work`, OMP project settings, or dotfiles Git.
+6. Set ordinary clients' `WH_ORCHESTRATOR_URL` to the HTTPS harness URL and
+   `WH_API_KEY_FILE` to the user's protected key file issued from `#keys`.
+   Do not put keys in the vault token directory, `~/Work`, OMP project settings,
+   or dotfiles Git. Human Pi control is available only in bootstrap's web view.
 7. Confirm host-side Git push and `gh` authentication without copying those
    credentials into the agent sandbox.
 
@@ -162,13 +186,18 @@ Set the following deployment environment (paths are on the server):
 - `WH_WEB_IMAGE`: matching immutable web image tag/digest.
 - `WH_TAILNET_ENV_FILE`: existing private Tailnet environment file.
 - `WH_TAILSCALE_VOLUME`: the existing external Tailscale volume name.
-- `WH_REGISTRY_VOLUME`: a newly created empty volume for this rollout; create it
-  with `docker volume create` before starting Compose. Never use the Tailscale
-  volume here.
+- `WH_REGISTRY_VOLUME`: the preserved external registry volume name. For a truly
+  new installation only, create an empty volume with `docker volume create`.
+  Never use the Tailscale volume here or replace an upgrade's existing registry.
 - `WH_MACHINES_FILE`: absolute path to the inventory above.
 - `WH_AGENT_ORCHESTRATOR_DIR`: pinned prompt/config release directory.
 - `WH_HERDR_SSH_DIR`: dedicated service-key/verified-known-hosts directory.
-- `WH_OPERATOR_TOKEN_FILE`: server operator-secret file.
+- `WH_WEB_ORIGIN`: exact external HTTPS browser origin, e.g. `https://harness.example.net`.
+- `WH_TRUSTED_PROXIES`: comma-separated IPs/CIDRs of the web edge (e.g. the
+  `WH_DOCKER_NETWORK` subnet). Only behind these peers is the nearest untrusted
+  `X-Forwarded-For` hop used as the client address for login rate limiting;
+  without it every browser shares the edge's address and one attacker's five
+  failed logins per minute would lock out the whole team.
 - `WH_FLEET_BASE_URL`: `http://orchestrator.hs.d0me.xyz:12889`.
 - `WH_ORCHESTRATOR_MACHINE`: `desktop`.
 - `WH_ORCHESTRATOR_CWD`: `/home/dome/Work/agent-orchestrator` on desktop.
@@ -177,8 +206,9 @@ Set the following deployment environment (paths are on the server):
 
 Stop/remove the old container through its EXISTING deployment manager before
 starting the replacement; do not allow two control servers to share SQLite or
-Tailscale state. Do not remove volumes. Start the new control first, check health
-and logs, then start/recreate the web edge so Nginx resolves the new container IP.
+Tailscale state. Do not remove volumes. Start the new control first, check schema
+migration/health/logs and complete first-run bootstrap, then start/recreate the
+web edge so Nginx resolves the new container IP.
 
 C4
 ```sh
@@ -188,20 +218,26 @@ docker compose -f docker-compose.orchestrator.example.yml up -d
 docker compose -f docker-compose.web.example.yml up -d --force-recreate
 ```
 
-The edge injects the operator bearer upstream; it never sends the secret to the
-browser. Keep the edge Tailnet-only: anyone allowed to reach it has operator
-control. API ports must not be published publicly. `/health` is intentionally
-public for health probes. Privileged API requests without credentials return 401
-when operator authentication is configured or a machine fleet exists. Empty
-fleet/no-secret mode remains only for legacy local development.
+The edge forwards each client's Cookie and Authorization unchanged; it never
+injects identity. Keep it Tailnet-only behind HTTPS, and do not publish the control
+API ports publicly. Only auth/admin, jobs/queue/usage, owned tunnels/Marimo,
+sanitized read-only workers/data, and the existing Pi routes are proxied.
+Unrelated `/api/` routes return 404; API responses are no-store. Control `/health`
+and edge `/healthz` are public probes. Unauthenticated protected requests always
+return 401, including an empty fleet/database; there is no anonymous development
+fallback. Ordinary users and API keys have no Pi, account-admin or key-issuance
+authority, even if the key belongs to an administrator. Administrators cannot
+read, stop or execute another user's private jobs, tunnels or notebooks.
 
 ## D6. Acceptance gates before opening the fleet
 
 Run these in order, using the actual production control path:
 
 1. **Health/auth:** control `/health` and edge `/healthz` succeed. Unauthenticated
-   control session/compute requests fail; the ordinary operator client succeeds.
-   Session list/detail/SSE responses contain no `token_hash`.
+   requests fail. Browser login, Origin/CSRF, logout and key revocation work.
+   Alice/Bob keys see shared sanitized queue rows but not each other's private
+   jobs/logs/tunnels/notebooks; admin keys cannot access admin or Pi routes.
+   Unrelated edge `/api/v1/_stats` returns 404. Session responses contain no hashes.
 2. **Transport:** from the service runtime, verify each machine snapshot, refusal
    of an unknown verb, a leading-option branch and a path outside the allowed
    home/cache roots. Stop desktop's test Herdr unit and confirm one cold recovery.
@@ -210,7 +246,7 @@ Run these in order, using the actual production control path:
    PM starts. Verify its role prompt and project/cwd, not only process existence.
 4. **Isolation:** inside the canary, SSH agent/key, Git credentials and tailscaled
    socket are unavailable; role prompt is readable but its cache is read-only;
-   operator token environment/file is unavailable. Expected data/vault reads work.
+   human API credentials are unavailable. Expected data/vault reads work.
 5. **Role/API contract:** orchestrator has no compute actions; task has no vault
    write tools or PR/worktree actions. A task cannot send to another project's PM,
    mutate its own role, or bypass role authorization by dropping its bearer.
@@ -231,13 +267,14 @@ only then tear down the task worktree containing its evidence.
 
 ## D7. Rollback
 
-Stop new launches and stop the new control/web containers. Preserve any new
-worktrees/branches. Restore the old control image with an empty registry (or the
-old registry volume, if retained), and restart compatible client plugins.
-Keep the SAME Tailscale state and network identity. Leave the web edge stopped
-unless restoring its matching version. Revoke the new forced public key if
-abandoning the fleet rollout. Never reset source checkouts or delete task worktrees
-as rollback machinery. Intentionally discarded database history is not recoverable.
+Stop new launches, drain or reconcile running work, and stop the new control/web
+containers. Preserve new worktrees/branches and a backup of the migrated registry.
+Restore the pre-migration database backup together with the matching old control,
+web and plugin versions; never point an old image at the migrated database.
+Keep the SAME Tailscale state, network identity and storage binds. Restore only
+the matching edge version; keep it inaccessible to users until its security
+boundary is checked. Revoke the new forced public key if abandoning the fleet
+rollout. Never reset source checkouts or delete task worktrees as rollback machinery.
 
 The sandbox hardening can remain during an application rollback. Restoring the
 old sandbox would reopen the tailscaled socket exposure, so do not do so merely
@@ -245,17 +282,21 @@ to restore an older application image.
 
 ## D8. Security scope
 
-The forced shim and Bubblewrap reduce capabilities; they are not adversarial
-multi-user isolation. Agents share the client Unix account and approved writable
-project roots. Bash path validation has a check/use race against concurrent
-same-user filesystem mutations; the service-key Herdr verb can launch panes by
-design. Keep service and operator credentials outside every sandbox bind and
-restrict the web edge to trusted operators. Hardened separate users/VMs would be
-needed for mutually untrusted agents, not just these role prompts.
+This deployment is for a trusted team sharing one worker runtime, Unix account,
+code and data. API ownership protects private remote endpoints, not shared files
+or processes from arbitrary shell commands. `CUDA_VISIBLE_DEVICES` is cooperative
+GPU assignment, not a device ACL or isolation boundary. Do not claim hostile-user
+multi-tenancy; separate users/containers/VMs would require a different design.
+Generic raw TCP tunnels are reachable on the trusted Tailnet and have no per-user
+connection authentication: the forwarded service must provide its own. Managed
+Marimo instead requires the owner-authenticated proxy plus its private native token.
 
-The preserved direct host-relay terminal endpoint is a separate, pre-existing
-network capability; the new operator bearer protects the control gateway, not
-that direct endpoint. Restrict host-relay reachability to trusted operators.
+The forced shim and Bubblewrap reduce agent capabilities, not shared-account
+authority. Bash path validation has a check/use race against same-user filesystem
+mutations; the service-key Herdr verb can launch panes by design. Keep human and
+service credentials outside sandbox binds and retain approved project/data roots.
+The direct host-relay terminal endpoint remains a separate Tailnet-trusted
+bootstrap workflow, not an ordinary multi-user endpoint. Restrict its reachability.
 Likewise, hiding vault write tools does not reduce the scope of the underlying
 vault token: use a read-scoped credential if arbitrary task HTTP requests must
 also be unable to write. Do not treat tool registration as service authorization.

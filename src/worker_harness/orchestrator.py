@@ -88,20 +88,54 @@ async def serve(config: Config) -> None:
 
 
 def run_tui(config: Config) -> None:
-    """Run the Textual TUI."""
-    from .tui.app import run_tui
+    """Run the Textual TUI against the authenticated control API."""
+    from .client import request
+    from .tui.app import run_tui as run_textual_tui
 
-    db = Database(config.db_path)
-    asyncio.run(db.connect())
-
-    console.print(f"[green]Starting Worker Harness TUI...[/]")
-    console.print(f"[dim]DB: {config.db_path}[/]")
+    console.print("[green]Starting Worker Harness TUI...[/]")
     console.print("[dim]Press ? for key bindings[/]")
+    run_textual_tui(request)
 
+
+async def bootstrap_admin(db_path: Path, username: str, password: str) -> dict:
+    """Create the first administrator and assign legacy records to it."""
+    from .auth import PasswordService, normalize_username, validate_password
+
+    username = normalize_username(username)
+    validate_password(password)
+    password_hash = await PasswordService().hash(password)
+    db = Database(db_path)
+    await db.connect()
     try:
-        run_tui(db)
+        return await db.bootstrap_admin(
+            username=username, display_name=username, password_hash=password_hash,
+            now=int(time.time()),
+        )
     finally:
-        asyncio.run(db.close())
+        await db.close()
+
+
+def run_bootstrap_admin(config: Config, username: str) -> int:
+    """Interactive bootstrap; passwords are never accepted from argv/env."""
+    import getpass
+
+    from .db import IdentityConflict
+
+    password = getpass.getpass("Bootstrap administrator password: ")
+    confirmation = getpass.getpass("Repeat password: ")
+    if password != confirmation:
+        console.print("[red]Passwords do not match.[/]")
+        return 2
+    try:
+        user = asyncio.run(bootstrap_admin(Path(config.db_path), username, password))
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        return 2
+    except IdentityConflict as exc:
+        console.print(f"[red]Bootstrap refused: {exc}.[/]")
+        return 1
+    console.print(f"[green]Bootstrap administrator {user['username']} created ({user['id']}).[/]")
+    return 0
 
 
 def main():
@@ -115,6 +149,11 @@ def main():
     sub.add_parser("tui", help="Run TUI")
     sub.add_parser("all", help="Run heartbeat server + TUI together")
     sub.add_parser("run-server", help="Alias for serve")
+    bootstrap = sub.add_parser(
+        "bootstrap-admin",
+        help="Create the first administrator (prompts for the password twice)",
+    )
+    bootstrap.add_argument("--username", required=True)
 
     args = parser.parse_args()
 
@@ -127,6 +166,8 @@ def main():
 
     if args.command in ("serve", "run-server"):
         asyncio.run(serve(config))
+    elif args.command == "bootstrap-admin":
+        sys.exit(run_bootstrap_admin(config, args.username))
     elif args.command == "tui":
         run_tui(config)
     elif args.command == "all":

@@ -48,24 +48,23 @@ class PiCliTests(unittest.TestCase):
             ):
                 self.assertEqual(pi._base_url(), "http://bridge:12889")
 
-    def test_headers_include_role_token_only_when_set(self):
-        with patch.dict(pi.os.environ, {"WH_SESSION_TOKEN": "secret"}, clear=True):
+    def test_headers_require_internal_role_and_token(self):
+        with patch.dict(pi.os.environ, {
+            "WH_SESSION_ROLE": "task", "WH_SESSION_TOKEN": "secret",
+        }, clear=True):
             self.assertEqual(pi._headers(), {"Authorization": "Bearer secret"})
-        with patch.dict(pi.os.environ, {}, clear=True):
-            self.assertEqual(pi._headers(), {})
+        for credentials in ({}, {"WH_SESSION_TOKEN": "secret"},
+                            {"WH_SESSION_ROLE": "task", "WH_API_KEY": "human-secret"},
+                            {"WH_API_KEY": "human-secret"}):
+            with patch.dict(pi.os.environ, credentials, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "bootstrap administrator's web Pi view"):
+                    pi._headers()
 
-    def test_operator_token_file_is_not_used_by_scoped_agents(self):
-        with tempfile.TemporaryDirectory() as directory:
-            token_file = Path(directory) / "operator.token"
-            token_file.write_text("operator-secret\n")
-            with patch.dict(pi.os.environ, {
-                "WH_OPERATOR_TOKEN_FILE": str(token_file),
-            }, clear=True):
-                self.assertEqual(pi._headers(), {"Authorization": "Bearer operator-secret"})
-                pi.os.environ["WH_SESSION_ROLE"] = "task"
-                self.assertEqual(pi._headers(), {})
-                pi.os.environ["WH_SESSION_TOKEN"] = "task-secret"
-                self.assertEqual(pi._headers(), {"Authorization": "Bearer task-secret"})
+    def test_human_pi_cli_fails_before_network_request(self):
+        with patch.dict(pi.os.environ, {"WH_API_KEY": "human-key"}, clear=True):
+            result = self.runner.invoke(pi.app, ["sessions"])
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("bootstrap administrator's web Pi view", result.output)
 
     def test_sessions_text_renders_role(self):
         with patch.object(pi, "_request", new=AsyncMock(return_value=[self.session()])):

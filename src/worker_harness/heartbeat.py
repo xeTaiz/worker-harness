@@ -7,24 +7,45 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
+import shlex
+import time
 from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import AsyncIterator, Awaitable, Callable, Literal, Self, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Self, TypeVar
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from starlette.requests import HTTPConnection
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
+from .auth import (
+    MARIMO_PROXY_PATH,
+    SESSION_COOKIE,
+    LoginRateLimiter,
+    load_trusted_proxies,
+    PasswordService,
+    Principal,
+    enforce_browser_mutation,
+    enforce_capability,
+    load_web_origin,
+    origin_matches,
+    principal_still_valid,
+    require_bootstrap_web_user,
+    require_principal,
+    resolve_principal,
+)
+from .auth_routes import create_auth_router
 from .cache import TTLCache
 from .data import (
     DataPathError,
@@ -36,7 +57,7 @@ from .data import (
     validate_data_path,
     with_worker_dir,
 )
-from .db import Database
+from .db import Database, ListenerConflict, QueueConflict, QueueValidationError
 from .job import JobManager
 from .machines import load_machines
 from .orchestration import Orchestrator, WorktreeError
@@ -48,11 +69,21 @@ from .marimo import (
     allocate_local_port,
     allocate_worker_port,
     build_launch_command,
+    delete_local_token,
+    delete_remote_token,
+    local_token_path,
+    proxy_base_path,
+    remote_token_path,
     tailnet_bind_host,
+    upload_remote_token,
     wait_until_ready,
+    write_local_token,
 )
+from .marimo_proxy import ProxyTarget, create_marimo_proxy_router
 from .models import (
+    Job,
     JobKind,
+    JobPriority,
     JobStatus,
     PiBridgeEventBatch,
     PiBridgeRegister,
@@ -62,12 +93,14 @@ from .models import (
     PiSessionState,
     PortForward,
     MarimoSession,
+    TerminationReason,
     WorkerJobReportBatch,
     WorkerRegistration,
     WorkerStatus,
 )
+from .queue_board import forecast_worker, owned_job, public_queue_job, public_worker
 from .ratelimit import AgentRateLimiter, RateLimited, resolve_agent_name
-from .reaper import reap_loop
+from .reaper import reap_loop, release_orphan_forwards
 from .ssh import async_ssh_run, set_lanes, ssh_download_bytes, ssh_port_forward, ssh_upload_bytes
 from .tunnel_registry import TunnelProcess, TunnelRegistry
 
@@ -75,74 +108,134 @@ log = logging.getLogger("heartbeat-server")
 
 T = TypeVar("T")
 
+# GET routes that reach workers over SSH and therefore stay rate-limited.
+SSH_BACKED_READ = re.compile(
+    r"^/api/v1/(jobs/[^/]+/logs(/stream)?|marimo/[^/]+|workers/[^/]+/files)$"
+)
 
-class JobCreateRequest(BaseModel):
+
+class _Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+def _nonblank(value: str | None, label: str) -> str | None:
+    if value is not None and not value.strip():
+        raise ValueError(f"{label} must not be blank")
+    return value
+
+
+class PriorityFields(_Strict):
+    priority: JobPriority = JobPriority.NORMAL
+    priority_note: str = Field(default="", max_length=1000)
+    deadline_at: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _time_critical_note(self) -> Self:
+        if self.priority == JobPriority.TIME_CRITICAL and not self.priority_note.strip():
+            raise ValueError("time_critical priority requires a priority_note")
+        return self
+
+
+class JobCreateRequest(PriorityFields):
+    """CPU/setup work launched immediately; it never takes a GPU slot."""
+
     worker_id: str
-    command: str
-    name: str | None = None
+    command: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=200)
+    expected_seconds: int = Field(ge=1)
     no_pty: bool = False
     sync: bool = False       # block until command finishes, return stdout
-    sync_timeout: int = 120  # seconds to wait in sync mode
+    sync_timeout: int = Field(default=120, ge=1, le=3600)
 
-class JobEnqueueRequest(BaseModel):
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return _nonblank(value, "name")
+
+
+class JobEnqueueRequest(PriorityFields):
     worker_id: str
-    command: str
-    name: str = Field(min_length=1)
+    command: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=200)
     expected_seconds: int = Field(ge=1)
-    gpu_count: int = Field(default=1, ge=1)
+    gpu_count: int = Field(ge=1)
     no_pty: bool = False
 
     @field_validator("name")
     @classmethod
     def validate_name(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("name must not be blank")
-        return value
+        return _nonblank(value, "name")
 
 
-class QueuedJobUpdateRequest(BaseModel):
-    worker_id: str | None = None
-    position: int | None = Field(default=None, ge=1)
-    name: str | None = None
+class _MetadataUpdate(_Strict):
     expected_seconds: int | None = Field(default=None, ge=1)
+    priority: JobPriority | None = None
+    priority_note: str | None = Field(default=None, max_length=1000)
+    deadline_at: int | None = Field(default=None, ge=0)
+
+    def changes(self) -> dict:
+        # deadline_at may be explicitly cleared with null.
+        return {key: getattr(self, key) for key in self.model_fields_set}
+
+    @model_validator(mode="after")
+    def validate_update(self) -> Self:
+        if not self.model_fields_set:
+            raise ValueError("at least one field must be supplied")
+        for key in self.model_fields_set - {"deadline_at"}:
+            if getattr(self, key) is None:
+                raise ValueError(f"{key} cannot be null")
+        return self
+
+
+class RunningJobUpdateRequest(_MetadataUpdate):
+    pass
+
+
+class QueuedJobUpdateRequest(_MetadataUpdate):
+    worker_id: str | None = None
+    name: str | None = Field(default=None, max_length=200)
     gpu_count: int | None = Field(default=None, ge=1)
 
     @field_validator("name")
     @classmethod
     def validate_optional_name(cls, value: str | None) -> str | None:
-        if value is not None and not value.strip():
-            raise ValueError("name must not be blank")
+        return _nonblank(value, "name")
+
+    def changes(self) -> dict:
+        return {key: getattr(self, key) for key in self.model_fields_set if key != "worker_id"}
+
+
+class QueuePreviewRequest(_Strict):
+    before_job_id: str | None
+    expected_revision: int = Field(ge=0)
+    reason: str
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        value = value.strip()
+        if not 1 <= len(value) <= 1000:
+            raise ValueError("reason must be 1-1000 characters")
         return value
 
-    @model_validator(mode="after")
-    def validate_update(self) -> Self:
-        if all(
-            value is None
-            for value in (
-                self.worker_id,
-                self.position,
-                self.name,
-                self.expected_seconds,
-                self.gpu_count,
-            )
-        ):
-            raise ValueError("at least one queue field must be supplied")
-        return self
+
+class QueueMoveRequest(_Strict):
+    preview_id: str = Field(min_length=1)
+    expected_revision: int = Field(ge=0)
 
 
-class TunnelCreateRequest(BaseModel):
+class TunnelCreateRequest(_Strict):
     worker_id: str
-    local_port: int
-    remote_port: int
-    name: str = ""
+    local_port: int = Field(ge=1024, le=65535)
+    remote_port: int = Field(ge=1, le=65535)
+    name: str = Field(default="", max_length=200)
 
 
-class MarimoCreateRequest(BaseModel):
+class MarimoCreateRequest(_Strict):
     worker_id: str
     notebook_path: str
     environment: str
     ready_timeout: float = 45.0
-
 
 # 10 MB — larger transfers should use direct rsync over tailnet SSH
 MAX_FILE_TRANSFER_BYTES = 10 * 1024 * 1024
@@ -212,15 +305,7 @@ async def reconcile_active_ssh_jobs(
     max_concurrent: int = 4,
 ) -> None:
     """Refresh persisted SSH job state without blocking read endpoints."""
-    jobs = [
-        job
-        for job in await db.list_jobs()
-        if job.kind == JobKind.SSH
-        and (
-            job.status == JobStatus.RUNNING
-            or (job.status == JobStatus.PENDING and not job.queue_managed)
-        )
-    ]
+    jobs = [job for job in await db.list_active_jobs() if job.status == JobStatus.RUNNING]
     if not jobs:
         return
 
@@ -264,6 +349,7 @@ async def reconcile_queued_jobs(db: Database, job_manager: JobManager) -> None:
             log.exception("Failed to reconcile queued job %s", job.id)
     for worker in workers.values():
         try:
+            await job_manager.enforce_gpu_idle(worker)
             await job_manager.dispatch_worker(worker)
         except asyncio.CancelledError:
             raise
@@ -278,6 +364,9 @@ async def lifespan(app: FastAPI):
     Database ownership remains with the caller (`serve`), but every persistent
     tunnel and every queued lane waiter belongs to this FastAPI app.
     """
+    # Forward processes never survive this process; rows left by a restart
+    # or crash would otherwise reserve their listener ports forever.
+    await release_orphan_forwards(app)
     app.state.reaper_task = asyncio.create_task(reap_loop(app))
     background_tasks = [app.state.reaper_task]
     reconciler = getattr(app.state, "job_reconciler", None)
@@ -349,13 +438,23 @@ def create_registration_app(db: Database) -> FastAPI:
 
 async def stream_pi_session_events(
     request: Request, db: Database, session_id: str, after: int = 0,
+    *, still_valid: Callable[[], Awaitable[bool]],
 ) -> AsyncIterator[str]:
-    """Replay and tail one session's durable event log as SSE."""
+    """Replay and tail one session's durable event log as SSE.
+
+    Credentials are rechecked at least every five seconds; revocation or a
+    disabled account ends the stream.
+    """
     cursor = max(0, after)
     heartbeat_at = asyncio.get_running_loop().time() + 15.0
+    recheck_at = asyncio.get_running_loop().time() + 5.0
     while True:
         if await request.is_disconnected():
             return
+        if asyncio.get_running_loop().time() >= recheck_at:
+            if not await still_valid():
+                return
+            recheck_at = asyncio.get_running_loop().time() + 5.0
         events = await db.list_pi_session_events(session_id, after=cursor, limit=500)
         if events:
             for event in events:
@@ -469,6 +568,7 @@ async def _pump_terminal_gateway(
     *,
     send_timeout: float = 10.0,
     attachment: _GatewayAttachment | None = None,
+    still_valid: Callable[[], Awaitable[bool]] | None = None,
 ) -> str:
     """Pump terminal frames without buffering or touching persistent state."""
 
@@ -500,6 +600,14 @@ async def _pump_terminal_gateway(
     if attachment is not None:
         eviction_task = asyncio.create_task(attachment.evict.wait(), name="pi-gateway-eviction")
         tasks.add(eviction_task)
+    revocation_task = None
+    if still_valid is not None:
+        async def watch_credentials() -> None:
+            while await still_valid():
+                await asyncio.sleep(5.0)
+
+        revocation_task = asyncio.create_task(watch_credentials(), name="pi-gateway-revocation")
+        tasks.add(revocation_task)
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for task in pending:
         task.cancel()
@@ -507,80 +615,70 @@ async def _pump_terminal_gateway(
     for task in done:
         if task is not eviction_task:
             task.result()
+    if revocation_task in done:
+        return "revoked"
     return "replaced" if eviction_task in done else "completed"
 
 
-def _operator_token() -> str:
-    token = os.environ.get("WH_OPERATOR_TOKEN", "").strip()
-    token_file = os.environ.get("WH_OPERATOR_TOKEN_FILE", "").strip()
-    if not token and token_file:
-        token = Path(token_file).expanduser().read_text(encoding="utf8").strip()
-    if token or token_file:
-        if len(token) < 43 or any(
-            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-            for character in token
-        ):
-            raise ValueError("operator token must be at least 43 base64url characters")
-    return token
+def origin_session_of(principal: Principal) -> str | None:
+    """Internal Pi credentials attribute work to their session, never payloads."""
+    return principal.pi_session.id if principal.pi_session is not None else None
 
 
-def require_role(*allowed: str):
-    """Resolve an optional fleet bearer token and enforce the caller role."""
+async def api_gate(request: HTTPConnection) -> None:
+    """Global HTTP authentication and capability boundary.
 
-    async def resolve(
-        request: HTTPConnection,
-        authorization: str | None = Header(default=None),
-    ) -> PiSession | None:
-        operator_token = request.app.state.operator_token
-        if authorization is None:
-            if operator_token or request.app.state.machines:
-                raise HTTPException(status_code=401, detail="operator or session bearer token required")
-            if "operator" in allowed:
-                return None
-            raise HTTPException(status_code=403, detail="operator is not allowed")
-        scheme, separator, token = authorization.partition(" ")
-        if separator != " " or scheme.lower() != "bearer" or not token.strip() or not token.isascii():
-            raise HTTPException(status_code=401, detail="invalid bearer token")
-        if operator_token and secrets.compare_digest(token.strip(), operator_token):
-            if "operator" in allowed:
-                return None
-            raise HTTPException(status_code=403, detail="operator is not allowed")
-        caller = await request.app.state.db.get_pi_session_by_token_hash(
-            hashlib.sha256(token.strip().encode()).hexdigest()
-        )
-        if caller is None:
-            raise HTTPException(status_code=401, detail="invalid bearer token")
-        if caller.state in {
-            PiSessionState.STOPPED, PiSessionState.FAILED, PiSessionState.TERMINATION_UNKNOWN,
-        }:
-            raise HTTPException(status_code=401, detail="session token is no longer active")
-        if caller.role not in allowed:
-            raise HTTPException(status_code=403, detail="caller role is not allowed")
-        return caller
+    Login, health and static assets are public. WebSockets authenticate in
+    their handlers (before attachment), never through this dependency.
+    """
+    if request.scope["type"] == "websocket":
+        return
+    path = request.url.path
+    if not path.startswith("/api/") or path == "/api/v1/auth/login":
+        return
+    principal = await require_principal(request)
+    enforce_browser_mutation(request, principal, request.app.state.web_origin)
+    enforce_capability(principal, request.scope.get("method", "GET"), path)
+
+
+def pi_access(*roles: str):
+    """Pi workflow access: the listed internal roles, or the bootstrap browser user."""
+
+    async def resolve(request: HTTPConnection) -> Principal:
+        principal = await require_principal(request)
+        if principal.credential_kind == "pi_session":
+            if principal.pi_session.role not in roles:
+                raise HTTPException(status_code=403, detail="caller role is not allowed")
+        elif not principal.is_bootstrap_web:
+            raise HTTPException(status_code=403, detail="Pi workflow belongs to the bootstrap administrator")
+        return principal
 
     return resolve
 
 
-async def require_api_caller(request: HTTPConnection) -> None:
-    if request.url.path == "/health":
-        return
-    if request.scope["type"] == "websocket":
-        return
-    allowed = ("operator", "pm", "task")
-    if request.url.path.startswith("/api/v1/pi/"):
-        allowed += ("orchestrator",)
-    await require_role(*allowed)(request, request.headers.get("authorization"))
+def pi_role(*roles: str):
+    """Internal-session-only Pi access for the listed roles."""
+
+    async def resolve(request: HTTPConnection) -> Principal:
+        principal = await require_principal(request)
+        if principal.credential_kind != "pi_session" or principal.pi_session.role not in roles:
+            raise HTTPException(status_code=403, detail="caller role is not allowed")
+        return principal
+
+    return resolve
 
 
 def create_app(db: Database) -> FastAPI:
-    """Create the privileged control API (kept as the public test factory)."""
+    """Create the authenticated control API (kept as the public test factory)."""
     app = FastAPI(
         title="Worker Harness Control API", lifespan=lifespan,
-        dependencies=[Depends(require_api_caller)],
+        dependencies=[Depends(api_gate)],
     )
-    jm = JobManager(db)
     app.state.db = db
-    app.state.operator_token = _operator_token()
+    app.state.web_origin = load_web_origin()
+    app.state.passwords = PasswordService()
+    app.state.login_limiter = LoginRateLimiter()
+    app.state.trusted_proxies = load_trusted_proxies()
     app.state.machines = load_machines()
     app.state.projects = load_projects()
     app.state.orchestrator = Orchestrator(
@@ -588,6 +686,15 @@ def create_app(db: Database) -> FastAPI:
         app.state.machines,
         app.state.projects,
     )
+
+    async def on_job_terminal(job: Job) -> None:
+        # An owner stopping a managed notebook's job cleans the session up.
+        session = await db.get_marimo_session_for_job(job.id)
+        if session is not None:
+            await release_marimo_resources(session)
+
+    jm = JobManager(db, on_job_terminal=on_job_terminal)
+    app.state.job_manager = jm
 
     # Shared reliability services. They are attached before lifespan starts so
     # handlers, reaper, and /api/v1/_stats all see one coherent state.
@@ -609,26 +716,24 @@ def create_app(db: Database) -> FastAPI:
 
     @app.get("/health")
     async def health():
-        """Control-plane liveness endpoint (separate from registration)."""
-        async with app.state.pi_gateway_lock:
-            gateway_by_session = {
-                session_id: len(active)
-                for session_id, active in app.state.pi_gateway_attachments.items()
-                if active
-            }
-            gateway_close_reasons = dict(app.state.pi_gateway_close_reasons)
-            gateway_refused_total = app.state.pi_gateway_refused_total
-            gateway_evictions_total = app.state.pi_gateway_evictions_total
-        return {
-            "status": "healthy",
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "pi_gateway_attachment_count": sum(gateway_by_session.values()),
-            "pi_gateway_attachments_by_session": gateway_by_session,
-            "pi_gateway_max_per_session": app.state.pi_gateway_max_per_session,
-            "pi_gateway_refused_total": gateway_refused_total,
-            "pi_gateway_evictions_total": gateway_evictions_total,
-            "pi_gateway_close_reasons": gateway_close_reasons,
-        }
+        """Public control-plane liveness endpoint."""
+        return {"status": "healthy", "ts": datetime.now(timezone.utc).isoformat()}
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_handler(_request: Request, exc: RequestValidationError):
+        # Never echo submitted values (passwords, keys, commands).
+        errors = [
+            {"loc": list(error.get("loc", ())), "msg": error.get("msg", ""), "type": error.get("type", "")}
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": errors}, headers={"Cache-Control": "no-store"})
+
+    @app.middleware("http")
+    async def no_store_middleware(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.middleware("http")
     async def metrics_middleware(request: Request, call_next):
@@ -648,11 +753,26 @@ def create_app(db: Database) -> FastAPI:
         # upload more than the operator API's 60 req/min budget. Bridge routes
         # validate the active session incarnation instead of consuming the
         # peer-IP agent bucket; expensive operator routes remain rate-limited.
+        # Browsers all reach the control API through one web edge, so the
+        # bucket is keyed by the presented credential, never the shared peer
+        # address. Cheap database-only reads (the board, lists, usage) that
+        # the UI polls are not throttled; SSH-backed reads and every mutation
+        # still are.
         path = request.url.path
-        is_pi_bridge = path.startswith("/api/v1/pi/bridge/")
-        if path.startswith("/api/v1/") and not is_pi_bridge:
-            peer_ip = request.client.host if request.client else "unknown"
-            agent = resolve_agent_name(dict(request.headers), peer_ip)
+        exempt = (
+            path.startswith("/api/v1/pi/bridge/")
+            or MARIMO_PROXY_PATH.match(path)
+            or (request.method in ("GET", "HEAD") and not SSH_BACKED_READ.match(path))
+        )
+        if path.startswith("/api/v1/") and not exempt:
+            # A presented credential always selects the bucket: a caller-chosen
+            # X-Agent-Name must not mint fresh buckets for an authenticated client.
+            credential = request.headers.get("authorization") or request.cookies.get(SESSION_COOKIE)
+            if credential:
+                agent = "credential:" + hashlib.sha256(credential.encode()).hexdigest()[:16]
+            else:
+                peer_ip = request.client.host if request.client else "unknown"
+                agent = resolve_agent_name(dict(request.headers), peer_ip)
             try:
                 app.state.rate_limiter.check(agent)
             except RateLimited as e:
@@ -681,7 +801,7 @@ def create_app(db: Database) -> FastAPI:
         return value
 
     async def invalidate_workers_cache() -> None:
-        await app.state.cache.invalidate("workers:list")
+        await app.state.cache.invalidate("workers:public")
         await app.state.cache.invalidate("workers:summary")
         await app.state.cache.invalidate("data:paths:False")
         await app.state.cache.invalidate("data:paths:True")
@@ -701,14 +821,13 @@ def create_app(db: Database) -> FastAPI:
         )
 
 
-    # ── Privileged orchestration API (/api/v1) ───────────────────────────────
+    # ── Orchestration API (/api/v1) ──────────────────────────────────────────
 
     @app.get("/api/v1/workers")
     async def workers_list():
         async def load():
-            workers = await db.list_workers()
-            return [w.model_dump(mode="json") for w in workers]
-        return await cached("workers:list", 5.0, load)
+            return [public_worker(worker) for worker in await db.list_workers()]
+        return await cached("workers:public", 5.0, load)
 
     @app.get("/api/v1/workers/summary")
     async def workers_summary():
@@ -726,11 +845,9 @@ def create_app(db: Database) -> FastAPI:
     @app.delete("/api/v1/workers/prune")
     async def workers_prune(
         minutes: int = Query(5, ge=0),
-        _caller: PiSession | None = Depends(require_role("operator")),
+        _principal: Principal = Depends(require_bootstrap_web_user),
     ):
-        import time as _time
-
-        cutoff = int(_time.time()) - (minutes * 60)
+        cutoff = int(time.time()) - (minutes * 60)
         removed = await db.prune_workers(cutoff)
         await invalidate_workers_cache()
         return {"removed": removed, "minutes": minutes}
@@ -738,12 +855,16 @@ def create_app(db: Database) -> FastAPI:
     @app.post("/api/v1/pi/bridge/register")
     async def pi_bridge_register(
         payload: PiBridgeRegister,
-        caller: PiSession | None = Depends(
-            require_role("operator", "orchestrator", "pm", "task")
-        ),
+        principal: Principal = Depends(pi_access("orchestrator", "pm", "task")),
     ):
-        if caller and caller.id != payload.session_id:
-            raise HTTPException(status_code=403, detail="session token does not match bridge session")
+        caller = principal.pi_session
+        if caller is not None:
+            # Internal sessions only register their own, already-owned row.
+            if caller.id != payload.session_id:
+                raise HTTPException(status_code=403, detail="session token does not match bridge session")
+            owner_user_id = caller.owner_user_id
+        else:
+            owner_user_id = principal.user_id
         if payload.resume_path and caller:
             machine = app.state.machines.get(caller.meta.get("machine") or caller.host)
             path = PurePosixPath(payload.resume_path)
@@ -754,8 +875,10 @@ def create_app(db: Database) -> FastAPI:
                 raise HTTPException(status_code=403, detail="transcript path is outside the agent session directory")
         now = int(datetime.now(timezone.utc).timestamp())
         try:
-            session = await db.register_interactive_pi_session(payload, now=now)
-        except ValueError as exc:
+            session = await db.register_interactive_pi_session(
+                payload, owner_user_id=owner_user_id, now=now,
+            )
+        except (ValueError, PermissionError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         await db.insert_pi_session_event(PiSessionEvent(
             session_id=session.id,
@@ -769,10 +892,9 @@ def create_app(db: Database) -> FastAPI:
     async def pi_bridge_events(
         session_id: str,
         payload: PiBridgeEventBatch,
-        caller: PiSession | None = Depends(
-            require_role("operator", "orchestrator", "pm", "task")
-        ),
+        principal: Principal = Depends(pi_access("orchestrator", "pm", "task")),
     ):
+        caller = principal.pi_session
         if caller and caller.id != session_id:
             raise HTTPException(status_code=403, detail="session token does not match bridge session")
         try:
@@ -792,10 +914,9 @@ def create_app(db: Database) -> FastAPI:
         session_id: str,
         incarnation: str,
         wait_seconds: float = Query(20.0, ge=0.0, le=30.0),
-        caller: PiSession | None = Depends(
-            require_role("operator", "orchestrator", "pm", "task")
-        ),
+        principal: Principal = Depends(pi_access("orchestrator", "pm", "task")),
     ):
+        caller = principal.pi_session
         if caller and caller.id != session_id:
             raise HTTPException(status_code=403, detail="session token does not match bridge session")
         deadline = asyncio.get_running_loop().time() + wait_seconds
@@ -815,10 +936,9 @@ def create_app(db: Database) -> FastAPI:
         session_id: str,
         command_id: str,
         payload: PiCommandAck,
-        caller: PiSession | None = Depends(
-            require_role("operator", "orchestrator", "pm", "task")
-        ),
+        principal: Principal = Depends(pi_access("orchestrator", "pm", "task")),
     ):
+        caller = principal.pi_session
         if caller and caller.id != session_id:
             raise HTTPException(status_code=403, detail="session token does not match bridge session")
         try:
@@ -865,7 +985,7 @@ def create_app(db: Database) -> FastAPI:
 
     @app.get("/api/v1/pi/orchestrator")
     async def pi_orchestrator_get(
-        _caller: PiSession | None = Depends(require_role("operator", "orchestrator", "pm")),
+        _principal: Principal = Depends(pi_access("orchestrator", "pm")),
     ):
         sessions = await db.list_pi_sessions_by_role("orchestrator")
         for session in sessions:
@@ -876,8 +996,9 @@ def create_app(db: Database) -> FastAPI:
     @app.post("/api/v1/pi/orchestrator:send")
     async def pi_orchestrator_send(
         payload: PiMessageRequest,
-        caller: PiSession | None = Depends(require_role("operator", "pm")),
+        principal: Principal = Depends(pi_access("pm")),
     ):
+        caller = principal.pi_session
         try:
             session = await app.state.orchestrator.ensure_orchestrator()
         except Exception as exc:
@@ -902,8 +1023,9 @@ def create_app(db: Database) -> FastAPI:
         request: Request,
         worker_id: str | None = None,
         include_attach_info: bool = False,
-        caller: PiSession | None = Depends(require_role("operator", "orchestrator", "pm")),
+        principal: Principal = Depends(pi_access("orchestrator", "pm")),
     ):
+        caller = principal.pi_session
         if include_attach_info and caller:
             raise HTTPException(status_code=403, detail="terminal attachment is operator-only")
         sessions = await db.list_pi_sessions(worker_id)
@@ -936,8 +1058,9 @@ def create_app(db: Database) -> FastAPI:
     async def pi_session_send(
         session_id: str,
         payload: PiMessageRequest,
-        caller: PiSession | None = Depends(require_role("operator", "orchestrator", "pm")),
+        principal: Principal = Depends(pi_access("orchestrator", "pm")),
     ):
+        caller = principal.pi_session
         target = await db.get_pi_session(session_id)
         if target is None:
             raise HTTPException(status_code=404, detail="Pi session not found")
@@ -971,8 +1094,9 @@ def create_app(db: Database) -> FastAPI:
     @app.post("/api/v1/pi/sessions/{session_id}:interrupt")
     async def pi_session_interrupt(
         session_id: str,
-        caller: PiSession | None = Depends(require_role("operator", "orchestrator", "pm")),
+        principal: Principal = Depends(pi_access("orchestrator", "pm")),
     ):
+        caller = principal.pi_session
         target = await db.get_pi_session(session_id)
         if target is None:
             raise HTTPException(status_code=404, detail="Pi session not found")
@@ -1017,7 +1141,7 @@ def create_app(db: Database) -> FastAPI:
     async def pi_session_configure(
         session_id: str,
         payload: PiConfigureRequest,
-        _caller: PiSession | None = Depends(require_role("operator")),
+        _principal: Principal = Depends(pi_access()),
     ):
         target = await db.get_pi_session(session_id)
         if (
@@ -1069,8 +1193,9 @@ def create_app(db: Database) -> FastAPI:
     async def pi_session_ask_pm(
         session_id: str,
         payload: PiQuestionRequest,
-        caller: PiSession = Depends(require_role("task")),
+        principal: Principal = Depends(pi_role("task")),
     ):
+        caller = principal.pi_session
         if caller.id != session_id:
             raise HTTPException(status_code=403, detail="task may only block its own session")
         parent = await db.get_pi_session(caller.parent_session_id or "")
@@ -1097,8 +1222,9 @@ def create_app(db: Database) -> FastAPI:
     async def pi_session_notify_pm(
         session_id: str,
         payload: PiNoteRequest,
-        caller: PiSession = Depends(require_role("task")),
+        principal: Principal = Depends(pi_role("task")),
     ):
+        caller = principal.pi_session
         if caller.id != session_id:
             raise HTTPException(status_code=403, detail="task may only notify from its own session")
         parent = await db.get_pi_session(caller.parent_session_id or "")
@@ -1119,7 +1245,7 @@ def create_app(db: Database) -> FastAPI:
 
     @app.get("/api/v1/pi/projects")
     async def pi_projects_list(
-        _caller: PiSession | None = Depends(require_role("operator", "orchestrator")),
+        _principal: Principal = Depends(pi_access("orchestrator")),
     ):
         return [
             {
@@ -1136,8 +1262,9 @@ def create_app(db: Database) -> FastAPI:
     async def pi_project_send(
         project: str,
         payload: PiMessageRequest,
-        caller: PiSession | None = Depends(require_role("operator", "orchestrator")),
+        principal: Principal = Depends(pi_access("orchestrator")),
     ):
+        caller = principal.pi_session
         if project not in app.state.projects:
             raise HTTPException(status_code=404, detail="project not found")
         try:
@@ -1161,8 +1288,9 @@ def create_app(db: Database) -> FastAPI:
     async def pi_project_task_create(
         project: str,
         payload: PiTaskLaunchRequest,
-        caller: PiSession = Depends(require_role("pm")),
+        principal: Principal = Depends(pi_role("pm")),
     ):
+        caller = principal.pi_session
         if caller.meta.get("project") != project:
             raise HTTPException(status_code=403, detail="cross-project task launch")
         project_config = app.state.projects.get(project)
@@ -1190,8 +1318,9 @@ def create_app(db: Database) -> FastAPI:
     async def pi_session_teardown(
         session_id: str,
         payload: PiTeardownRequest,
-        caller: PiSession = Depends(require_role("pm")),
+        principal: Principal = Depends(pi_role("pm")),
     ):
+        caller = principal.pi_session
         task = await db.get_pi_session(session_id)
         if task is None:
             raise HTTPException(status_code=404, detail="Pi session not found")
@@ -1208,8 +1337,9 @@ def create_app(db: Database) -> FastAPI:
     async def pi_session_submit_pr(
         session_id: str,
         payload: PiSubmitPrRequest,
-        caller: PiSession = Depends(require_role("pm")),
+        principal: Principal = Depends(pi_role("pm")),
     ):
+        caller = principal.pi_session
         task = await db.get_pi_session(session_id)
         if task is None:
             raise HTTPException(status_code=404, detail="Pi session not found")
@@ -1239,8 +1369,9 @@ def create_app(db: Database) -> FastAPI:
 
     async def readable_session(
         session_id: str,
-        caller: PiSession | None = Depends(require_role("operator", "orchestrator", "pm", "task")),
+        principal: Principal = Depends(pi_access("orchestrator", "pm", "task")),
     ) -> PiSession:
+        caller = principal.pi_session
         session = await db.get_pi_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Pi session not found")
@@ -1309,7 +1440,7 @@ def create_app(db: Database) -> FastAPI:
     @app.get("/api/v1/pi/sessions/{session_id}/attach-info")
     async def pi_session_attach_info(
         session_id: str, request: Request,
-        _caller: PiSession | None = Depends(require_role("operator")),
+        _principal: Principal = Depends(pi_access()),
         session: PiSession = Depends(readable_session),
     ):
         return attach_info_with_gateway(session, request)
@@ -1318,7 +1449,11 @@ def create_app(db: Database) -> FastAPI:
     async def pi_session_attach_gateway(websocket: WebSocket, session_id: str) -> None:
         await websocket.accept()
         try:
-            await require_role("operator")(websocket, websocket.headers.get("authorization"))
+            principal = await resolve_principal(websocket)
+            if not principal.is_bootstrap_web:
+                raise HTTPException(status_code=403, detail="terminal attachment is bootstrap-only")
+            if not origin_matches(websocket, app.state.web_origin):
+                raise HTTPException(status_code=403, detail="origin not allowed")
         except HTTPException as exc:
             await websocket.close(code=4400 + exc.status_code % 100, reason=str(exc.detail))
             return
@@ -1371,8 +1506,12 @@ def create_app(db: Database) -> FastAPI:
                 close_timeout=2,
             ) as upstream:
                 outcome = await _pump_terminal_gateway(
-                    websocket, upstream, attachment=attachment
+                    websocket, upstream, attachment=attachment,
+                    still_valid=lambda: principal_still_valid(db, principal),
                 )
+                if outcome == "revoked":
+                    close_reason = "revoked"
+                    await websocket.close(code=4401, reason="credentials revoked")
                 if outcome == "replaced":
                     close_reason = "replaced"
                     await websocket.send_json({
@@ -1430,7 +1569,10 @@ def create_app(db: Database) -> FastAPI:
         if last_event_id.isdigit():
             after = max(after, int(last_event_id))
         return StreamingResponse(
-            stream_pi_session_events(request, db, session_id, after),
+            stream_pi_session_events(
+                request, db, session_id, after,
+                still_valid=lambda: principal_still_valid(db, request.state.principal),
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",
@@ -1449,7 +1591,8 @@ def create_app(db: Database) -> FastAPI:
         return await cached(f"data:paths:{include_offline}", 2.0, load)
 
     @app.post("/api/v1/data/copy")
-    async def data_copy(payload: DataCopyRequest):
+    async def data_copy(payload: DataCopyRequest, request: Request):
+        principal: Principal = request.state.principal
         try:
             src_path = validate_data_path(payload.src_path)
             dst_path = validate_data_path(payload.dst_path)
@@ -1504,7 +1647,11 @@ def create_app(db: Database) -> FastAPI:
             destination_copy_command(source.ssh_host, port, dst_path, username, secret_path),
         )
         try:
-            job = await jm.start_job(destination, command, name=f"data-copy-{transfer_id}", pty_enabled=False)
+            job = await jm.start_job(
+                destination, command, owner_user_id=principal.user_id,
+                actor_id=principal.actor_id, origin_session_id=origin_session_of(principal),
+                pty_enabled=False,
+            )
         except Exception as exc:
             await async_ssh_run(source, with_worker_dir(source, source_cleanup_command(transfer_id)), timeout=15)
             raise HTTPException(status_code=502, detail=f"destination copy job failed to start: {exc}")
@@ -1544,16 +1691,42 @@ def create_app(db: Database) -> FastAPI:
         worker = await resolve_worker(worker_id)
         if not worker:
             raise HTTPException(status_code=404, detail=f"Worker not found: {worker_id}")
-        return worker.model_dump(mode="json")
+        return public_worker(worker)
+
+    # ── Jobs: owner-private details, shared public board ────────────────────
+
+    def conflict(code: str, message: str, status_code: int = 409) -> HTTPException:
+        return HTTPException(status_code=status_code, detail={"code": code, "message": message})
+
+    async def owned_job_or_404(principal: Principal, job_id: str) -> Job:
+        job = await db.get_job(job_id)
+        # Another owner's private job is indistinguishable from a missing one.
+        if job is None or job.owner_user_id != principal.user_id:
+            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+        return job
+
+    async def owned_job_dto(job: Job, *, with_history: bool = False) -> dict:
+        names = await db.user_display_names({job.owner_user_id})
+        worker = await db.get_worker(job.worker_id or "")
+        item = owned_job(
+            job, owner_display_name=names.get(job.owner_user_id, ""),
+            worker_name=worker.name if worker else None,
+        )
+        if with_history:
+            history = await db.delay_history([job.id])
+            item["delay_history"] = history.get(job.id, [])
+        return item
+
+    async def worker_or_404(worker_id: str):
+        worker = await resolve_worker(worker_id)
+        if not worker:
+            raise HTTPException(status_code=404, detail=f"Worker not found: {worker_id}")
+        return worker
 
     @app.post("/api/v1/jobs/queue")
-    async def jobs_queue_create(payload: JobEnqueueRequest):
-        worker = await resolve_worker(payload.worker_id)
-        if not worker:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Worker not found: {payload.worker_id}",
-            )
+    async def jobs_queue_create(payload: JobEnqueueRequest, request: Request):
+        principal: Principal = request.state.principal
+        worker = await worker_or_404(payload.worker_id)
         if payload.gpu_count > worker.gpu_count:
             raise HTTPException(
                 status_code=422,
@@ -1562,178 +1735,224 @@ def create_app(db: Database) -> FastAPI:
         job = await jm.enqueue_job(
             worker,
             payload.command,
-            payload.name,
-            payload.expected_seconds,
+            owner_user_id=principal.user_id,
+            actor_id=principal.actor_id,
+            name=payload.name,
+            expected_seconds=payload.expected_seconds,
             gpu_count=payload.gpu_count,
+            priority=payload.priority,
+            priority_note=payload.priority_note,
+            deadline_at=payload.deadline_at,
+            origin_session_id=origin_session_of(principal),
             pty_enabled=not payload.no_pty,
         )
-        return job.model_dump(mode="json")
+        return await owned_job_dto(job)
+
+    async def build_board(worker_id: str | None) -> dict:
+        now = int(time.time())
+        workers = {worker.id: worker for worker in await db.list_workers()}
+        if worker_id is not None:
+            selected = await resolve_worker(worker_id)
+            worker_ids = [selected.id] if selected else [worker_id]
+        else:
+            worker_ids = list(workers)
+        queued = [job for job in await db.list_queued_jobs() if job.worker_id in worker_ids or worker_id is None]
+        cpu_jobs = [job for job in await db.list_active_cpu_jobs() if job.worker_id in worker_ids or worker_id is None]
+        for job in (*queued, *cpu_jobs):
+            if job.worker_id and job.worker_id not in worker_ids:
+                worker_ids.append(job.worker_id)
+        revisions = await db.queue_revisions()
+        names = await db.user_display_names({job.owner_user_id for job in (*queued, *cpu_jobs)})
+        history = await db.delay_history([job.id for job in queued], limit_per_job=5)
+        entries = []
+        for current_id in worker_ids:
+            worker = workers.get(current_id)
+            worker_jobs = [job for job in queued if job.worker_id == current_id]
+            estimates = forecast_worker(worker, worker_jobs, now)
+            snapshot = worker.name if worker else next(
+                (job.worker_name_at_submission for job in worker_jobs if job.worker_name_at_submission), None,
+            )
+            rows = []
+            position = 0
+            for job in worker_jobs:
+                if job.status == JobStatus.PENDING:
+                    position += 1
+                rows.append(public_queue_job(
+                    job, owner_display_name=names.get(job.owner_user_id, ""), worker_name=snapshot,
+                    position=position if job.status == JobStatus.PENDING else 0,
+                    estimate=estimates.get(job.id), delay_history=history.get(job.id, []),
+                ))
+            cpu_rows = [
+                public_queue_job(
+                    job, owner_display_name=names.get(job.owner_user_id, ""), worker_name=snapshot,
+                    position=0, estimate=None, delay_history=[],
+                )
+                for job in cpu_jobs if job.worker_id == current_id
+            ]
+            entries.append({
+                "worker_id": current_id,
+                "worker_name": snapshot,
+                "revision": revisions.get(current_id, 0),
+                "jobs": rows,
+                "cpu_jobs": cpu_rows,
+            })
+        entries.sort(key=lambda item: ((item["worker_name"] or "").lower(), item["worker_id"]))
+        return {"workers": entries, "as_of": now}
 
     @app.get("/api/v1/jobs/queue")
     async def jobs_queue_list(worker_id: str | None = None):
-        jobs = await db.list_queued_jobs(worker_id)
-        workers = {worker.id: worker for worker in await db.list_workers()}
-        pending_positions: dict[str, int] = {}
-        result = []
-        for job in jobs:
-            item = job.model_dump(mode="json")
-            worker_key = job.worker_id or ""
-            worker = workers.get(worker_key)
-            item["worker_name"] = worker.name if worker else None
-            if job.status == JobStatus.PENDING:
-                pending_positions[worker_key] = pending_positions.get(worker_key, 0) + 1
-                item["position"] = pending_positions[worker_key]
-            else:
-                item["position"] = 0
-            result.append(item)
+        return await build_board(worker_id)
+
+    @app.get("/api/v1/jobs/queue/history")
+    async def jobs_queue_history(
+        worker_id: str | None = None,
+        job_id: str | None = None,
+        before_event_id: int | None = Query(None, ge=1),
+        limit: int = Query(50, ge=1, le=200),
+    ):
+        events = await db.list_queue_events(
+            worker_id=worker_id, job_id=job_id, before_event_id=before_event_id, limit=limit,
+        )
+        return {
+            "events": events,
+            "next_before_event_id": events[-1]["id"] if len(events) == limit else None,
+        }
+
+    @app.post("/api/v1/jobs/{job_id}/queue/preview")
+    async def jobs_queue_preview(job_id: str, payload: QueuePreviewRequest, request: Request):
+        principal: Principal = request.state.principal
+        try:
+            return await db.create_queue_preview(
+                job_id, before_job_id=payload.before_job_id,
+                expected_revision=payload.expected_revision, reason=payload.reason,
+                actor=principal.audit_actor(), now=int(time.time()),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}") from exc
+        except QueueValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except QueueConflict as exc:
+            raise conflict(exc.code, exc.message) from exc
+
+    @app.post("/api/v1/jobs/{job_id}/queue/move")
+    async def jobs_queue_move(job_id: str, payload: QueueMoveRequest, request: Request):
+        principal: Principal = request.state.principal
+        try:
+            result = await db.commit_queue_move(
+                job_id, preview_id=payload.preview_id, expected_revision=payload.expected_revision,
+                actor=principal.audit_actor(), now=int(time.time()),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="preview not found") from exc
+        except QueueConflict as exc:
+            raise conflict(exc.code, exc.message) from exc
+        worker = await db.get_worker(result["event"]["worker_id"])
+        if worker is not None:
+            await jm.dispatch_worker(worker)
         return result
 
     @app.patch("/api/v1/jobs/{job_id}/queue")
-    async def jobs_queue_update(job_id: str, payload: QueuedJobUpdateRequest):
-        job = await db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
-        if not job.queue_managed or job.status != JobStatus.PENDING:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="only pending queued jobs can be updated",
-            )
-
-        source_worker = await db.get_worker(job.worker_id or "")
-        destination_worker = source_worker
-        destination_worker_id = None
+    async def jobs_queue_update(job_id: str, payload: QueuedJobUpdateRequest, request: Request):
+        principal: Principal = request.state.principal
+        job = await owned_job_or_404(principal, job_id)
+        destination = None
         if payload.worker_id is not None:
-            destination_worker = await resolve_worker(payload.worker_id)
-            if not destination_worker:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Worker not found: {payload.worker_id}",
-                )
-            destination_worker_id = destination_worker.id
-        if destination_worker is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Worker not found: {job.worker_id}",
-            )
-
-        requested_gpu_count = payload.gpu_count or job.gpu_count
-        if requested_gpu_count > destination_worker.gpu_count:
-            raise HTTPException(
-                status_code=422,
-                detail=f"gpu_count exceeds worker capacity ({destination_worker.gpu_count})",
-            )
+            destination = await worker_or_404(payload.worker_id)
         try:
-            await db.update_pending_job(
-                job_id,
-                worker_id=destination_worker_id,
-                position=payload.position,
-                name=payload.name,
-                expected_seconds=payload.expected_seconds,
-                gpu_count=payload.gpu_count,
+            updated = await db.update_job_metadata(
+                job_id, owner_user_id=principal.user_id, actor=principal.audit_actor(),
+                changes=payload.changes(), pending=True,
+                destination_worker_id=destination.id if destination else None, now=int(time.time()),
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"Job not found: {job_id}") from exc
         except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        for worker_ref in {job.worker_id, updated.worker_id}:
+            worker = await db.get_worker(worker_ref or "")
+            if worker is not None:
+                await jm.dispatch_worker(worker)
+        return await owned_job_dto(await db.get_job(job_id) or updated)
 
-        dispatch_workers = {
-            worker.id: worker
-            for worker in (source_worker, destination_worker)
-            if worker is not None
-        }
-        for worker in dispatch_workers.values():
-            await jm.dispatch_worker(worker)
-
-        queue_snapshot = await db.list_queued_jobs()
-        updated = next((queued for queued in queue_snapshot if queued.id == job_id), None)
-        if updated is None:
-            updated = await db.get_job(job_id)
-        if updated is None:
-            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
-        updated_worker = await db.get_worker(updated.worker_id or "")
-        item = updated.model_dump(mode="json")
-        item["worker_name"] = updated_worker.name if updated_worker else None
-        item["position"] = 0
-        if updated.status == JobStatus.PENDING:
-            pending = [
-                queued for queued in queue_snapshot
-                if queued.worker_id == updated.worker_id and queued.status == JobStatus.PENDING
-            ]
-            item["position"] = next(
-                index for index, queued in enumerate(pending, 1) if queued.id == updated.id
+    @app.patch("/api/v1/jobs/{job_id}")
+    async def jobs_update(job_id: str, payload: RunningJobUpdateRequest, request: Request):
+        principal: Principal = request.state.principal
+        await owned_job_or_404(principal, job_id)
+        try:
+            updated = await db.update_job_metadata(
+                job_id, owner_user_id=principal.user_id, actor=principal.audit_actor(),
+                changes=payload.changes(), pending=False, now=int(time.time()),
             )
-        return item
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return await owned_job_dto(updated)
 
     @app.post("/api/v1/jobs")
-    async def jobs_create(payload: JobCreateRequest):
-        worker = await resolve_worker(payload.worker_id)
-        if not worker:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Worker not found: {payload.worker_id}",
-            )
-
+    async def jobs_create(payload: JobCreateRequest, request: Request):
+        principal: Principal = request.state.principal
+        worker = await worker_or_404(payload.worker_id)
+        if worker.status != WorkerStatus.ONLINE:
+            raise conflict("WORKER_OFFLINE", "worker is offline; CPU/setup jobs launch immediately")
         job = await jm.start_job(
             worker,
             payload.command,
+            owner_user_id=principal.user_id,
+            actor_id=principal.actor_id,
             name=payload.name,
+            expected_seconds=payload.expected_seconds,
+            priority=payload.priority,
+            priority_note=payload.priority_note,
+            deadline_at=payload.deadline_at,
+            origin_session_id=origin_session_of(principal),
             pty_enabled=not payload.no_pty,
         )
-
         if not payload.sync:
-            return job.model_dump(mode="json")
+            return await owned_job_dto(job)
 
-        # Sync mode: poll until the job finishes or sync_timeout expires.
-        import time as _time
-
-        deadline = _time.monotonic() + payload.sync_timeout
-        while _time.monotonic() < deadline:
+        # Sync mode: poll until the supervisor confirms completion or timeout.
+        deadline = time.monotonic() + payload.sync_timeout
+        while time.monotonic() < deadline:
             job = await jm.refresh_job_status(worker, job)
-            if job.status not in (JobStatus.STARTING, JobStatus.RUNNING, JobStatus.PENDING):
+            if job.status not in (JobStatus.STARTING, JobStatus.RUNNING):
                 break
             await asyncio.sleep(0.5)
-
-        # Read the full log (stdout+stderr merged by the tmux script)
         log_path = f"{worker.harness_dir.rstrip('/')}/{job.id}/output.log"
-        log_result = await async_ssh_run(worker, f"cat '{log_path}' 2>/dev/null", timeout=10)
-        # Strip the EXIT marker line
-        output_lines = [
-            line for line in log_result.stdout.splitlines() if not line.startswith("EXIT:")
-        ]
-        output = "\n".join(output_lines)
-
-        result = job.model_dump(mode="json")
-        result["stdout"] = output
+        log_result = await async_ssh_run(worker, f"cat {shlex.quote(log_path)} 2>/dev/null", timeout=10)
+        result = await owned_job_dto(job)
+        result["stdout"] = log_result.stdout.rstrip("\n")
         return result
 
     @app.get("/api/v1/jobs")
     async def jobs_list(
+        request: Request,
         worker_id: str | None = None,
         status_value: str | None = Query(None, alias="status"),
-        origin_session_id: str | None = None,
     ):
+        principal: Principal = request.state.principal
         job_status = None
         if status_value:
             try:
                 job_status = JobStatus(status_value)
             except ValueError:
                 raise HTTPException(status_code=400, detail=f"Invalid status: {status_value}")
-
-        jobs = await db.list_jobs(
-            worker_id=worker_id,
-            status=job_status,
-            origin_session_id=origin_session_id,
-        )
+        # Ownership is applied in SQL regardless of other filters.
+        jobs = await db.list_jobs(worker_id=worker_id, status=job_status, owner_user_id=principal.user_id)
         workers = {w.id: w for w in await db.list_workers()}
+        names = await db.user_display_names({principal.user_id})
+        return [
+            owned_job(
+                job, owner_display_name=names.get(principal.user_id, ""),
+                worker_name=workers[job.worker_id].name if job.worker_id in workers else None,
+            )
+            for job in jobs
+        ]
 
-        refreshed = []
-        for job in jobs:
-            item = job.model_dump(mode="json")
-            worker_ref = workers.get(job.worker_id or "")
-            item["worker_name"] = worker_ref.name if worker_ref else None
-            refreshed.append(item)
-
-        return refreshed
+    @app.get("/api/v1/jobs/{job_id}")
+    async def jobs_get(job_id: str, request: Request):
+        job = await owned_job_or_404(request.state.principal, job_id)
+        return await owned_job_dto(job, with_history=True)
 
     async def _job_reconciler() -> None:
         interval = _positive_int_env("WH_JOB_RECONCILE_INTERVAL_SECONDS", 10)
@@ -1752,161 +1971,216 @@ def create_app(db: Database) -> FastAPI:
     @app.get("/api/v1/jobs/{job_id}/logs")
     async def jobs_logs(
         job_id: str,
+        request: Request,
         tail: int | None = Query(None, ge=0),
         head: int | None = Query(None, ge=0),
     ):
         if tail is not None and head is not None:
             raise HTTPException(status_code=400, detail="tail and head are mutually exclusive")
-
-        job = await db.get_job(job_id)
-        if not job or not job.worker_id:
-            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
-
-        worker = await db.get_worker(job.worker_id)
+        job = await owned_job_or_404(request.state.principal, job_id)
+        worker = await db.get_worker(job.worker_id or "")
         if not worker:
             raise HTTPException(status_code=404, detail=f"Worker not found: {job.worker_id}")
-
         resolved_tail = tail if tail is not None else (None if head is not None else 10)
         logs = await jm.get_logs(worker, job_id, tail=resolved_tail, head=head)
-        return {
-            "job_id": job_id,
-            "tail": resolved_tail,
-            "head": head,
-            "logs": logs,
-        }
+        return {"job_id": job_id, "tail": resolved_tail, "head": head, "logs": logs}
 
     @app.get("/api/v1/jobs/{job_id}/logs/stream")
     async def jobs_logs_stream(
         job_id: str,
+        request: Request,
         poll_seconds: float = Query(1.0, gt=0, le=10),
         tail: int = Query(50, ge=1, le=10000),
     ):
-        job = await db.get_job(job_id)
-        if not job or not job.worker_id:
-            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
-
-        worker = await db.get_worker(job.worker_id)
+        principal: Principal = request.state.principal
+        job = await owned_job_or_404(principal, job_id)
+        worker = await db.get_worker(job.worker_id or "")
         if not worker:
             raise HTTPException(status_code=404, detail=f"Worker not found: {job.worker_id}")
 
         async def stream():
-            last_len = 0
+            offset: int | None = None
+            partial = b""
             while True:
-                logs = await jm.get_logs(worker, job_id, tail=tail)
-                lines = logs.splitlines(keepends=True)
-                for line in lines[last_len:]:
-                    yield line
-                last_len = len(lines)
+                # Revalidate credentials before every batch.
+                if not await principal_still_valid(db, principal):
+                    return
+                chunk = await jm.get_log_range(worker, job_id, offset)
+                if chunk is not None:
+                    start, end, data = chunk
+                    if offset is not None and start != offset:
+                        partial = b""  # the log was truncated or replaced
+                    complete, newline, partial = (partial + data).rpartition(b"\n")
+                    lines = (complete + newline).decode(errors="replace").splitlines(keepends=True)
+                    if offset is None:
+                        # The initial window may begin mid-line; then every new line.
+                        lines = (lines[1:] if start > 0 else lines)[-tail:]
+                    for line in lines:
+                        yield line
+                    offset = end
                 await asyncio.sleep(poll_seconds)
 
-        return StreamingResponse(stream(), media_type="text/plain")
+        return StreamingResponse(stream(), media_type="text/plain", headers={"X-Accel-Buffering": "no"})
 
     @app.delete("/api/v1/jobs/{job_id}")
-    async def jobs_delete(job_id: str):
-        job = await db.get_job(job_id)
-        if not job or not job.worker_id:
-            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
-
+    async def jobs_delete(job_id: str, request: Request):
+        job = await owned_job_or_404(request.state.principal, job_id)
         if job.status in (JobStatus.DONE, JobStatus.FAILED):
             return {
-                "job_id": job_id,
-                "stopped": True,
-                "already_terminal": True,
-                "status": job.status.value,
+                "job_id": job_id, "stopped": True, "already_terminal": True,
+                "status": job.status.value, "execution_state": job.execution_state.value,
             }
-
-        worker = await db.get_worker(job.worker_id)
+        worker = await db.get_worker(job.worker_id or "")
         if not worker:
-            raise HTTPException(status_code=404, detail=f"Worker not found: {job.worker_id}")
-
-        stopped = await jm.stop_job(worker, job_id)
-        if not stopped:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "message": f"Failed to stop job: {job_id}",
-                    "hint": "Job may have already exited; refresh job status and retry.",
-                },
+            raise conflict("STOP_UNCONFIRMED", "worker is unknown; the job keeps its allocation", 503)
+        outcome = await jm.stop_job(worker, job_id, reason=TerminationReason.USER_CANCELLED)
+        if outcome.state == "not_found":
+            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+        if outcome.state == "unconfirmed":
+            raise conflict(
+                "STOP_UNCONFIRMED",
+                "stop requested but termination is not confirmed; the job keeps its allocation",
+                503,
             )
-
-        updated = await db.get_job(job_id)
+        updated = outcome.job or await db.get_job(job_id)
         return {
             "job_id": job_id,
             "stopped": True,
-            "already_terminal": False,
+            "already_terminal": outcome.state == "already_terminal",
             "status": updated.status.value if updated else None,
+            "execution_state": updated.execution_state.value if updated else None,
         }
 
-    async def stop_marimo_session(session: MarimoSession) -> None:
-        job = await db.get_job(session.job_id)
-        worker = await db.get_worker(session.worker_id)
-        if job and worker and job.status in (
-            JobStatus.STARTING,
-            JobStatus.RUNNING,
-            JobStatus.PENDING,
-        ):
-            if not await jm.stop_job(worker, job.id):
-                raise RuntimeError(f"failed to stop marimo job {job.id}")
+    @app.get("/api/v1/usage")
+    async def usage(worker_id: str | None = None, user_id: str | None = None):
+        now = int(time.time())
+        rows = await db.usage(now=now, worker_id=worker_id, user_id=user_id)
+        return {"rows": rows, "as_of": now, "provisional": any(row["provisional"] for row in rows)}
 
-        entry = app.state.tunnels.remove(session.tunnel_id)
+    # ── Managed Marimo (owner-scoped) ────────────────────────────────────────
+
+    def marimo_dto(session: MarimoSession, *, worker_name: str | None, ready: bool) -> dict:
+        return {
+            "id": session.id,
+            "worker_id": session.worker_id,
+            "worker_name": worker_name,
+            "notebook_path": session.notebook_path,
+            "environment": session.environment,
+            "job_id": session.job_id,
+            "status": "ready" if ready else "stopped",
+            "url": session.url,
+            "owner_user_id": session.owner_user_id,
+            "created_at": session.created_at,
+        }
+
+    async def stop_tunnel(tunnel_id: str) -> None:
+        entry = app.state.tunnels.remove(tunnel_id)
         if entry:
+            # The registry kills the complete process group off the event loop.
             await asyncio.to_thread(TunnelRegistry.stop, entry)
-        await db.delete_port_forward(session.tunnel_id)
+        await db.delete_port_forward(tunnel_id)
+
+    async def release_marimo_resources(session: MarimoSession) -> None:
+        """Delete forward, tokens and record once the notebook job is confirmed gone."""
+        await stop_tunnel(session.tunnel_id)
+        if session.upstream_token_path:
+            delete_local_token(Path(session.upstream_token_path))
+        worker = await db.get_worker(session.worker_id)
+        if worker is not None:
+            await delete_remote_token(worker, session.id)
         await db.delete_marimo_session(session.id)
-        await app.state.cache.invalidate("tunnels:list")
+
+    async def owned_marimo(principal: Principal, session_id: str) -> tuple[MarimoSession, Job, PortForward]:
+        session = await db.get_marimo_session(session_id)
+        if session is None or session.owner_user_id != principal.user_id:
+            raise HTTPException(status_code=404, detail=f"Marimo session not found: {session_id}")
+        job = await db.get_job(session.job_id)
+        forward = await db.get_port_forward(session.tunnel_id)
+        if (
+            job is None or forward is None
+            or job.owner_user_id != session.owner_user_id
+            or forward.owner_user_id != session.owner_user_id
+        ):
+            raise HTTPException(status_code=409, detail="managed notebook resources are inconsistent")
+        return session, job, forward
+
+    def marimo_ready(job: Job | None, tunnel_id: str) -> bool:
+        entry = app.state.tunnels.get(tunnel_id)
+        return bool(job and job.status == JobStatus.RUNNING and entry and entry.proc.poll() is None)
 
     @app.post("/api/v1/marimo", status_code=201)
-    async def marimo_create(payload: MarimoCreateRequest):
-        worker = await resolve_worker(payload.worker_id)
-        if not worker:
-            raise HTTPException(status_code=404, detail=f"Worker not found: {payload.worker_id}")
+    async def marimo_create(payload: MarimoCreateRequest, request: Request):
+        principal: Principal = request.state.principal
+        worker = await worker_or_404(payload.worker_id)
         if not 1 <= payload.ready_timeout <= 300:
             raise HTTPException(status_code=422, detail="ready_timeout must be between 1 and 300 seconds")
-
+        session_id = str(uuid4())
+        base_url = proxy_base_path(session_id)
+        bind_host = "127.0.0.1"
         try:
             remote_port = await allocate_worker_port(worker)
-            bind_host = tailnet_bind_host()
-            local_port = allocate_local_port(bind_host)
+            reserved = {pf.local_port for pf in await db.list_port_forwards() if pf.bind_host == bind_host}
+            local_port = allocate_local_port(bind_host, reserved=reserved)
             command = build_launch_command(
                 notebook_path=payload.notebook_path,
                 environment=payload.environment,
                 port=remote_port,
+                token_file=remote_token_path(worker, session_id),
+                base_url=base_url,
             )
         except (ValueError, RuntimeError, OSError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        job = await jm.start_job(worker, command, name=f"marimo-{uuid4().hex[:12]}", pty_enabled=False)
+        token = secrets.token_urlsafe(32)
+        token_path = local_token_path(db.path, session_id)
+        write_local_token(token_path, token)
+        uploaded = await upload_remote_token(worker, session_id, token)
+        if uploaded.returncode != 0:
+            delete_local_token(token_path)
+            await delete_remote_token(worker, session_id)
+            raise HTTPException(status_code=502, detail="could not provision the notebook token")
+
+        # Managed notebooks are CPU-only; GPU notebooks use ordinary queued commands.
+        job = await jm.start_job(
+            worker, command, owner_user_id=principal.user_id, actor_id=principal.actor_id,
+            name="Marimo session", origin_session_id=origin_session_of(principal), pty_enabled=False,
+        )
         if job.status == JobStatus.FAILED:
+            delete_local_token(token_path)
+            await delete_remote_token(worker, session_id)
             raise HTTPException(status_code=502, detail="failed to start marimo worker process")
 
+        now = int(datetime.now(timezone.utc).timestamp())
         pf = PortForward(
             worker_id=worker.id,
             local_port=local_port,
             remote_port=remote_port,
-            service_name=f"marimo:{payload.notebook_path}",
-            created_at=int(datetime.now(timezone.utc).timestamp()),
+            service_name="Marimo session",
+            created_at=now,
+            owner_user_id=principal.user_id,
+            created_by_actor_id=principal.actor_id,
+            bind_host=bind_host,
+            marimo_session_id=session_id,
         )
         proc = None
+        reserved = False
         registered = False
         try:
-            proc = await ssh_port_forward(
-                worker, local_port, remote_port, bind_host=bind_host
-            )
+            await db.insert_port_forward(pf)
+            reserved = True
+            proc = await ssh_port_forward(worker, local_port, remote_port, bind_host=bind_host)
             if proc.poll() is not None:
                 raise RuntimeError(f"SSH tunnel exited immediately (code={proc.returncode})")
             pf.pid = proc.pid
-            await db.insert_port_forward(pf)
+            await db.update_port_forward_pid(pf.id, proc.pid)
             app.state.tunnels.add(TunnelProcess(
-                id=pf.id,
-                worker_id=worker.id,
-                local_port=local_port,
-                remote_port=remote_port,
-                proc=proc,
-                created_at=pf.created_at,
+                id=pf.id, worker_id=worker.id, local_port=local_port, remote_port=remote_port,
+                proc=proc, created_at=now, owner_user_id=principal.user_id,
             ))
             registered = True
-            await wait_until_ready(bind_host, local_port, payload.ready_timeout)
+            await wait_until_ready(bind_host, local_port, payload.ready_timeout, base_url=base_url, token=token)
             session = MarimoSession(
+                id=session_id,
                 worker_id=worker.id,
                 notebook_path=payload.notebook_path,
                 environment=payload.environment,
@@ -1915,30 +2189,42 @@ def create_app(db: Database) -> FastAPI:
                 local_port=local_port,
                 remote_port=remote_port,
                 bind_host=bind_host,
-                url=f"http://{bind_host}:{local_port}",
+                url=f"{app.state.web_origin}{base_url}/",
                 status="ready",
-                created_at=pf.created_at,
+                created_at=now,
+                owner_user_id=principal.user_id,
+                created_by_actor_id=principal.actor_id,
+                upstream_token_path=str(token_path),
             )
             await db.insert_marimo_session(session)
         except BaseException as exc:
             async def cleanup_failed_start() -> None:
+                # Remove only resources allocated by this request.
                 entry = app.state.tunnels.remove(pf.id) if registered else None
                 if entry:
                     await asyncio.to_thread(TunnelRegistry.stop, entry)
                 elif proc is not None:
                     transient = TunnelProcess(
                         id=pf.id, worker_id=worker.id, local_port=local_port,
-                        remote_port=remote_port, proc=proc, created_at=pf.created_at,
+                        remote_port=remote_port, proc=proc, created_at=now,
+                        owner_user_id=principal.user_id,
                     )
                     await asyncio.to_thread(TunnelRegistry.stop, transient)
+                if reserved:
+                    try:
+                        await db.delete_port_forward(pf.id)
+                    except Exception:
+                        log.exception("Failed to delete marimo tunnel row %s during rollback", pf.id)
                 try:
-                    await db.delete_port_forward(pf.id)
-                except Exception:
-                    log.exception("Failed to delete marimo tunnel row %s during rollback", pf.id)
-                try:
-                    await jm.stop_job(worker, job.id)
+                    outcome = await jm.stop_job(worker, job.id, reason=TerminationReason.USER_CANCELLED)
                 except Exception:
                     log.exception("Failed to stop marimo job %s during rollback", job.id)
+                    return
+                if outcome.state in ("stopped", "already_terminal"):
+                    delete_local_token(token_path)
+                    await delete_remote_token(worker, session_id)
+                else:
+                    log.error("Marimo job %s stop unconfirmed; retaining its token for reconciliation", job.id)
 
             cleanup_task = asyncio.create_task(cleanup_failed_start())
             try:
@@ -1947,100 +2233,127 @@ def create_app(db: Database) -> FastAPI:
                 await cleanup_task
             if isinstance(exc, asyncio.CancelledError):
                 raise
+            if isinstance(exc, ListenerConflict):
+                raise HTTPException(status_code=409, detail="listener port unavailable; retry") from exc
             raise HTTPException(status_code=502, detail=f"marimo startup failed: {exc}") from exc
 
-        await app.state.cache.invalidate("tunnels:list")
-        return {**session.model_dump(mode="json"), "worker_name": worker.name}
+        return marimo_dto(session, worker_name=worker.name, ready=True)
 
     @app.get("/api/v1/marimo")
-    async def marimo_list(worker_id: str | None = None):
-        sessions = await db.list_marimo_sessions(worker_id=worker_id)
+    async def marimo_list(request: Request, worker_id: str | None = None):
+        principal: Principal = request.state.principal
+        sessions = await db.list_marimo_sessions(worker_id=worker_id, owner_user_id=principal.user_id)
         workers = {worker.id: worker for worker in await db.list_workers()}
         result = []
         for session in sessions:
             job = await db.get_job(session.job_id)
             worker = workers.get(session.worker_id)
-            if job and worker and job.status in (
-                JobStatus.STARTING,
-                JobStatus.RUNNING,
-                JobStatus.PENDING,
-            ):
-                job = await jm.refresh_job_status(worker, job)
-            entry = app.state.tunnels.get(session.tunnel_id)
-            tunnel_live = bool(entry and entry.proc.poll() is None)
-            item = session.model_dump(mode="json")
-            item["status"] = "ready" if job and job.status == JobStatus.RUNNING and tunnel_live else "stopped"
-            item["worker_name"] = worker.name if worker else None
-            result.append(item)
+            result.append(marimo_dto(
+                session, worker_name=worker.name if worker else None,
+                ready=marimo_ready(job, session.tunnel_id),
+            ))
         return result
 
     @app.get("/api/v1/marimo/{session_id}")
-    async def marimo_get(session_id: str):
-        session = await db.get_marimo_session(session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail=f"Marimo session not found: {session_id}")
+    async def marimo_get(session_id: str, request: Request):
+        session, job, _forward = await owned_marimo(request.state.principal, session_id)
         worker = await db.get_worker(session.worker_id)
-        job = await db.get_job(session.job_id)
-        if job and worker and job.status in (
-            JobStatus.STARTING,
-            JobStatus.RUNNING,
-            JobStatus.PENDING,
-        ):
+        if worker and job.status == JobStatus.RUNNING:
             job = await jm.refresh_job_status(worker, job)
-        entry = app.state.tunnels.get(session.tunnel_id)
-        tunnel_live = bool(entry and entry.proc.poll() is None)
-        item = session.model_dump(mode="json")
-        item["status"] = "ready" if job and job.status == JobStatus.RUNNING and tunnel_live else "stopped"
-        item["worker_name"] = worker.name if worker else None
-        return item
+        return marimo_dto(
+            session, worker_name=worker.name if worker else None,
+            ready=marimo_ready(job, session.tunnel_id),
+        )
 
     @app.delete("/api/v1/marimo/{session_id}")
-    async def marimo_delete(session_id: str):
-        session = await db.get_marimo_session(session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail=f"Marimo session not found: {session_id}")
-        try:
-            await stop_marimo_session(session)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+    async def marimo_delete(session_id: str, request: Request):
+        session, job, _forward = await owned_marimo(request.state.principal, session_id)
+        if job.status not in (JobStatus.DONE, JobStatus.FAILED):
+            worker = await db.get_worker(session.worker_id)
+            if worker is None:
+                raise conflict("STOP_UNCONFIRMED", "worker is unknown; notebook kept", 503)
+            outcome = await jm.stop_job(worker, job.id, reason=TerminationReason.USER_CANCELLED)
+            if outcome.state == "unconfirmed":
+                raise conflict("STOP_UNCONFIRMED", "notebook stop is not confirmed; resources kept", 503)
+        # The terminal-job hook normally released everything; finish if not.
+        remaining = await db.get_marimo_session(session_id)
+        if remaining is not None:
+            await release_marimo_resources(remaining)
         return {"session_id": session_id, "removed": True}
 
+    async def authorize_marimo(connection: HTTPConnection, session_id: str) -> ProxyTarget:
+        principal = await resolve_principal(connection)
+        if principal.credential_kind == "pi_session" and principal.pi_session.role == "orchestrator":
+            raise HTTPException(status_code=403, detail="caller role is not allowed")
+        session, job, forward = await owned_marimo(principal, session_id)
+        if job.status != JobStatus.RUNNING:
+            raise HTTPException(status_code=409, detail="notebook is not running")
+        token_path = Path(session.upstream_token_path) if session.upstream_token_path else None
+        try:
+            token = token_path.read_text(encoding="utf8").strip() if token_path else ""
+        except OSError:
+            token = ""
+        if not token:
+            # Legacy unauthenticated listeners are never adopted.
+            raise HTTPException(status_code=409, detail="notebook has no native token; recreate it")
+        return ProxyTarget(
+            upstream=f"http://127.0.0.1:{forward.local_port}",
+            base_path=proxy_base_path(session.id),
+            token=token,
+            credential_kind=principal.credential_kind,
+        )
+
+    app.include_router(create_marimo_proxy_router(authorize=authorize_marimo, web_origin=app.state.web_origin))
+
+    # ── Generic tunnels (owner-scoped raw TCP on the trusted Tailnet) ────────
+
+    def tunnel_dto(pf: PortForward, worker_name: str | None) -> dict:
+        return {
+            "id": pf.id,
+            "worker_id": pf.worker_id,
+            "worker_name": worker_name,
+            "local_port": pf.local_port,
+            "remote_port": pf.remote_port,
+            "service_name": pf.service_name,
+            "bind_host": pf.bind_host,
+            "owner_user_id": pf.owner_user_id,
+            "created_at": pf.created_at,
+        }
+
     @app.post("/api/v1/tunnels")
-    async def tunnels_create(payload: TunnelCreateRequest):
-        worker = await resolve_worker(payload.worker_id)
-        if not worker:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Worker not found: {payload.worker_id}",
-            )
-
-        existing = await db.list_port_forwards()
-        conflict = next((p for p in existing if p.local_port == payload.local_port), None)
-        if conflict:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Local port {payload.local_port} already forwarded",
-            )
-
+    async def tunnels_create(payload: TunnelCreateRequest, request: Request):
+        principal: Principal = request.state.principal
+        worker = await worker_or_404(payload.worker_id)
+        try:
+            bind_host = tailnet_bind_host()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         pf = PortForward(
             worker_id=worker.id,
             local_port=payload.local_port,
             remote_port=payload.remote_port,
             service_name=payload.name or f"port-{payload.remote_port}",
             created_at=int(datetime.now(timezone.utc).timestamp()),
+            owner_user_id=principal.user_id,
+            created_by_actor_id=principal.actor_id,
+            bind_host=bind_host,
         )
+        try:
+            await db.insert_port_forward(pf)
+        except ListenerConflict as exc:
+            raise HTTPException(status_code=409, detail="local port unavailable") from exc
 
         proc = None
         registered = False
         try:
-            proc = await ssh_port_forward(worker, payload.local_port, payload.remote_port)
+            proc = await ssh_port_forward(worker, payload.local_port, payload.remote_port, bind_host=bind_host)
             if proc.poll() is not None:
                 raise HTTPException(
                     status_code=502,
                     detail=f"SSH tunnel setup exited immediately (code={proc.returncode})",
                 )
             pf.pid = proc.pid
-            await db.insert_port_forward(pf)
+            await db.update_port_forward_pid(pf.id, proc.pid)
             app.state.tunnels.add(TunnelProcess(
                 id=pf.id,
                 worker_id=worker.id,
@@ -2048,9 +2361,9 @@ def create_app(db: Database) -> FastAPI:
                 remote_port=payload.remote_port,
                 proc=proc,
                 created_at=pf.created_at,
+                owner_user_id=principal.user_id,
             ))
             registered = True
-            await app.state.cache.invalidate("tunnels:list")
         except BaseException:
             async def cleanup_failed_tunnel() -> None:
                 entry = app.state.tunnels.remove(pf.id) if registered else None
@@ -2060,7 +2373,7 @@ def create_app(db: Database) -> FastAPI:
                     transient = TunnelProcess(
                         id=pf.id, worker_id=worker.id,
                         local_port=payload.local_port, remote_port=payload.remote_port,
-                        proc=proc, created_at=pf.created_at,
+                        proc=proc, created_at=pf.created_at, owner_user_id=principal.user_id,
                     )
                     await asyncio.to_thread(TunnelRegistry.stop, transient)
                 try:
@@ -2074,42 +2387,47 @@ def create_app(db: Database) -> FastAPI:
             except asyncio.CancelledError:
                 await cleanup_task
             raise
-
-        return {
-            **pf.model_dump(mode="json"),
-            "worker_name": worker.name,
-        }
+        finally:
+            await app.state.cache.invalidate(f"tunnels:{principal.user_id}")
+        return tunnel_dto(pf, worker.name)
 
     @app.get("/api/v1/tunnels")
-    async def tunnels_list():
+    async def tunnels_list(request: Request):
+        principal: Principal = request.state.principal
+
         async def load():
-            tunnels = await db.list_port_forwards()
+            tunnels = await db.list_port_forwards(owner_user_id=principal.user_id)
             workers = {w.id: w for w in await db.list_workers()}
             return [
-                {
-                    **t.model_dump(mode="json"),
-                    "worker_name": getattr(workers.get(t.worker_id), "name", None),
-                }
-                for t in tunnels
+                tunnel_dto(t, getattr(workers.get(t.worker_id), "name", None))
+                for t in tunnels if t.marimo_session_id is None
             ]
-        return await cached("tunnels:list", 10.0, load)
+        return await cached(f"tunnels:{principal.user_id}", 10.0, load)
 
     @app.delete("/api/v1/tunnels/{tunnel_id}")
-    async def tunnels_delete(tunnel_id: str):
-        tunnels = await db.list_port_forwards()
-        pf = next((t for t in tunnels if t.id == tunnel_id), None)
-        if not pf:
+    async def tunnels_delete(tunnel_id: str, request: Request):
+        principal: Principal = request.state.principal
+        pf = await db.get_port_forward(tunnel_id)
+        if pf is None or pf.owner_user_id != principal.user_id:
             raise HTTPException(status_code=404, detail=f"Tunnel not found: {tunnel_id}")
-
-        entry = app.state.tunnels.remove(pf.id)
-        if entry:
-            # Tunnel registry kills the complete process group off the event
-            # loop, so tunnel teardown never blocks unrelated HTTP calls.
-            await asyncio.to_thread(TunnelRegistry.stop, entry)
-
-        await db.delete_port_forward(pf.id)
-        await app.state.cache.invalidate("tunnels:list")
+        if pf.marimo_session_id is not None:
+            raise conflict("MANAGED_BY_MARIMO", "stop the managed notebook instead")
+        await stop_tunnel(pf.id)
+        await app.state.cache.invalidate(f"tunnels:{principal.user_id}")
         return {"tunnel_id": pf.id, "removed": True}
+
+    async def on_user_disabled(user_id: str) -> None:
+        """Cancel pending work and close generic listeners; running jobs continue."""
+        cancelled = await db.cancel_pending_jobs_for_user(user_id, finished_at=int(time.time()))
+        if cancelled:
+            for worker in await db.list_workers():
+                await jm.dispatch_worker(worker)
+        for pf in await db.list_port_forwards(owner_user_id=user_id):
+            if pf.marimo_session_id is None:
+                await stop_tunnel(pf.id)
+        await app.state.cache.invalidate(f"tunnels:{user_id}")
+
+    app.include_router(create_auth_router(on_user_disabled=on_user_disabled))
 
     @app.post("/api/v1/workers/{worker_id}/files")
     async def worker_file_upload(worker_id: str, payload: FileUploadRequest):

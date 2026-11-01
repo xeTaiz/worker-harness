@@ -67,6 +67,17 @@ if [ -n "${WH_FAKEROOT:-}" ]; then
     *) echo "[start-wh] ERROR: WH_FAKEROOT must be 0/1 or false/true" >&2; exit 1 ;;
   esac
 fi
+host_group_ids="$(id -G)"
+if [ -n "$fakeroot_flag" ]; then
+  # Under --fakeroot the host user is container uid/gid 0, and every other
+  # container id maps to a subordinate range. Run SSH sessions (and so jobs)
+  # as uid 0 under the SSH user's name: files in WH_DIR and /code keep host
+  # ownership instead of becoming root-owned (host-created) or subuid-owned
+  # (job-created). Host supplementary groups are not mapped, so add none.
+  ssh_uid=0
+  ssh_gid=0
+  host_group_ids=""
+fi
 
 TS_AUTHKEY="${TS_AUTHKEY:-${WORKER_TS_KEY:-}}"
 
@@ -102,7 +113,7 @@ base_group="${tmpdir}/group"
 "$runtime" exec --cleanenv "$image" cat /etc/passwd >"$base_passwd"
 "$runtime" exec --cleanenv "$image" cat /etc/group >"$base_group"
 
-python3 - "$base_passwd" "$base_group" "$passwd_file" "$group_file" "$ssh_user" "$ssh_uid" "$ssh_gid" "$ssh_home_container" "$ssh_shell" "$(id -G)" <<'PY'
+python3 - "$base_passwd" "$base_group" "$passwd_file" "$group_file" "$ssh_user" "$ssh_uid" "$ssh_gid" "$ssh_home_container" "$ssh_shell" "$host_group_ids" <<'PY'
 from __future__ import annotations
 
 import os

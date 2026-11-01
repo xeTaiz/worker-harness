@@ -10,10 +10,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from identity_support import PASSWORD, bootstrap
+
+from worker_harness.auth import PasswordService
 from worker_harness.db import Database
 from worker_harness.herdr_host import HerdrError
 from worker_harness.machines import Machine, load_machines
-from worker_harness.models import PiSession, PiSessionState
+from worker_harness.models import PiBridgeRegister, PiSession, PiSessionState, PiSessionType
 from worker_harness.orchestration import Orchestrator, WorktreeError
 from worker_harness.pr import PR_SECTIONS, open_pr
 from worker_harness.projects import Project, load_projects, projects_path
@@ -26,6 +29,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.tmp.name)
         self.db = Database(self.root / "sessions.sqlite")
         await self.db.connect()
+        self.owner = await bootstrap(self.db)
         self.machine = Machine("desktop", "user@desktop", "/home/user")
         self.project = Project("one", "desktop", "/home/user/Work/one", "owner/one")
         self.orch = Orchestrator(self.db, {"desktop": self.machine}, {"one": self.project})
@@ -37,6 +41,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def session(self, role="pm", **kwargs):
         session = PiSession(
             role=role,
+            owner_user_id=kwargs.pop("owner_user_id", self.owner["id"]),
             state=kwargs.pop("state", PiSessionState.IDLE),
             host="desktop",
             updated_at=1,
@@ -116,6 +121,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         remove.assert_awaited_once_with(self.machine, session.meta["cache_dir"])
         destroy.assert_not_awaited()
         self.assertEqual((await self.db.get_pi_session(session.id)).state, PiSessionState.FAILED)
+        self.assertEqual((await self.db.get_pi_session(session.id)).owner_user_id, self.owner["id"])
 
     async def test_post_run_failure_preserves_checkout_and_hides_token_from_pane(self):
         parent = await self.session()
@@ -145,6 +151,92 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("WH_SESSION_TOKEN", run.await_args.args[2])
         script = next(content for path, content in written.items() if path.endswith("launch.sh"))
         self.assertIn("WH_SESSION_TOKEN=", script)
+        failed = await self.db.list_pi_sessions_by_role("task")
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].state, PiSessionState.FAILED)
+        self.assertEqual(failed[0].owner_user_id, parent.owner_user_id)
+
+    async def test_orchestrator_and_pm_launch_with_bootstrap_owner_and_tasks_inherit_pm_owner(self):
+        other = await self.db.create_user(
+            username="task-owner", display_name="Task Owner",
+            password_hash=await PasswordService().hash(PASSWORD), is_admin=False, now=1,
+        )
+        prompt = self.root / "prompt"
+        prompt.write_text("Role instructions")
+
+        async def register_bridge(machine, session):
+            return await self.db.register_interactive_pi_session(
+                PiBridgeRegister(session_id=session.id, incarnation="ready"),
+                owner_user_id=session.owner_user_id,
+            )
+
+        with patch.object(self.orch, "_prompt_path", return_value=prompt), patch.multiple(
+            "worker_harness.orchestration.herdr_host",
+            workspace_create=AsyncMock(return_value={"workspace_id": "workspace", "pane_id": "pane"}),
+            write_file=AsyncMock(), pane_run=AsyncMock(), agent_rename=AsyncMock(),
+            report_metadata=AsyncMock(),
+        ), patch.object(self.orch, "report_state", new=AsyncMock()), patch.object(
+            self.orch, "_wait_for_bridge", side_effect=register_bridge,
+        ), patch("worker_harness.orchestration.create_worktree", new=AsyncMock(
+            return_value=("/home/user/task", "task"),
+        )), patch.dict(os.environ, {"WH_ORCHESTRATOR_MACHINE": "desktop"}):
+            orchestrator = await self.orch.ensure_orchestrator()
+            manager = await self.orch.ensure_pm("one")
+            parent = await self.session(owner_user_id=other["id"])
+            task = await self.orch.launch_task(
+                self.project, branch="task", briefing="Do work", parent_session_id=parent.id,
+            )
+
+        self.assertEqual(orchestrator.session_type, PiSessionType.GLOBAL_ROUTER)
+        for session in (orchestrator, manager):
+            self.assertEqual(session.owner_user_id, self.owner["id"])
+            persisted = await self.db.get_pi_session(session.id)
+            self.assertEqual(persisted.owner_user_id, self.owner["id"])
+        self.assertNotEqual(parent.owner_user_id, self.owner["id"])
+        self.assertEqual(task.parent_session_id, parent.id)
+        self.assertEqual(task.owner_user_id, parent.owner_user_id)
+        self.assertEqual((await self.db.get_pi_session(task.id)).owner_user_id, parent.owner_user_id)
+
+    async def test_failed_worktree_launch_record_retains_parent_owner(self):
+        parent = await self.session()
+        with patch(
+            "worker_harness.orchestration.create_worktree",
+            new=AsyncMock(side_effect=WorktreeError("worktree unavailable")),
+        ), patch("worker_harness.orchestration.herdr_host.workspace_create", new=AsyncMock()) as workspace:
+            with self.assertRaises(WorktreeError):
+                await self.orch.launch_task(
+                    self.project, branch="task", briefing="Do work", parent_session_id=parent.id,
+                )
+        workspace.assert_not_awaited()
+        tasks = await self.db.list_pi_sessions_by_role("task")
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].state, PiSessionState.FAILED)
+        self.assertEqual(tasks[0].parent_session_id, parent.id)
+        self.assertEqual(tasks[0].owner_user_id, parent.owner_user_id)
+        self.assertEqual(tasks[0].detail, "worktree unavailable")
+
+    async def test_failed_workspace_launch_record_retains_parent_owner(self):
+        parent = await self.session()
+        with patch(
+            "worker_harness.orchestration.create_worktree",
+            new=AsyncMock(return_value=("/home/user/task", "task")),
+        ), patch(
+            "worker_harness.orchestration.herdr_host.workspace_create",
+            new=AsyncMock(side_effect=HerdrError("unavailable", "workspace unavailable")),
+        ), patch("worker_harness.orchestration.destroy_worktree", new=AsyncMock()) as destroy:
+            with self.assertRaises(HerdrError):
+                await self.orch.launch_task(
+                    self.project, branch="task", briefing="Do work", parent_session_id=parent.id,
+                )
+        destroy.assert_awaited_once_with(
+            self.machine, self.project.repo, "/home/user/task", "task",
+        )
+        tasks = await self.db.list_pi_sessions_by_role("task")
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].state, PiSessionState.FAILED)
+        self.assertEqual(tasks[0].parent_session_id, parent.id)
+        self.assertEqual(tasks[0].owner_user_id, parent.owner_user_id)
+        self.assertIn("workspace unavailable", tasks[0].detail)
 
     async def test_teardown_requires_pr_and_confirmed_pane_close(self):
         session = await self.session("task")
@@ -169,15 +261,15 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LaunchEnvironmentTests(unittest.TestCase):
-    def test_launch_overrides_inherited_role_and_operator_credentials(self):
+    def test_launch_overrides_inherited_role_and_api_credentials(self):
         with tempfile.TemporaryDirectory() as home:
             wrapper = Path(home) / ".local/bin/omp"
             wrapper.parent.mkdir(parents=True)
-            wrapper.write_text("#!/bin/sh\nprintf '%s\\n' \"$LOCAL_VAULT_READONLY\" \"${WH_OPERATOR_TOKEN-unset}\" \"${WH_OPERATOR_TOKEN_FILE-unset}\" \"${WH_PI_SESSION_ID-unset}\" \"$AGENT_SANDBOX_SESSION_DIR\" \"$@\"\n")
+            wrapper.write_text("#!/bin/sh\nprintf '%s\\n' \"$LOCAL_VAULT_READONLY\" \"${WH_API_KEY-unset}\" \"${WH_API_KEY_FILE-unset}\" \"${WH_PI_SESSION_ID-unset}\" \"$WH_SESSION_ROLE\" \"$WH_SESSION_TOKEN\" \"$AGENT_SANDBOX_SESSION_DIR\" \"$@\"\n")
             wrapper.chmod(0o755)
             command = launch_command(machine=Machine("test", "test", home), role="pm", paths_file="/paths", session_id="session", token="token", base_url="http://localhost", prompt_file="/prompt with spaces")
-            result = subprocess.run(["/bin/sh", "-c", command], env={**os.environ, "LOCAL_VAULT_READONLY": "1", "WH_OPERATOR_TOKEN": "secret", "WH_OPERATOR_TOKEN_FILE": "/secret", "WH_PI_SESSION_ID": "legacy"}, text=True, capture_output=True, check=True)
-            self.assertEqual(result.stdout.splitlines(), ["0", "unset", "unset", "unset", f"{home}/.cache/worker-harness/session", "--append-system-prompt", "/prompt with spaces"])
+            result = subprocess.run(["/bin/sh", "-c", command], env={**os.environ, "LOCAL_VAULT_READONLY": "1", "WH_API_KEY": "whk_secret", "WH_API_KEY_FILE": "/secret", "WH_PI_SESSION_ID": "legacy", "WH_SESSION_ROLE": "task", "WH_SESSION_TOKEN": "inherited"}, text=True, capture_output=True, check=True)
+            self.assertEqual(result.stdout.splitlines(), ["0", "unset", "unset", "unset", "pm", "token", f"{home}/.cache/worker-harness/session", "--append-system-prompt", "/prompt with spaces"])
 
     def test_invalid_top_level_catalog_tables_disable_configuration(self):
         with tempfile.TemporaryDirectory() as directory:

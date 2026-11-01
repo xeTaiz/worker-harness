@@ -30,12 +30,6 @@ def get_db():
     return _state["db"]
 
 
-def get_job_manager():
-    from worker_harness.job import JobManager
-    if "job_manager" not in _state:
-        _state["job_manager"] = JobManager(get_db())
-    return _state["job_manager"]
-
 
 @asynccontextmanager
 async def db_lifespan() -> AsyncIterator[None]:
@@ -95,15 +89,8 @@ def main_entry():
     @app.command(name="tui", hidden=True)
     def tui_cmd():
         """Launch the Textual TUI."""
-        from worker_harness.db import Database
-        from worker_harness.job import JobManager
+        from worker_harness.client import request
         from worker_harness.tui.app import run_tui
-        from worker_harness.config import Config
-        config = Config.load()
-        db = Database(config.db_path)
-        import asyncio
-        asyncio.run(db.connect())
-        jm = JobManager(db)
-        run_tui(db, jm)
+        run_tui(request)
 
     app()

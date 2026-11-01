@@ -21,6 +21,7 @@ button, textarea, select { font: inherit; }
 button, select { -webkit-tap-highlight-color: transparent; }
 button { color: inherit; }
 .hidden { display: none !important; }
+[hidden] { display: none !important; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .app-shell { display: flex; width: 100%; height: 100dvh; min-height: 0; flex-direction: column; overflow: hidden; background: radial-gradient(circle at 85% -10%, #173149 0, transparent 34rem), var(--bg); }
 .topbar {
@@ -239,3 +240,57 @@ button { color: inherit; }
   .detail-view { border-right: 1px solid var(--line); }
 }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }
+
+/* Shared compute and account surfaces use the same palette as the Pi views. */
+input { font: inherit; }
+.workspace-view { overflow-y: auto; overscroll-behavior: contain; padding: 20px 24px 48px; scrollbar-gutter: stable; }
+#workspace-content, #workspace-notice { width: min(100%, 1400px); margin-inline: auto; }
+.workspace-nav { display: grid; gap: 5px; margin-bottom: 20px; }
+.workspace-link { padding: 10px 12px; border-radius: 9px; color: var(--muted); text-decoration: none; }
+.workspace-link:hover, .workspace-link[aria-current="page"] { color: var(--text); background: var(--surface-2); }
+.workspace-section { margin: 0 0 24px; padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.workspace-section .workspace-section { margin-top: 14px; background: var(--bg); }
+.workspace-section h2, .workspace-dialog h2 { margin: 0 0 14px; font-size: 19px; }
+.workspace-section h3 { margin: 18px 0 10px; font-size: 15px; }
+.workspace-section p { line-height: 1.5; overflow-wrap: anywhere; }
+.muted { color: var(--muted); }
+.warning, .unknown-estimate { color: var(--warning); }
+.notice { padding: 12px; border-left: 3px solid var(--accent); color: var(--text); background: var(--surface-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.notice.error { border-color: var(--danger); color: var(--danger); }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 12px; margin: 14px 0 20px; align-items: start; }
+.form-heading { grid-column: 1 / -1; }
+.form-field { display: flex; min-width: 0; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; }
+.form-field:has(textarea) { grid-column: 1 / -1; }
+.form-field input, .form-field select, .form-field textarea, .issued-key input { min-width: 0; width: 100%; min-height: 40px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--bg); }
+.form-field textarea { min-height: 78px; resize: vertical; }
+.form-field input[type="checkbox"] { width: 24px; min-height: 24px; align-self: flex-start; accent-color: var(--accent); }
+.action-button { display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 8px 11px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--surface-2); font-size: 12px; text-decoration: none; cursor: pointer; }
+.action-button.primary { border-color: var(--accent); color: #07110f; background: var(--accent); font-weight: 700; }
+.action-button.danger { color: var(--danger); }
+.action-button:disabled { cursor: wait; opacity: .5; }
+.form-grid > button[type="submit"] { order: 2; align-self: end; grid-column: 1 / -1; justify-self: start; min-width: 140px; }
+.row-actions { display: flex; flex-wrap: wrap; gap: 6px; min-width: 130px; }
+:is(button, a, input, textarea, select, summary):focus-visible { outline: 2px solid var(--accent-2); outline-offset: 3px; }
+.table-scroll { width: 100%; overflow-x: auto; margin: 12px 0; }
+.data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.data-table th { color: var(--muted); font-weight: 650; white-space: nowrap; }
+.data-table th, .data-table td { padding: 12px 9px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.data-table td { min-width: 90px; max-width: 420px; overflow-wrap: anywhere; }
+.data-table td p { margin: 5px 0; }
+.delay-entry, .history-event { padding: 10px 0; color: var(--muted); }
+.delay-entry summary, .history-event summary { cursor: pointer; color: var(--warning); line-height: 1.5; }
+.workspace-dialog { width: min(calc(100% - 24px), 900px); max-height: calc(100dvh - 32px); overflow: auto; border: 1px solid var(--line); border-radius: 14px; color: var(--text); background: var(--surface); padding: 22px; }
+.workspace-dialog::backdrop { background: #000b; }
+.issued-key { padding: 14px; margin: 12px 0; border: 1px solid var(--warning); border-radius: 9px; }
+.issued-key input { margin-bottom: 8px; font-family: ui-monospace, monospace; }
+.issued-key button { margin-right: 8px; }
+.job-command, .job-logs { max-height: 55vh; overflow: auto; padding: 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 ui-monospace, monospace; }
+.account-badge { display: inline-block; padding: 3px 6px; margin: 2px; border: 1px solid var(--line); border-radius: 6px; color: var(--warning); }
+@media (max-width: 759px) {
+  .workspace-view { height: 100%; padding: 12px 8px 32px; }
+  .workspace-section { padding: 12px; }
+  .form-grid { grid-template-columns: 1fr; }
+  .form-field input, .form-field select, .form-field textarea { font-size: 16px; }
+  .data-table th, .data-table td { padding: 10px 6px; }
+  .workspace-dialog { padding: 15px; }
+}

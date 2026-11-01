@@ -1,0 +1,90 @@
+# Multi-user Worker Harness control plane behind an existing SWAG Nginx.
+#
+#   Internet --HTTPS--> SWAG (worker-harness.subdomain.conf)
+#                         --> worker-harness-web:8080 (UI + API allowlist)
+#                               --> worker-harness-orch:12889 (internal network only)
+#   wh-hs tailnet --> worker-harness-orch tailscaled (TUN): workers register on
+#                     :12888; the orchestrator reaches workers with `tailscale ssh`.
+#
+# Run from this directory:
+#   cp .env.example .env                              # SWAG network + address
+#   cp orchestrator.env.example orchestrator.env      # add TS_AUTHKEY, chmod 600
+#   docker compose up -d --build
+#   docker compose exec -it worker-harness-orch \
+#     python -m worker_harness.orchestrator bootstrap-admin --username admin
+name: worker-harness
+
+services:
+  worker-harness-orch:
+    build:
+      context: ../..
+      dockerfile: orchestrator_container/Dockerfile
+    image: worker-harness-orch:multi-user
+    container_name: worker-harness-orch
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    env_file:
+      - orchestrator.env
+    environment:
+      # The API listens only on the internal network, never on the container's
+      # tailnet address: browsers and the extension go through the web edge.
+      WH_CONTROL_HOST: 172.31.250.10
+      WH_CONTROL_PORT: "12889"
+      # Registration is reached by workers over the tailnet (never published).
+      WH_HB_HOST: 0.0.0.0
+      WH_HB_PORT: "12888"
+      # Exactly the two proxies in front of the API: the web edge and SWAG.
+      # Their X-Forwarded-For hops are trusted for login rate limiting; trusting
+      # wider ranges would let clients that SWAG sees as Docker/LAN addresses
+      # spoof theirs. If SWAG's address changes, everyone shares SWAG's bucket
+      # (fails safe) until WH_SWAG_IP is updated.
+      WH_TRUSTED_PROXIES: 172.31.250.11/32,${WH_SWAG_IP:?set WH_SWAG_IP to SWAG's address on WH_SWAG_NETWORK}/32
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - registry:/root/.config/worker-harness
+    networks:
+      internal:
+        ipv4_address: 172.31.250.10
+        aliases:
+          - wh-orch
+
+  worker-harness-web:
+    build:
+      context: ../..
+      dockerfile: web_container/Dockerfile
+    image: worker-harness-web:multi-user
+    container_name: worker-harness-web
+    restart: unless-stopped
+    depends_on:
+      - worker-harness-orch
+    # Not published on the host; SWAG reaches it on its own Docker network.
+    user: "101:101"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /var/cache/nginx:size=16m,mode=1777
+    networks:
+      internal:
+        ipv4_address: 172.31.250.11
+      swag: {}
+
+volumes:
+  tailscale-state:
+  registry:
+
+networks:
+  internal:
+    ipam:
+      config:
+        # Must not overlap an existing Docker network on the host.
+        - subnet: 172.31.250.0/24
+  swag:
+    external: true
+    name: ${WH_SWAG_NETWORK:?set WH_SWAG_NETWORK to the Docker network SWAG is attached to}

@@ -12,8 +12,10 @@ from fastapi.testclient import TestClient
 from worker_harness.data import DataPathError, is_advertised_data_path, reverse_data_paths, validate_data_path
 from worker_harness.db import Database
 from worker_harness.heartbeat import create_app, create_registration_app
-from worker_harness.models import WorkerRegistration, WorkerStatus
+from worker_harness.models import Job, JobStatus, WorkerRegistration, WorkerStatus
 from worker_harness.ssh import SSHResult
+
+from identity_support import bearer, bootstrap, issue_key, login
 
 
 class DataApiTests(unittest.TestCase):
@@ -22,6 +24,18 @@ class DataApiTests(unittest.TestCase):
         self.tmp.close()
         self.db = Database(self.tmp.name)
         asyncio.run(self.db.connect())
+        self.owner = asyncio.run(bootstrap(self.db))
+        # The endpoint's detached export-cleanup monitor must never probe SSH.
+        refresh = patch(
+            "worker_harness.heartbeat.JobManager.refresh_job_status",
+            new=AsyncMock(return_value=Job(
+                id="completed-copy", worker_id="w-two", status=JobStatus.DONE,
+                owner_user_id=self.owner["id"],
+                submitted_by_actor_id=f"migration:{self.owner['id']}",
+            )),
+        )
+        refresh.start()
+        self.addCleanup(refresh.stop)
         for worker_id, name, paths in (
             ("w-one", "worker-one", ["/data/imagenet", "/code/project"]),
             ("w-two", "worker-two", ["/data/cache"]),
@@ -36,6 +50,7 @@ class DataApiTests(unittest.TestCase):
                 data_paths=paths,
             )))
         self.client = TestClient(create_app(self.db))
+        self.client.headers.update(login(self.client, "admin"))
 
     def tearDown(self) -> None:
         self.client.close()
@@ -56,6 +71,19 @@ class DataApiTests(unittest.TestCase):
         self.assertNotIn("/data/cache", self.client.get("/api/v1/data").json())
         self.assertIn("/data/cache", self.client.get("/api/v1/data", params={"include_offline": True}).json())
 
+    def test_api_key_can_discover_shared_roots_but_cannot_start_data_copy(self):
+        headers = bearer(issue_key(self.client, dict(self.client.headers)))
+        response = self.client.get("/api/v1/data", headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("/data/imagenet", response.json())
+        with patch("worker_harness.heartbeat.async_ssh_run", new=AsyncMock()) as ssh:
+            response = self.client.post("/api/v1/data/copy", headers=headers, json={
+                "src_worker": "w-one", "src_path": "/data/imagenet",
+                "dst_worker": "w-two", "dst_path": "/data/cache/imagenet",
+            })
+        self.assertEqual(response.status_code, 403, response.text)
+        ssh.assert_not_awaited()
+
     def test_copy_exports_then_starts_destination_job_without_peer_ssh(self):
         endpoint = json.dumps({"port": 22003, "module": "transfer", "username": "transfer", "password": "secret"})
         with patch(
@@ -75,11 +103,13 @@ class DataApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["job_id"], "job-copy")
-        self.assertIn("wh-data-export", ssh.await_args.args[1])
+        self.assertTrue(any("wh-data-export" in call.args[1] for call in ssh.await_args_list))
         command = start_job.await_args.args[1]
         self.assertIn("wh-data-import", command)
         self.assertIn("--host worker-one.tailnet", command)
         self.assertNotIn("tailscale ssh", command)
+        self.assertEqual(start_job.await_args.kwargs["owner_user_id"], self.owner["id"])
+        self.assertTrue(start_job.await_args.kwargs["actor_id"].startswith("web_session:"))
 
     def test_copy_accepts_child_of_advertised_bind_root(self):
         with patch(

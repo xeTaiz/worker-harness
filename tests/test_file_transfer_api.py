@@ -18,6 +18,8 @@ from worker_harness.db import Database
 from worker_harness.heartbeat import create_app
 from worker_harness.models import GPUInfo, JobStatus, WorkerRegistration
 
+from identity_support import bearer, bootstrap, issue_key, login
+
 
 class FileTransferApiTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -25,6 +27,7 @@ class FileTransferApiTests(unittest.TestCase):
         self.tmp.close()
         self.db = Database(self.tmp.name)
         asyncio.run(self.db.connect())
+        asyncio.run(bootstrap(self.db))
 
         reg = WorkerRegistration(
             worker_id="w-test",
@@ -45,11 +48,31 @@ class FileTransferApiTests(unittest.TestCase):
 
         self.app = create_app(self.db)
         self.client = TestClient(self.app)
+        self.client.headers.update(login(self.client, "admin"))
 
     def tearDown(self) -> None:
         self.client.close()
         asyncio.run(self.db.close())
         Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_api_key_cannot_upload_or_download_files(self):
+        token = issue_key(self.client, dict(self.client.headers))
+        with patch("worker_harness.heartbeat.ssh_upload_bytes", new=AsyncMock()) as upload, patch(
+            "worker_harness.heartbeat.ssh_download_bytes", new=AsyncMock(),
+        ) as download:
+            response = self.client.post(
+                "/api/v1/workers/w-test/files",
+                headers=bearer(token),
+                json={"path": "/tmp/test.sh", "content_b64": base64.b64encode(b"hello").decode()},
+            )
+            self.assertEqual(response.status_code, 403, response.text)
+            response = self.client.get(
+                "/api/v1/workers/w-test/files",
+                headers=bearer(token), params={"path": "/tmp/test.sh"},
+            )
+            self.assertEqual(response.status_code, 403, response.text)
+        upload.assert_not_awaited()
+        download.assert_not_awaited()
 
     # ── Upload tests ──────────────────────────────────────────────────
 
