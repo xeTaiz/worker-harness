@@ -84,7 +84,8 @@ def forecast_worker(
         PendingRequest(job_id=job.id, gpu_count=job.gpu_count, expected_seconds=job.expected_seconds)
         for job in ordered
     ]
-    return estimate_worker(now, resources, running, pending)
+    labels = {job.id: job.name for job in (*active, *ordered) if job.name}
+    return estimate_worker(now, resources, running, pending, labels=labels)
 
 
 def public_worker(worker: Worker) -> dict[str, Any]:
@@ -145,7 +146,8 @@ def public_queue_job(
         "deadline_at": job.deadline_at,
         "expected_seconds": job.expected_seconds,
         "gpu_count": job.gpu_count,
-        "started_at": job.started_at,
+        # 0 means "not yet"; clients expect null rather than the 1970 epoch.
+        "started_at": job.started_at or None,
         "termination_reason": _enum(job.termination_reason),
         "stop_requested_at": job.stop_requested_at,
         "estimated_start_at": estimate.estimated_start_at if estimate else None,
@@ -181,8 +183,8 @@ def owned_job(job: Job, *, owner_display_name: str, worker_name: str | None) -> 
         "gpu_count": job.gpu_count,
         "gpu_indices": list(job.gpu_indices),
         "queue_managed": job.queue_managed,
-        "started_at": job.started_at,
-        "finished_at": job.finished_at,
+        "started_at": job.started_at or None,
+        "finished_at": job.finished_at or None,
         "termination_reason": _enum(job.termination_reason),
         "stop_requested_at": job.stop_requested_at,
         "origin_session_id": job.origin_session_id,

@@ -9,7 +9,7 @@ but can still be used to attribute changes in its admission time.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Literal, Sequence
+from typing import Iterable, Literal, Mapping, Sequence
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,8 @@ def estimate_worker(
     resources: WorkerResources,
     running: Sequence[RunningClaim],
     pending: Sequence[PendingRequest],
+    *,
+    labels: Mapping[str, str] | None = None,
 ) -> dict[str, Estimate]:
     """Simulate strict FIFO admission using the lowest available GPU indices.
 
@@ -58,6 +60,11 @@ def estimate_worker(
     would fit otherwise. Releasing exactly at ``now`` is known; an overrun is
     not treated as an immediate release.
     """
+    def job(job_id: str) -> str:
+        # Public job names read better than IDs; times live in the estimate fields.
+        label = (labels or {}).get(job_id)
+        return f"'{label}'" if label else f"job {job_id}"
+
     estimates: dict[str, Estimate] = {}
     releases: list[int | None] = [now] * resources.gpu_count
     explanations = [""] * resources.gpu_count
@@ -67,15 +74,15 @@ def estimate_worker(
         finish = claim.started_at + claim.expected_seconds
         if not claim.release_known:
             finish = None
-            explanation = f"unknown: job {claim.job_id} release is unconfirmed"
+            explanation = f"unknown: {job(claim.job_id)} release is unconfirmed"
         elif claim.expected_seconds <= 0:
             finish = None
-            explanation = f"unknown: job {claim.job_id} has no runtime estimate"
+            explanation = f"unknown: {job(claim.job_id)} has no runtime estimate"
         elif finish < now:
             finish = None
-            explanation = f"unknown: job {claim.job_id} has run past its estimate"
+            explanation = f"unknown: {job(claim.job_id)} has run past its estimate"
         else:
-            explanation = f"job {claim.job_id} estimated to finish at {finish}"
+            explanation = f"{job(claim.job_id)} ends after its expected runtime"
         estimates[claim.job_id] = Estimate(
             claim.job_id,
             claim.started_at,
@@ -101,10 +108,10 @@ def estimate_worker(
         if not resources.online:
             explanation = "unknown: worker offline"
         elif blocked_by is not None:
-            explanation = f"unknown: earlier queued job {blocked_by} has unknown start"
+            explanation = f"unknown: earlier queued {job(blocked_by)} has unknown start"
         elif request.gpu_count > resources.gpu_count:
             explanation = (
-                f"unknown: job {request.job_id} requests more GPUs than the worker has"
+                f"unknown: {job(request.job_id)} requests more GPUs than the worker has"
             )
         else:
             known_releases = sorted(time for time in releases if time is not None)
@@ -125,16 +132,16 @@ def estimate_worker(
                     if time is not None and time <= start
                 ][:request.gpu_count]
                 waits = [
-                    f"GPU {index} released by job {owners[index]} at {releases[index]}"
+                    f"GPU {index} released by {job(owners[index])}"
                     for index in indices
                     if owners[index] is not None and releases[index] > now
                 ]
                 explanation = "waits for " + "; ".join(waits) if waits else "GPUs available"
                 if start > now and not waits:
-                    explanation = f"waits for earlier queued admission at {start}"
+                    explanation = "waits for earlier queued jobs to start (FIFO)"
                 finish = start + request.expected_seconds if request.expected_seconds > 0 else None
                 if finish is None:
-                    explanation += f"; unknown: job {request.job_id} has no runtime estimate"
+                    explanation += f"; unknown: {job(request.job_id)} has no runtime estimate"
                 estimates[request.job_id] = Estimate(
                     request.job_id,
                     start,
@@ -146,7 +153,7 @@ def estimate_worker(
                     releases[index] = finish
                     owners[index] = request.job_id
                     explanations[index] = (
-                        f"unknown: job {request.job_id} has no runtime estimate"
+                        f"unknown: {job(request.job_id)} has no runtime estimate"
                     )
                 admission_time = start
                 continue
