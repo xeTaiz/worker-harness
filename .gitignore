@@ -13,3 +13,6 @@ dist/.env
 /worker-harness-giga-wh.sif
 /.pi-subagents/
 /zellij_plugins/wh-tab-bar/target
+
+# Local SSH identities
+chaos-key*
