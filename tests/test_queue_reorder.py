@@ -134,6 +134,30 @@ class ReorderApiTests(unittest.TestCase):
         owned = self.client.get(f"/api/v1/jobs/{self.job_a['id']}", headers=self.keys["alice"]).json()
         self.assertEqual(owned["delay_history"][0]["reason"], "paper deadline")
 
+    def test_job_pushed_back_by_another_user_records_the_delay_on_itself(self) -> None:
+        def push_to_end(user: str) -> None:
+            preview = self.preview(user, self.job_a["id"], None, self.worker_board()["revision"]).json()
+            commit = self.client.post(
+                f"/api/v1/jobs/{self.job_a['id']}/queue/move", headers=self.keys[user],
+                json={"preview_id": preview["preview_id"], "expected_revision": preview["revision"]},
+            )
+            self.assertEqual(commit.status_code, 200, commit.text)
+
+        def history() -> list[dict]:
+            return next(row for row in self.worker_board()["jobs"] if row["id"] == self.job_a["id"])["delay_history"]
+
+        push_to_end("alice")  # the owner moving her own job later is not reported back
+        self.assertEqual(history(), [])
+        preview = self.preview("alice", self.job_a["id"], self.job_b["id"], self.worker_board()["revision"]).json()
+        self.client.post(
+            f"/api/v1/jobs/{self.job_a['id']}/queue/move", headers=self.keys["alice"],
+            json={"preview_id": preview["preview_id"], "expected_revision": preview["revision"]},
+        )
+        push_to_end("carol")
+        entry = history()[0]
+        self.assertTrue(entry["moved_itself"])
+        self.assertEqual((entry["delay_seconds"], entry["actor_display_name"]), (300, "Carol"))
+
     def test_stale_and_expired_previews_never_partially_apply(self) -> None:
         revision = self.worker_board()["revision"]
         first = self.preview("carol", self.job_b["id"], self.job_a["id"], revision).json()

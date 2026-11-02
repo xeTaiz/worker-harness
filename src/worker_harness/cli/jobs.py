@@ -49,14 +49,18 @@ def delay_messages(entries: list[dict]) -> list[str]:
     messages = []
     for entry in entries:
         delay = entry.get("delay_seconds")
+        moved_itself = entry.get("moved_itself", False)
         if delay is None:
             message = "Moved later; delay estimate unavailable"
         elif delay > 0:
-            message = (f"+{math.ceil(delay / 60)} minutes estimated delay because of "
-                       f"{entry['moved_job_name']} by {entry['moved_job_owner_display_name']}")
+            minutes = math.ceil(delay / 60)
+            message = f"+{minutes} minute{'' if minutes == 1 else 's'} estimated delay"
+            if not moved_itself:
+                message += f" because of {entry['moved_job_name']} by {entry['moved_job_owner_display_name']}"
         else:
             continue
-        messages.append(f"{message}; Moved by {entry['actor_display_name']}; "
+        mover = "Moved later by" if moved_itself else "Moved by"
+        messages.append(f"{message}; {mover} {entry['actor_display_name']}; "
                         f"{entry['reason']} ({_format_timestamp(entry.get('created_at'))})")
     return messages
 

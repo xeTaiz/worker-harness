@@ -1,6 +1,6 @@
-const CACHE = "wh-multi-user-shell-v24";
+const CACHE = "wh-multi-user-shell-v25";
 const SHELL = [
-  "/", "/index.html", "/app.css?v=24", "/app.js?v=24", "/manifest.webmanifest", "/icon.svg", "/icon-maskable.svg",
+  "/", "/index.html", "/app.css?v=25", "/app.js?v=25", "/manifest.webmanifest", "/icon.svg", "/icon-maskable.svg",
   "/vendor/marked/marked.umd.js", "/vendor/dompurify/purify.min.js",
   "/vendor/katex/katex.min.js", "/vendor/katex/auto-render.min.js", "/vendor/katex/katex.min.css",
 ];

@@ -139,6 +139,7 @@ class NativeJobCliTests(unittest.TestCase):
                    priority="normal", status="pending", expected_seconds=120, estimate_status="unknown",
                    estimate_explanation="FIFO head has unknown finish", delay_history=[
                        {**base, "delay_seconds": 61}, {**base, "delay_seconds": None},
+                       {**base, "delay_seconds": 50, "moved_itself": True, "actor_display_name": "Carol"},
                        {**base, "moved_job_name": "No positive delay", "delay_seconds": -10}])
         board = {"workers": [{"worker_id": "w", "worker_name": "Worker", "revision": 2, "jobs": [row], "cpu_jobs": []}]}
         stream = io.StringIO()
@@ -149,6 +150,7 @@ class NativeJobCliTests(unittest.TestCase):
         output = stream.getvalue()
         self.assertIn("+2 minutes estimated delay because of Experiment B by Bob", output)
         self.assertIn("Moved by Alice", output)
+        self.assertIn("+1 minute estimated delay; Moved later by Carol", output)
         self.assertIn("Team agreement", output)
         self.assertIn("Moved later; delay estimate unavailable", output)
         self.assertIn("unknown: FIFO head has unknown finish", output)

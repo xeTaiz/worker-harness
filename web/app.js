@@ -317,10 +317,12 @@ function delayEntries(entries = []) {
   for (const entry of entries) {
     if (entry.delay_seconds != null && entry.delay_seconds <= 0) continue;
     const details = node("details", "delay-entry");
+    const minutes = entry.delay_seconds == null ? 0 : Math.ceil(entry.delay_seconds / 60);
     details.append(node("summary", "", entry.delay_seconds == null
       ? "Moved later; delay estimate unavailable"
-      : `+${Math.ceil(entry.delay_seconds / 60)} minutes estimated delay because of ${entry.moved_job_name} by ${entry.moved_job_owner_display_name}`));
-    details.append(node("p", "", `Moved by ${entry.actor_display_name}`), node("p", "", entry.reason), node("p", "muted", when(entry.created_at)));
+      : `+${minutes} minute${minutes === 1 ? "" : "s"} estimated delay`
+        + (entry.moved_itself ? "" : ` because of ${entry.moved_job_name} by ${entry.moved_job_owner_display_name}`)));
+    details.append(node("p", "", `${entry.moved_itself ? "Moved later by" : "Moved by"} ${entry.actor_display_name}`), node("p", "", entry.reason), node("p", "muted", when(entry.created_at)));
     result.append(details);
   }
   return result;

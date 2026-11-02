@@ -2082,7 +2082,12 @@ class Database:
     async def delay_history(
         self, job_ids: list[str], *, limit_per_job: int | None = None,
     ) -> dict[str, list[dict]]:
-        """Estimated delays that reorders of other jobs caused each job."""
+        """Estimated delays that reorders caused each job.
+
+        Covers reorders of other jobs and moves of the job itself by someone
+        other than its owner (``moved_itself``); owners moving their own job
+        later are not reported back to them.
+        """
         if not job_ids:
             return {}
         rows = await self._db.execute_fetchall(
@@ -2091,7 +2096,8 @@ class Database:
                        e.actor_display_name, e.reason, e.created_at
                 FROM queue_event_impacts AS i JOIN queue_events AS e ON e.id = i.event_id
                 WHERE i.job_id IN ({', '.join('?' for _ in job_ids)})
-                  AND e.event_type = 'reorder' AND e.job_id != i.job_id
+                  AND e.event_type = 'reorder'
+                  AND (e.job_id != i.job_id OR e.actor_user_id != e.job_owner_user_id)
                   AND (i.delay_seconds > 0
                        OR (i.delay_seconds IS NULL AND i.after_position > i.before_position))
                 ORDER BY i.event_id DESC""",
@@ -2107,6 +2113,7 @@ class Database:
                 "created_at": row["created_at"],
                 "delay_seconds": row["delay_seconds"],
                 "moved_job_id": row["moved_job_id"],
+                "moved_itself": row["moved_job_id"] == row["job_id"],
                 "moved_job_name": row["moved_job_name"],
                 "moved_job_owner_display_name": row["moved_owner"],
                 "actor_user_id": row["actor_user_id"],
